@@ -285,7 +285,7 @@ function renderUpcoming() {
     if (part.length) html += `<section class="ag-group ${cls || ""}"><h3>${name} <span>${part.length}</span></h3><div class="ag-rows">${part.map(agRow).join("")}</div></section>`;
   }
   if (!saved.length) html = `<div class="empty" style="margin-top:22px"><b>Nothing in your agenda</b>Use the bookmark on any item in your feed to keep track of it here.</div>`;
-  if (done.length) html += `<details class="ag-done"><summary>Done (${done.length})</summary><div class="ag-rows" style="margin-top:8px">${done.map(agRow).join("")}</div></details>`;
+  if (done.length) html += `<details class="ag-done" data-key="ag-done"><summary>Done (${done.length})</summary><div class="ag-rows" style="margin-top:8px">${done.map(agRow).join("")}</div></details>`;
   return html;
 }
 function renderMonth() {
@@ -340,7 +340,7 @@ function renderSources() {
     return `<div class="srow"><label class="switch" title="Watch this source"><input type="checkbox" data-src-active="${s.id}" ${s.active ? "checked" : ""}><i></i></label>
       <div style="min-width:0"><h4>${esc(s.name)} ${learn} ${status}</h4><div class="u">${esc(s.url)}</div>
         ${s.notes && agent ? `<div class="n">${esc(s.notes)}</div>` : ""}${l && !l.ok ? `<div class="err">${esc(l.error)}</div>` : ""}${s.extractor_error && agent && !s.extractor_ok ? `<div class="err">${esc(s.extractor_error)}</div>` : ""}
-        ${s.extractor ? `<details><summary>View the reader your agent wrote${s.extractor_updated ? ", " + short(s.extractor_updated.slice(0, 10)) : ""}${s.extractor_runs ? `, used ${s.extractor_runs} time${s.extractor_runs > 1 ? "s" : ""}` : ""}</summary><div class="code">${esc(s.extractor)}</div></details>` : ""}</div>
+        ${s.extractor ? `<details data-key="src-${s.id}"><summary>View the reader your agent wrote${s.extractor_updated ? ", " + short(s.extractor_updated.slice(0, 10)) : ""}${s.extractor_runs ? `, used ${s.extractor_runs} time${s.extractor_runs > 1 ? "s" : ""}` : ""}</summary><div class="code">${esc(s.extractor)}</div></details>` : ""}</div>
       <div class="row">${agent ? `<button class="btn sm ghost" data-src-edit="${s.id}">Edit notes</button>${s.extractor ? `<button class="btn sm ghost" data-src-relearn="${s.id}">Relearn</button>` : ""}` : ""}
         <button class="btn sm" data-src-scan="${s.id}" ${S.progress.running ? "disabled" : ""}>${I.play} Scan</button><button class="btn sm ghost danger" data-src-del="${s.id}" aria-label="Delete source">${I.trash}</button></div></div>`;
   }).join("");
@@ -414,8 +414,20 @@ function renderSettings() {
 }
 
 // ---------- scan detail ----------
-const scanCache = {};
-async function loadScan(id) { scanCache[id] = await api(`/api/scans/${id}`).catch(() => ({ missing: true })); render(); }
+const scanCache = {}, scanInFlight = {};
+async function loadScan(id) {
+  if (scanInFlight[id]) return;
+  scanInFlight[id] = true;
+  try {
+    const data = await api(`/api/scans/${id}`).catch(() => (scanCache[id] ? null : { missing: true }));
+    if (!data) return;
+    const changed = !scanCache[id] || JSON.stringify(scanCache[id]) !== JSON.stringify(data);
+    scanCache[id] = data;
+    if (changed && route.view === "scan" && route.id === id) render();
+  } finally {
+    delete scanInFlight[id];
+  }
+}
 function renderScan() {
   const d = scanCache[route.id];
   if (!d) { loadScan(route.id); return `<div class="page"><div class="head"><div><h1>Scan</h1><p>Loading…</p></div></div></div>`; }
@@ -434,17 +446,25 @@ function renderScan() {
 }
 
 // ---------- render ----------
+let lastHtml = null, lastTag = null;
 function render() {
   if (!S) return;
   renderSide();
   const v = route.view;
   const html = v === "feed" ? renderFeed() : v === "agenda" ? renderAgenda() : v === "sources" ? renderSources() : v === "filters" ? renderFilters() : v === "settings" ? renderSettings() : v === "scan" ? renderScan() : renderHome();
-  const tag = v === "settings" && AG ? "settings:ag" : v, main = $("#main");
-  const act = document.activeElement, keepId = act && act.id, pos = act && act.selectionStart;
+  const tag = v === "settings" && AG ? "settings:ag" : v === "scan" ? `scan:${route.id}` : v, main = $("#main");
+  const force = render.force; render.force = false;
+  const same = main.dataset.view === tag;
   // Settings is a form: background refreshes must not wipe what is being typed.
-  if (!(tag === "settings:ag" && main.dataset.view === tag && !render.force)) { main.innerHTML = html; main.dataset.view = tag; }
-  render.force = false;
-  if (keepId && $("#" + keepId)) { const el = $("#" + keepId); el.focus(); try { el.setSelectionRange(pos, pos); } catch (_) {} }
+  if (tag === "settings:ag" && same && !force) return;
+  if (same && tag === lastTag && html === lastHtml) return;
+  const act = document.activeElement, keepId = act && act.id, pos = act && act.selectionStart;
+  const scrollTop = same ? main.scrollTop : 0;
+  const open = same ? [...main.querySelectorAll("details[open][data-key]")].map((d) => d.dataset.key) : [];
+  main.innerHTML = html; main.dataset.view = tag; lastHtml = html; lastTag = tag;
+  for (const k of open) { const d = main.querySelector(`details[data-key="${CSS.escape(k)}"]`); if (d) d.open = true; }
+  if (keepId && $("#" + keepId)) { const el = $("#" + keepId); el.focus({ preventScroll: true }); try { el.setSelectionRange(pos, pos); } catch (_) {} }
+  main.scrollTop = scrollTop;
 }
 let timer = null, wasBusy = false;
 async function refresh() {
@@ -454,11 +474,11 @@ async function refresh() {
     if (S.settings.agent && !modelCache[S.settings.agent]) modelsFor(S.settings.agent).then(() => { render.force = true; render(); });
     if (!AG) ensureAgents().then(() => render());
     const busy = S.progress.running || S.discovery.running;
-    if ((wasBusy || busy) && route.view === "scan") delete scanCache[route.id];
+    if ((wasBusy || busy) && route.view === "scan") loadScan(route.id);
     const typing = document.activeElement && /INPUT|TEXTAREA|SELECT/.test(document.activeElement.tagName) && document.activeElement.id !== "q";
     if (!popEl && !typing) render(); else renderSide();
     wasBusy = busy;
-  } catch (e) { $("#main").innerHTML = `<div class="page"><div class="empty"><b>Lookout's engine stopped</b>Close this window and open Lookout again.</div></div>`; }
+  } catch (e) { lastHtml = lastTag = null; $("#main").innerHTML = `<div class="page"><div class="empty"><b>Lookout's engine stopped</b>Close this window and open Lookout again.</div></div>`; }
   timer = setTimeout(refresh, S && (S.progress.running || S.discovery.running) ? 1500 : 30000);
 }
 

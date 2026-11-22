@@ -671,6 +671,12 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:
                 pass
         _write_launch_secret_file(new_sec)
+        hook = getattr(self.server, "on_new_secret", None)
+        if callable(hook):
+            try:
+                hook(new_sec)
+            except Exception:
+                pass
         return sess
 
     def _render_index(self) -> bytes:

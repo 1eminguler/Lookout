@@ -207,19 +207,28 @@ python run.py scan               # or: lookout scan
 
 Because most coding-agent CLIs run with auto-approve flags (`--yolo`, `--dangerously-skip-permissions`, etc.), running Lookout inside a container isolates agent file and shell access from your host home directory (`~/.ssh`, `~/.aws`, browser profiles).
 
-The included [`Dockerfile`](Dockerfile) uses `python:3.13-slim`, installs Node.js, `agent-browser`, and system Chromium, and runs as a non-root `lookout` user with `/data` mounted as a volume:
+The included [`Dockerfile`](Dockerfile) uses `python:3.13-slim`, installs Node.js, `agent-browser`, and system Chromium, runs as a non-root `lookout` user with `/data` as a volume, and starts Lookout in headless mode. CI builds the image and signs in to it on every push.
 
 ```bash
-docker build -t lookout .
+# Pick the agent CLIs to bake in: claude, codex, gemini (space separated). Leave it out for none.
+docker build --build-arg AGENTS="codex" -t lookout .
 
-# Publish ONLY on host loopback (127.0.0.1) so Lookout's Host header check and local boundary remain intact:
-docker run --rm -it \
-  -p 127.0.0.1:8780:8780 \
-  -v lookout-data:/data \
-  lookout
+# Publish ONLY on host loopback (127.0.0.1); the server only accepts Host: 127.0.0.1:8780 / localhost:8780.
+docker run -d --name lookout -p 127.0.0.1:8780:8780 -v lookout-data:/data lookout
+
+# Sign in: open the one-time link the container printed.
+docker logs lookout | grep "k="
+# Later, or after the link was used: print the current one
+docker exec lookout python run.py --print-url
+
+# Log the agent in once, inside the container (kept in the container's home directory),
+# by starting it and following its sign-in steps:
+docker exec -it lookout codex
 ```
 
-Inside the container, `LOOKOUT_BIND=0.0.0.0` lets Docker bridge port forwarding reach the server while `lookout/server.py` still enforces `Host: 127.0.0.1:8780` / `localhost:8780` and one-time launch-secret authentication. To sign in on the host browser after starting the container, read the one-time secret from `/data/.launch_secret` (e.g. `docker exec <container> cat /data/.launch_secret`) and open `http://127.0.0.1:8780/?k=<secret>`. Mount or install your chosen agent CLI credentials inside the container (not your entire host home directory).
+Each sign-in link works once; after it is used, the container prints the next one. Without an agent in the image, Lookout still runs scans with readers it already learned and with plugins, but it cannot learn new sites or find sources. Prefer logging the agent in inside the container over mounting your host home directory.
+
+`python run.py --headless` (or `LOOKOUT_HEADLESS=1`) works outside Docker too, for example on a home server: it serves without opening a window and prints each sign-in link.
 
 ## Environment variables
 

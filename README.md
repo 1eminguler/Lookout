@@ -45,17 +45,21 @@ python run.py scan               # or: lookout scan
 
 ## A tour
 
-**Opportunities:** See matching updates from your watches together.
+Start on **Home** to describe what you want to watch. Open **Feed** to see matches across watches and save an item to your agenda.
 
-<img src="docs/screenshots/opportunities.png" alt="Opportunities from different watches" width="900">
+<img src="docs/screenshots/feed.png" alt="Feed showing matches and deadlines across watches" width="900">
 
-**Watch settings:** Review the sources and rules for a watch.
+In **Sources**, add a listing URL or check the status of a source you already follow.
 
-<img src="docs/screenshots/watch-settings.png" alt="Summer internships watch settings with sources and a location rule" width="800">
+<img src="docs/screenshots/sources.png" alt="Sources grouped by global and watch sources" width="900">
 
-**Agenda:** Keep an item, choose a reminder, and add a note.
+In **Agenda**, open a saved item to add a note or set a reminder.
 
-<img src="docs/screenshots/agenda.png" alt="Agenda with an item and its details open" width="900">
+<img src="docs/screenshots/agenda.png" alt="Agenda with a saved internship and its reminder open" width="900">
+
+In **Settings**, choose your agent, daily scan time, desktop notifications, and appearance. System follows your device, or you can choose Light or Dark.
+
+<img src="docs/screenshots/settings.png" alt="Settings in Light mode with Advanced sections collapsed" width="900">
 
 ## Contents
 

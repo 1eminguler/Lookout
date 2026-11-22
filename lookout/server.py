@@ -697,7 +697,12 @@ class Handler(BaseHTTPRequestHandler):
         return sess
 
     def _render_index(self) -> bytes:
-        return (WEB / "index.html").read_bytes()
+        theme = db.get_settings()["theme"]
+        if theme not in ("light", "dark"):
+            theme = "system"
+        return (WEB / "index.html").read_bytes().replace(
+            b'data-preference="system"', f'data-preference="{theme}"'.encode("ascii"), 1
+        )
 
     def _render_unauth_page(self) -> bytes:
         return (
@@ -1297,6 +1302,8 @@ class Handler(BaseHTTPRequestHandler):
                     "error": "custom_command cannot be changed over HTTP; use data/agent_command.txt or --custom-command"
                 })
             vals = {k: v for k, v in b.items() if k in db.DEFAULTS and not (k in SECRET_KEYS and not v)}
+            if "theme" in vals and vals["theme"] not in ("system", "light", "dark"):
+                raise ValueError("theme must be system, light or dark")
             if "eligibility_profile" in vals:
                 profile = eligibility.normalize_profile(vals["eligibility_profile"])
                 vals["eligibility_profile"] = json.dumps(profile, sort_keys=True, ensure_ascii=True)

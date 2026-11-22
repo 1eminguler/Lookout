@@ -331,6 +331,47 @@ class UiSmokeTests(TempLookoutTestCase):
                     page.click('#editFilterForm [data-act="cancel-edit"]')
                     _wait_js(page, "() => !document.querySelector('#editFilterForm')")
                 elif route_hash == "#/settings":
+                    picker = page.get_by_label("Appearance")
+                    picker.wait_for()
+                    self.assertEqual(page.locator(".advanced").count(), 4)
+                    self.assertEqual(page.locator(".advanced[open]").count(), 0)
+                    page.emulate_media(color_scheme="dark")
+                    for theme in ("dark", "system", "light"):
+                        picker.select_option(theme)
+                        attr = None if theme == "system" else theme
+                        _wait_js(page, f"() => (document.documentElement.dataset.theme || '') === '{attr or ''}'")
+                        self.assertEqual(db.get_settings()["theme"], theme)
+                        scheme = "light" if theme == "light" else "dark"
+                        self.assertEqual(page.locator("html").evaluate("el => getComputedStyle(el).colorScheme"), scheme)
+                    # The head script must apply the saved preference even before app startup.
+                    page.route("**/app.js", lambda route: route.fulfill(content_type="text/javascript", body=""))
+                    page.reload(wait_until="networkidle")
+                    self.assertEqual(page.locator("html").get_attribute("data-theme"), "light")
+                    page.unroute("**/app.js")
+                    page.reload(wait_until="networkidle")
+                    self.assertEqual(picker.input_value(), "light")
+                    self.assertEqual(page.locator("html").get_attribute("data-theme"), "light")
+                    page.goto(base + "#/feed")
+                    card = page.locator("article.item").first
+                    card.wait_for()
+                    for selector in ("h3 a", ".who", ".sum", ".when b"):
+                        ratio = card.locator(selector).first.evaluate("""el => {
+                            function luminance(color) {
+                                const [r, g, b] = color.match(/[0-9.]+/g).slice(0, 3).map(n => {
+                                    const s = Number(n) / 255;
+                                    return s <= .04045 ? s / 12.92 : ((s + .055) / 1.055) ** 2.4;
+                                });
+                                return .2126 * r + .7152 * g + .0722 * b;
+                            }
+                            const fg = luminance(getComputedStyle(el).color);
+                            const bg = luminance(getComputedStyle(el.closest("article")).backgroundColor);
+                            return (Math.max(fg, bg) + .05) / (Math.min(fg, bg) + .05);
+                        }""")
+                        self.assertGreaterEqual(ratio, 4.5, selector)
+                    page.goto(base + "#/settings")
+                    page.locator('[data-key="setup"] summary').click()
+                    page.locator("#starterPacks [data-add]").wait_for()
+                    page.locator('[data-key="delivery"] summary').click()
                     page.wait_for_selector("#webhookUrl")
                     page.wait_for_selector("#webhookFormat")
                     page.wait_for_selector("#mailFrom")

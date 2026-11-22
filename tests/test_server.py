@@ -523,6 +523,8 @@ class ServerTests(TempLookoutTestCase):
         self.assertIn("Reminder: Python Intern", ics_txt)
 
         # Settings & secret handling
+        self.assertEqual(db.get_settings()["theme"], "system")
+        self.assertEqual(self.req("POST", "/api/settings", {"theme": "unknown"})[0], 400)
         self.assertEqual(self.req("POST", "/api/settings", {"agent": "unknown"})[0], 400)
         self.assertEqual(self.req("POST", "/api/settings", {"parallel": 99})[0], 400)
         self.assertEqual(self.req("POST", "/api/settings", {"agent": "claude", "smtp_password": "secret-pw"})[0], 200)

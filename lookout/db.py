@@ -583,6 +583,7 @@ def _exec(sql: str, args: Iterable = ()) -> int:
 
 # ---------- settings ----------
 DEFAULTS = {
+    "theme": "system",
     "agent": "", "model": "", "headed": "0", "notify": "1", "schedule_time": "08:30",
     "agent_timeout_min": "12", "parallel": "2", "first_run_done": "0",
     "custom_command": "", "mail_to": "", "mail_from": "", "smtp_host": "smtp.gmail.com", "smtp_port": "587",

@@ -27,10 +27,10 @@ const I = {
   funnel: '<svg viewBox="0 0 24 24"><path d="M4 5h16l-6 8v5l-4 2v-7z"/></svg>',
   dl: '<svg viewBox="0 0 24 24"><path d="M12 4v11M7 10l5 5 5-5M5 20h14"/></svg>',
 };
-const SCOPE = `<svg viewBox="0 0 120 120" aria-hidden="true"><defs><radialGradient id="sw" cx="0" cy="0" r="1" gradientUnits="userSpaceOnUse" gradientTransform="translate(60 60) scale(56)"><stop offset="0" stop-color="#7B9CFF" stop-opacity=".55"/><stop offset="1" stop-color="#7B9CFF" stop-opacity="0"/></radialGradient></defs>
-  <circle cx="60" cy="60" r="56" fill="none" stroke="#26262B"/><circle cx="60" cy="60" r="38" fill="none" stroke="#1E1E23"/><circle cx="60" cy="60" r="20" fill="none" stroke="#1E1E23"/>
-  <path d="M60 4v112M4 60h112" stroke="#18181C"/><g class="sweep"><path d="M60 60 L60 4 A56 56 0 0 1 108.5 32 Z" fill="url(#sw)"/><path d="M60 60 L108.5 32" stroke="#7B9CFF" stroke-width="1.6"/></g>
-  <circle cx="83" cy="40" r="2.6" fill="#7B9CFF"/><circle cx="41" cy="78" r="2" fill="#7B9CFF" opacity=".6"/><circle cx="60" cy="60" r="3" fill="#EDEDEF"/></svg>`;
+const SCOPE = `<svg viewBox="0 0 120 120" aria-hidden="true"><defs><radialGradient id="sw" cx="0" cy="0" r="1" gradientUnits="userSpaceOnUse" gradientTransform="translate(60 60) scale(56)"><stop offset="0" stop-color="var(--accent)" stop-opacity=".55"/><stop offset="1" stop-color="var(--accent)" stop-opacity="0"/></radialGradient></defs>
+  <circle cx="60" cy="60" r="56" fill="none" stroke="var(--line)"/><circle cx="60" cy="60" r="38" fill="none" stroke="var(--line-soft)"/><circle cx="60" cy="60" r="20" fill="none" stroke="var(--line-soft)"/>
+  <path d="M60 4v112M4 60h112" stroke="var(--line-soft)"/><g class="sweep"><path d="M60 60 L60 4 A56 56 0 0 1 108.5 32 Z" fill="url(#sw)"/><path d="M60 60 L108.5 32" stroke="var(--accent)" stroke-width="1.6"/></g>
+  <circle cx="83" cy="40" r="2.6" fill="var(--accent)"/><circle cx="41" cy="78" r="2" fill="var(--accent)" opacity=".6"/><circle cx="60" cy="60" r="3" fill="var(--ink)"/></svg>`;
 
 const ITEMS_PAGE_SIZE = 50;
 let S = null, AG = null, route = { view: "home", id: null };
@@ -892,14 +892,16 @@ function eligibilityProfileForm(profile) {
 
 function renderSettings() {
   const profileForm = eligibilityProfileForm(S.settings.eligibility_profile || {});
-  if (!AG) { ensureAgents().then(render); return `<div class="page"><div class="head"><div><h1>Settings</h1><p>Looking for AI agents on this computer…</p></div></div>${profileForm}</div>`; }
+  if (!AG) { ensureAgents().then(render); return `<div class="page"><div class="head"><div><h1>Settings</h1><p>Looking for AI agents on this computer…</p></div></div></div>`; }
   const st = S.settings, cur = st.agent, sch = S.schedule;
   const usage = (u) => !u.length ? "Not used by Lookout yet" : u.slice(0, 3).map((m) => `${esc(m.model || "default model")}: ${m.today} today, ${m.calls} this week` + (m.blocked_until ? ` · <span class="bad">quota used up until ${m.blocked_until.slice(11, 16)}</span>` : "")).join("<br>");
-  const agents = AG.agents.map((a) => `<label class="agent ${a.installed || a.configured ? "" : "off"} ${cur === a.id ? "on" : ""}">
-      <input type="radio" name="agent" value="${a.id}" ${cur === a.id ? "checked" : ""} ${a.installed || a.configured ? "" : "disabled"}>
-      <div><b>${esc(a.name)}</b><span class="v">${a.id === "custom" ? (a.configured ? (a.installed ? "configured" : "executable not found") : "local config only") : a.installed ? (a.version && a.version !== "?" ? "v" + esc(a.version) : "installed") : "not installed"}</span>${a.verified || a.id === "custom" || !a.installed ? "" : ' <span class="tag" title="Command-line flags not yet tested on a real install">experimental</span>'}
-        ${a.id === "custom" ? `<small>Configured locally for security (not editable via web UI): place your template in <code>${esc(a.config_path || "data/agent_command.txt")}</code> or start Lookout with <code>--custom-command "..."</code>.</small>` : ""}
-        ${a.installed && a.id !== "custom" ? `<div class="usage">${usage(a.usage)}</div>` : ""}</div></label>`).join("");
+  const agentOptions = AG.agents.map((a) => {
+    const status = a.id === "custom" ? (a.configured ? (a.installed ? "configured" : "executable not found") : "local config only")
+      : !a.installed ? "not installed" : [a.version && a.version !== "?" ? "v" + a.version : "installed", !a.verified && "experimental"].filter(Boolean).join(", ");
+    return `<option value="${esc(a.id)}" ${cur === a.id ? "selected" : ""} ${a.installed || a.configured ? "" : "disabled"}>${esc(a.name)} (${esc(status)})</option>`;
+  }).join("");
+  const history = AG.agents.filter(a => a.installed && a.id !== "custom").map(a => `<p><b>${esc(a.name)}</b><br>${usage(a.usage)}</p>`).join("");
+  const custom = AG.agents.find(a => a.id === "custom");
   const snipHtml = schedPreview ? `<div class="sched-snippets">
     <div><small class="muted">Cron (Linux / macOS)</small><pre>${esc(schedPreview.cron || schedPreview.crontab || "")}</pre></div>
     <div><small class="muted">systemd --user (~/.config/systemd/user/lookout-scan.service)</small><pre>${esc(schedPreview.systemd_service || "")}</pre></div>
@@ -908,9 +910,16 @@ function renderSettings() {
     ${schedPreview.test_command ? `<div><small class="muted">Self-test command</small><pre>${esc(schedPreview.test_command)}</pre></div>` : ""}
   </div>` : "";
   return `<div class="page">${renderNotifyErrorsBanner()}<div class="head"><div><h1>Settings</h1><p>Settings are saved on this computer.</p></div></div>
-    ${profileForm}
+    <div class="box pad">
+      <label class="setrow"><b>Agent</b><select id="settingsAgent"><option value="">Choose an agent</option>${agentOptions}</select></label>
+      <div class="setrow"><div><b>Daily scan</b><small>${sch.supported ? `Runs in the background even when Lookout is closed${sch.backend ? ` (${esc(sch.backend)})` : ""}.` : esc(sch.hint || "Manual cron/systemd/launchd setup available below.")}</small></div>
+        <div class="row"><input type="time" id="schTime" class="w-110" value="${esc(st.schedule_time)}" aria-label="Time">${sch.supported ? `<label class="switch"><input type="checkbox" id="schOn" aria-label="Enable daily scan" ${sch.enabled ? "checked" : ""}><i></i></label>` : ""}</div></div>
+      <div class="setrow"><div><b>Desktop notification</b><small>When a scan finds new or updated items.</small></div><label class="switch"><input type="checkbox" id="notifyIn" aria-label="Desktop notifications" ${st.notify === "1" ? "checked" : ""}><i></i></label></div>
+      <label class="setrow"><b>Appearance</b><select id="themeSel">${["system", "light", "dark"].map(theme => `<option value="${theme}" ${st.theme === theme ? "selected" : ""}>${theme[0].toUpperCase() + theme.slice(1)}</option>`).join("")}</select></label>
+    </div>
+    <div class="h2">Advanced</div>
+    <details class="box advanced" data-key="agent"><summary>Agent options and usage</summary>
     ${AG.browser.installed ? "" : `<div class="banner">${I.warn}<div><b>agent-browser is missing</b><div class="muted fs-13 mt-8">Agents use it to drive a real browser. Install it once in a terminal:</div><div class="cmd mt-8">${esc(AG.browser.install)}</div></div></div>`}
-    <div class="h2">AI agent</div><div class="box">${agents}</div>
     <div class="box pad mt-10"><div class="kv">
       <div class="f">Model<div>${cur ? `<button type="button" class="chip model" data-pick="model">${modelChipText(st.model, cur)} ${I.down}</button>` : '<span class="muted">Choose an agent first</span>'}</div></div>
       <label class="f">Minutes your agent may spend on one site<input type="number" id="timeoutIn" min="3" max="60" value="${esc(st.agent_timeout_min)}"></label>
@@ -920,11 +929,9 @@ function renderSettings() {
     </div><p class="muted fs-125 mt-12">Isolation: Codex runs with its workspace-write sandbox; Gemini uses its CLI sandbox only when <code>--help</code> advertises it. Claude restricts tools per task but has no OS sandbox. Antigravity, opencode, Cursor Agent, Qwen, Copilot and custom commands are not sandboxed by Lookout. Agent tasks run from a temporary folder with secret-like environment variables removed, except known login variables for the selected CLI.</p>
     <p class="muted fs-125 mt-12">Agent tools don't report how much quota is left. Lookout counts the calls it makes, remembers the last quota error and skips an agent until its quota resets.</p>
     <div class="row mt-12"><span class="grow"></span><button class="btn primary" data-act="save-agent">Save</button></div></div>
-    <div class="h2">Schedule and notifications</div><div class="box pad">
-      <div class="setrow"><div><b>Daily scan</b><small>${sch.supported ? `Runs in the background even when Lookout is closed${sch.backend ? ` (${esc(sch.backend)})` : ""}.` : esc(sch.hint || "Manual cron/systemd/launchd setup available below.")}</small></div>
-        <div class="row"><input type="time" id="schTime" class="w-110" value="${esc(st.schedule_time)}" aria-label="Time">${sch.supported ? `<label class="switch"><input type="checkbox" id="schOn" ${sch.enabled ? "checked" : ""}><i></i></label>` : ""}${sch.supported && sch.enabled ? `<button type="button" class="btn sm ghost" data-act="sched-test">Run now</button>` : ""}<button type="button" class="btn sm ghost" data-act="sched-preview">${schedPreview ? "Hide configs" : "Cron / systemd / launchd"}</button></div></div>
-      ${snipHtml}
-      <div class="setrow"><div><b>Desktop notification</b><small>When a scan finds new or updated items.</small></div><label class="switch"><input type="checkbox" id="notifyIn" ${st.notify === "1" ? "checked" : ""}><i></i></label></div>
+    <div class="pad">${history}<p>Configure a local custom command in <code>${esc(custom?.config_path || "data/agent_command.txt")}</code> or start Lookout with <code>--custom-command "..."</code>.</p></div></details>
+    <details class="box advanced" data-key="delivery"><summary>Schedule diagnostics and notification channels</summary>
+    <div class="box pad"><div class="row">${sch.supported && sch.enabled ? `<button type="button" class="btn sm ghost" data-act="sched-test">Run now</button>` : ""}<button type="button" class="btn sm ghost" data-act="sched-preview">${schedPreview ? "Hide configs" : "Cron / systemd / launchd"}</button></div>${snipHtml}
       <div class="setrow"><div><b>Unauthenticated localhost RSS/Atom feeds</b><small>Allow local feed readers on this computer (127.0.0.1) to fetch /api/watches/&lt;id&gt;/feed.xml without a session cookie while Lookout is running (default off).</small></div><label class="switch"><input type="checkbox" id="rssPublicIn" ${st.rss_public === "1" ? "checked" : ""}><i></i></label></div></div>
     <div class="h2">Webhook notification <span>optional (JSON / Slack / Discord / Telegram / ntfy)</span></div><div class="box pad"><div class="kv">
       <label class="f span-all">Webhook or ntfy topic URL<input type="url" id="webhookUrl" value="${esc(st.webhook_url || "")}" placeholder="https://ntfy.sh/my-lookout-alerts"></label>
@@ -951,10 +958,14 @@ function renderSettings() {
         <option value="0" ${st.smtp_starttls === "0" ? "selected" : ""}>Never (plain / SSL on 465)</option>
       </select></label>
     </div><div class="row mt-12"><span class="grow"></span><button class="btn" data-act="mail-test">Send test e-mail</button><button class="btn primary" data-act="save-mail">Save</button></div></div>
+    </details>
+    <details class="box advanced" data-key="profile"><summary>Eligibility profile</summary>${profileForm}</details>
+    <details class="box advanced" data-key="setup"><summary>Starter packs and setup backup</summary>
+    <div class="pad" id="starterPacks"></div>
     <div class="h2">Backup and restore</div><div class="box pad"><div class="setrow"><div><b>Setup and tracked items</b><small>Export or restore watches, sources, filters, saved/applied items and item history (passwords are never included).</small></div>
       <div class="row"><button type="button" class="btn sm" data-dl="/api/backup.json" data-fn="lookout-backup.json">${I.dl} Export JSON</button>
         <button type="button" class="btn sm" data-act="import-btn">Import JSON</button>
-        <input type="file" id="importFile" accept="application/json" class="hidden"></div></div></div></div>`;
+        <input type="file" id="importFile" accept="application/json" class="hidden"></div></div></div></details></div>`;
 }
 
 // ---------- scan detail ----------
@@ -1045,6 +1056,7 @@ function render() {
   const scrollTop = same ? main.scrollTop : 0;
   const open = same ? [...main.querySelectorAll("details[open][data-key]")].map((d) => d.dataset.key) : [];
   main.innerHTML = html; main.dataset.view = tag; lastHtml = html; lastTag = tag;
+  if (tag === "settings:ag") renderStarterPacks($("#starterPacks", main));
   for (const k of open) { const d = main.querySelector(`details[data-key="${CSS.escape(k)}"]`); if (d) d.open = true; }
   if (keepId && $("#" + keepId)) { const el = $("#" + keepId); el.focus({ preventScroll: true }); try { el.setSelectionRange(pos, pos); } catch (_) {} }
   main.scrollTop = scrollTop;
@@ -1090,10 +1102,18 @@ async function pollProgress() {
   }
 }
 
+let themeRevision = 0;
 async function refresh(reloadItemsToo = false) {
+  const requestedRevision = themeRevision;
   clearTimeout(timer);
   try {
-    S = await api("/api/state" + eligibilityQuery());
+    const state = await api("/api/state" + eligibilityQuery());
+    // A route change can fetch state just before a theme save completes.
+    if (requestedRevision !== themeRevision) state.settings.theme = S.settings.theme;
+    S = state;
+    applyTheme(S.settings.theme);
+    const picker = $("#themeSel");
+    if (picker && !picker.disabled) picker.value = S.settings.theme;
     sessionStorage.removeItem("lookout-reauth-ts");
     lastScanDone = S.progress?.done || 0;
     if (S.settings.agent && !modelCache[S.settings.agent]) modelsFor(S.settings.agent).then(() => { render.force = true; render(); }).catch((err) => { if (err?.status === 401 || err?.status === 403) handleAuthFailure(); });
@@ -1212,7 +1232,6 @@ document.addEventListener("click", async (e) => {
     if (d.watchDel) { const { count } = await api(`/api/watches/${d.watchDel}/tracked-count`); const detail = count ? ` ${count} tracked item${count === 1 ? "" : "s"} with actions, notes, or reminders will be kept in Agenda/Applied.` : " No tracked items will be kept."; if (!confirm(`Delete this watch, its sources, filters and scans?${detail} Other collected items will be deleted.`)) return; await api(`/api/watches/${d.watchDel}/delete`, {}); location.hash = "#/feed"; return refresh(true); }
     if (d.act === "save-agent") {
       await api("/api/settings", {
-        agent: $("input[name=agent]:checked")?.value || "",
         headed: $("#headedIn").checked ? "1" : "0",
         agent_timeout_min: $("#timeoutIn").value,
         parallel: $("#parallelIn").value,
@@ -1279,11 +1298,31 @@ document.addEventListener("change", async (e) => {
     if (d.fActive) { await api(`/api/filters/${d.fActive}`, { active: t.checked }); return refresh(true); }
     if (d.remind !== undefined) { await api(`/api/items/${encodeURIComponent(d.remind)}`, { remind_on: t.value }); toast("Reminder set"); return refresh(false); }
     if (d.note !== undefined) { await api(`/api/items/${encodeURIComponent(d.note)}`, { note: t.value }); return toast("Note saved"); }
-    if (t.name === "agent") { document.querySelectorAll(".agent").forEach((l) => l.classList.toggle("on", l.contains(t))); return; }
+    if (t.id === "settingsAgent") {
+      await api("/api/settings", { agent: t.value, model: "" });
+      render.force = true;
+      t.blur();
+      return refresh(false);
+    }
+    if (t.id === "themeSel") {
+      const theme = t.value;
+      t.disabled = true;
+      try {
+        await api("/api/settings", { theme });
+        themeRevision++;
+        S.settings.theme = theme;
+        applyTheme(theme);
+      } finally {
+        t.value = S.settings.theme;
+        t.disabled = false;
+      }
+      return;
+    }
     if (t.id === "notifyIn") { await api("/api/settings", { notify: t.checked ? "1" : "0" }); return toast("Saved"); }
     if (t.id === "rssPublicIn") { await api("/api/settings", { rss_public: t.checked ? "1" : "0" }); return toast("Saved"); }
     if (t.id === "schOn" || t.id === "schTime") {
       if ($("#schOn")) { const r = await api("/api/schedule", { enabled: $("#schOn").checked, at: $("#schTime").value }); toast(r.message); }
+      else await api("/api/settings", { schedule_time: $("#schTime").value });
       if (schedPreview) { schedPreview = await api(`/api/schedule/preview?at=${encodeURIComponent($("#schTime").value || "08:30")}`); render.force = true; }
       return refresh(false);
     }

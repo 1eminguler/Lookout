@@ -1,18 +1,25 @@
 """Local web UI + JSON API. Listens on 127.0.0.1 only."""
 import csv
+import hmac
+import html as _html
+import inspect
 import io as _io
 import json
 import mimetypes
 import os
 import re
+import secrets
 import sys
 import threading
 import time
 import traceback
 import urllib.parse
-from datetime import date
+import uuid
+from datetime import date, datetime, timezone
+from email.utils import format_datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, List, Optional
+from xml.sax.saxutils import escape as _xesc
 
 from lookout import agents, db, notify, scanner, tasks
 
@@ -20,6 +27,9 @@ WEB = db.ROOT / "web"
 PORT = int(os.environ.get("LOOKOUT_PORT") or 8780)
 HOSTS = {f"127.0.0.1:{PORT}", f"localhost:{PORT}"}
 SECRET_KEYS = {"smtp_password"}
+API_TOKEN = secrets.token_urlsafe(32)
+DEFAULT_ITEMS_LIMIT = 200
+MAX_ITEMS_LIMIT = 500
 discovery: Dict[str, Any] = {"id": None, "watch_id": None, "running": False, "request": "", "title": "",
                              "results": [], "error": "", "finished": None}
 _disc_lock = threading.Lock()
@@ -45,11 +55,28 @@ def public_settings() -> Dict[str, Any]:
     return out
 
 
-def state() -> Dict[str, Any]:
-    return {"items": db.items(), "scans": db.scans(), "discoveries": db.discoveries(),
-            "watches": db.watches(), "sources": db.sources(), "filters": db.filters(),
-            "progress": {k: scanner.progress.get(k) for k in ("running", "scan_id", "done", "total", "current", "learning")},
-            "settings": public_settings(), "discovery": dict(discovery), "schedule": _cached_schedule_status()}
+def state(limit: int = DEFAULT_ITEMS_LIMIT, offset: int = 0) -> Dict[str, Any]:
+    lim = max(1, min(MAX_ITEMS_LIMIT, int(limit)))
+    off = max(0, int(offset))
+    total = db.items_count()
+    page_items = db.items(limit=lim, offset=off)
+    return {
+        "items": page_items,
+        "items_total": total,
+        "items_limit": lim,
+        "items_offset": off,
+        "items_has_more": (off + len(page_items)) < total,
+        "agenda_items": db.agenda_items(),
+        "scans": db.scans(),
+        "discoveries": db.discoveries(),
+        "watches": db.watches(),
+        "sources": db.sources(),
+        "filters": db.filters(),
+        "progress": scanner.get_progress(),
+        "settings": public_settings(),
+        "discovery": dict(discovery),
+        "schedule": _cached_schedule_status(),
+    }
 
 
 def cancel_discovery(async_browser: bool = False) -> None:
@@ -64,32 +91,63 @@ def run_discovery(did: int, wid: Optional[int], request: str) -> None:
     results: List[Dict[str, Any]] = []
     error, status, title = "", "done", None
     added_ids: List[int] = []
+    scanned_ids: set = set()
+    sync_lock = threading.Lock()
+    disc_token = uuid.uuid4().hex
+    have_f = {(f["kind"], f["value"].strip().lower()) for f in db.filters(watch_id=wid)} if wid is not None else set()
+    have_u = {s["url"].rstrip("/").lower(): s["id"] for s in db.sources(watch_id=wid)} if wid is not None else {}
+
+    def _apply_partial(partial: Dict[str, Any], start_early: bool) -> None:
+        nonlocal results, title
+        p_sources = partial.get("sources") or []
+        p_filters = partial.get("filters") or []
+        p_title = partial.get("title")
+        new_sids: List[int] = []
+        with sync_lock:
+            results = list(p_sources)
+            if p_title:
+                title = p_title
+            with _disc_lock:
+                if discovery.get("id") == did:
+                    discovery["results"] = list(p_sources)
+                    if p_title:
+                        discovery["title"] = p_title
+            if wid is not None and db.watch_detail(wid):
+                if p_title:
+                    db.update_watch(wid, title=p_title)
+                for f in p_filters:
+                    key = (f["kind"], f["value"].strip().lower())
+                    if key not in have_f:
+                        try:
+                            db.add_filter(f["kind"], f["value"], watch_id=wid)
+                            have_f.add(key)
+                        except ValueError:
+                            pass
+                for c in p_sources:
+                    u = c["url"].rstrip("/").lower()
+                    if u not in have_u:
+                        sid = db.add_source(c["name"], c["url"], c.get("notes") or "", watch_id=wid)
+                        have_u[u] = sid
+                        added_ids.append(sid)
+                        new_sids.append(sid)
+        if start_early and new_sids and wid is not None and not _disc_cancel.is_set():
+            if scanner.enqueue_scan_sources(new_sids, watch_id=wid):
+                scanned_ids.update(new_sids)
+            elif scanner.start_scan_async("manual", only=new_sids, watch_id=wid):
+                scanned_ids.update(new_sids)
+
     try:
-        out = tasks.discover_sources(request, cancel_event=_disc_cancel, session=f"lookout-discover-{did}")
-        results = out["sources"]
-        title = out.get("title")
-        new_filters = out.get("filters") or []
+        if db.acquire_scan_lock(disc_token, name="discover"):
+            db.update_scan_lock(disc_token, scan_id=did, name="discover")
+        kw: Dict[str, Any] = {"cancel_event": _disc_cancel, "session": f"lookout-discover-{did}"}
+        sig_params = inspect.signature(tasks.discover_sources).parameters
+        if "on_progress" in sig_params or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig_params.values()):
+            kw["on_progress"] = lambda p: _apply_partial(p, start_early=True)
+        out = tasks.discover_sources(request, **kw)
         if _disc_cancel.is_set():
             status = "cancelled"
-        elif wid is not None and db.watch_detail(wid):
-            if title:
-                db.update_watch(wid, title=title)
-            have_f = {(f["kind"], f["value"].strip().lower()) for f in db.filters(watch_id=wid)}
-            for f in new_filters:
-                key = (f["kind"], f["value"].strip().lower())
-                if key not in have_f:
-                    try:
-                        db.add_filter(f["kind"], f["value"], watch_id=wid)
-                        have_f.add(key)
-                    except ValueError:
-                        pass
-            have_u = {s["url"].rstrip("/").lower() for s in db.sources(watch_id=wid)}
-            for c in results:
-                u = c["url"].rstrip("/").lower()
-                if u not in have_u:
-                    sid = db.add_source(c["name"], c["url"], c.get("notes") or "", watch_id=wid)
-                    added_ids.append(sid)
-                    have_u.add(u)
+        else:
+            _apply_partial(out, start_early=False)
     except agents.CancelledError:
         status, error = "cancelled", ""
     except Exception as e:
@@ -98,34 +156,216 @@ def run_discovery(did: int, wid: Optional[int], request: str) -> None:
         else:
             status, error = "failed", str(e)[:400]
     finally:
+        db.release_scan_lock(disc_token, name="discover")
         db.finish_discovery(did, status, results, error, title=title)
+        remaining = [sid for sid in added_ids if sid not in scanned_ids]
+        if status == "done" and remaining and wid is not None and db.watch_detail(wid):
+            if not scanned_ids:
+                scanner.start_scan_async("manual", only=remaining, watch_id=wid)
+            elif not scanner.enqueue_scan_sources(remaining, watch_id=wid):
+                scanner.start_scan_async("manual", only=remaining, watch_id=wid)
         with _disc_lock:
             if discovery.get("id") == did:
                 discovery.update(id=did, watch_id=wid, running=False, results=results, error=error,
                                  finished=db.now(), title=title or discovery.get("title", ""))
-        if status == "done" and added_ids and wid is not None and db.watch_detail(wid):
-            scanner.start_scan_async("manual", only=added_ids, watch_id=wid)
+
+
+def _csv_cell(v: Any) -> str:
+    s = "" if v is None else str(v)
+    if s and s[0] in ("=", "+", "-", "@", "\t", "\r"):
+        return "'" + s
+    return s
+
+
+def _ics_fold(line: str) -> str:
+    if len(line.encode("utf-8")) <= 75:
+        return line
+    parts: List[str] = []
+    cur = bytearray()
+    for ch in line:
+        b = ch.encode("utf-8")
+        if len(cur) + len(b) > 75:
+            parts.append(cur.decode("utf-8"))
+            cur = bytearray(b" " + b)
+        else:
+            cur.extend(b)
+    if cur:
+        parts.append(cur.decode("utf-8"))
+    return "\r\n".join(parts)
 
 
 def agenda_ics() -> str:
     """Saved items as all-day calendar events: one for the deadline, one for the user's reminder."""
     def text(v):
-        return str(v or "").replace("\\", "\\\\").replace(";", r"\;").replace(",", r"\,").replace("\n", " ")
-    stamp = db.now().replace("-", "").replace(":", "").replace(" ", "T")
-    lines = ["BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//Lookout//Agenda//EN", "CALSCALE:GREGORIAN", "X-WR-CALNAME:Lookout"]
-    for i in db.items():
-        if i["action"] not in ("saved", "applied"):
-            continue
+        s = str(v or "").replace("\r\n", "\n").replace("\r", "\n")
+        return s.replace("\\", "\\\\").replace(";", r"\;").replace(",", r"\,").replace("\n", r"\n")
+
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    lines = ["BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//Lookout//Agenda//EN", "CALSCALE:GREGORIAN",
+             "X-WR-CALNAME:Lookout"]
+    for i in db.agenda_items():
         for kind, day in (("Deadline", i["deadline"]), ("Reminder", i["remind_on"])):
             if not day:
                 continue
             d = day.replace("-", "")
-            lines += ["BEGIN:VEVENT", f"UID:{i['id']}-{kind.lower()}@lookout", f"DTSTAMP:{stamp}", f"DTSTART;VALUE=DATE:{d}",
-                      f"SUMMARY:{text(kind + ': ' + i['title'])}", f"URL:{text(i['url'])}",
-                      f"DESCRIPTION:{text(' - '.join(x for x in (i['org'], i['source_name'], i['note']) if x))}",
-                      "END:VEVENT"]
+            clean_url = str(i["url"] or "").replace("\r", "").replace("\n", "")
+            lines += [
+                "BEGIN:VEVENT",
+                f"UID:{i['id']}-{kind.lower()}@lookout",
+                f"DTSTAMP:{stamp}",
+                f"DTSTART;VALUE=DATE:{d}",
+                f"SUMMARY:{text(kind + ': ' + i['title'])}",
+                f"URL:{text(clean_url)}",
+                f"DESCRIPTION:{text(' - '.join(x for x in (i['org'], i['source_name'], i['note']) if x))}",
+                "END:VEVENT",
+            ]
     lines.append("END:VCALENDAR")
-    return "\r\n".join(lines) + "\r\n"
+    return "\r\n".join(_ics_fold(ln) for ln in lines) + "\r\n"
+
+
+def _rfc2822_ts(ts: str) -> str:
+    try:
+        dt = datetime.strptime(ts, db.TS).replace(tzinfo=timezone.utc)
+    except (TypeError, ValueError):
+        dt = datetime.now(timezone.utc)
+    return format_datetime(dt, usegmt=True)
+
+
+def _rfc3339_ts(ts: str) -> str:
+    try:
+        dt = datetime.strptime(ts, db.TS).replace(tzinfo=timezone.utc)
+    except (TypeError, ValueError):
+        dt = datetime.now(timezone.utc)
+    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _watch_rss(wid: int, base_url: str) -> Optional[str]:
+    w = db.watch_detail(wid)
+    if not w:
+        return None
+    items = db.watch_feed_items(wid, limit=100)
+    chan_link = f"{base_url}/#/watch/{wid}"
+    entries = []
+    for it in items:
+        desc_parts = [x for x in (
+            it.get("org"),
+            it.get("location"),
+            f"Deadline: {it['deadline']}" if it.get("deadline") else None,
+            it.get("change_summary"),
+            it.get("summary"),
+        ) if x]
+        entries.append(
+            "<item>"
+            f"<title>{_xesc(it['title'])}</title>"
+            f"<link>{_xesc(it['url'])}</link>"
+            f"<guid isPermaLink=\"false\">{_xesc(it['id'])}</guid>"
+            f"<pubDate>{_xesc(_rfc2822_ts(it.get('updated_at') or it['first_seen']))}</pubDate>"
+            f"<description>{_xesc(' · '.join(desc_parts))}</description>"
+            "</item>"
+        )
+    return (
+        '<?xml version="1.0" encoding="utf-8"?>\n'
+        '<rss version="2.0"><channel>'
+        f"<title>{_xesc('Lookout — ' + w['title'])}</title>"
+        f"<link>{_xesc(chan_link)}</link>"
+        f"<description>{_xesc(w.get('request') or w['title'])}</description>"
+        + "".join(entries)
+        + "</channel></rss>\n"
+    )
+
+
+def _watch_atom(wid: int, base_url: str) -> Optional[str]:
+    w = db.watch_detail(wid)
+    if not w:
+        return None
+    items = db.watch_feed_items(wid, limit=100)
+    updated = _rfc3339_ts(
+        max((it.get("updated_at") or it["first_seen"] for it in items), default=db.now())
+    )
+    entries = []
+    for it in items:
+        desc_parts = [x for x in (
+            it.get("org"),
+            it.get("location"),
+            f"Deadline: {it['deadline']}" if it.get("deadline") else None,
+            it.get("change_summary"),
+            it.get("summary"),
+        ) if x]
+        entries.append(
+            "<entry>"
+            f"<id>urn:lookout:item:{_xesc(it['id'])}</id>"
+            f"<title>{_xesc(it['title'])}</title>"
+            f"<link href=\"{_xesc(it['url'])}\"/>"
+            f"<updated>{_xesc(_rfc3339_ts(it.get('updated_at') or it['first_seen']))}</updated>"
+            f"<summary>{_xesc(' · '.join(desc_parts))}</summary>"
+            "</entry>"
+        )
+    return (
+        '<?xml version="1.0" encoding="utf-8"?>\n'
+        '<feed xmlns="http://www.w3.org/2005/Atom">'
+        f"<id>urn:lookout:watch:{wid}</id>"
+        f"<title>{_xesc('Lookout — ' + w['title'])}</title>"
+        f"<link href=\"{_xesc(base_url + '/#/watch/' + str(wid))}\"/>"
+        f"<updated>{_xesc(updated)}</updated>"
+        + "".join(entries)
+        + "</feed>\n"
+    )
+
+
+def _schedule_snippets(at: str) -> Dict[str, Any]:
+    if hasattr(notify, "schedule_preview"):
+        prev = notify.schedule_preview(at)
+        return {
+            "at": at,
+            "platform": sys.platform,
+            "cron": prev.get("cron", ""),
+            "crontab": prev.get("cron", ""),
+            "systemd_service": prev.get("systemd_service", ""),
+            "systemd_timer": prev.get("systemd_timer", ""),
+            "launchd_plist": prev.get("launchd_plist", ""),
+            "schedule": _cached_schedule_status(),
+        }
+    hh, mm = at.split(":")
+    h_num, m_num = int(hh), int(mm)
+    root = str(db.ROOT)
+    script = str(db.ROOT / "run.py")
+    py = sys.executable
+    cron_line = f"{m_num} {h_num} * * * cd \"{root}\" && \"{py}\" \"{script}\" scan --scheduled"
+    service = (
+        "[Unit]\nDescription=Lookout daily scan\n\n[Service]\nType=oneshot\n"
+        f"WorkingDirectory={root}\nExecStart=\"{py}\" \"{script}\" scan --scheduled\n"
+    )
+    timer = (
+        "[Unit]\nDescription=Run Lookout daily scan\n\n[Timer]\n"
+        f"OnCalendar=*-*-* {hh}:{mm}:00\nPersistent=true\n\n[Install]\nWantedBy=timers.target\n"
+    )
+    plist = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" '
+        '"http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
+        '<plist version="1.0"><dict>\n'
+        '  <key>Label</key><string>com.lookout.dailyscan</string>\n'
+        '  <key>ProgramArguments</key><array>\n'
+        f'    <string>{_xesc(py)}</string><string>{_xesc(script)}</string>'
+        '<string>scan</string><string>--scheduled</string>\n'
+        '  </array>\n'
+        f'  <key>WorkingDirectory</key><string>{_xesc(root)}</string>\n'
+        '  <key>StartCalendarInterval</key><dict>\n'
+        f'    <key>Hour</key><integer>{h_num}</integer>'
+        f'<key>Minute</key><integer>{m_num}</integer>\n'
+        '  </dict>\n'
+        '</dict></plist>\n'
+    )
+    return {
+        "at": at,
+        "platform": sys.platform,
+        "cron": cron_line,
+        "crontab": cron_line,
+        "systemd_service": service,
+        "systemd_timer": timer,
+        "launchd_plist": plist,
+        "schedule": _cached_schedule_status(),
+    }
 
 
 def _parse_int(v: Any, name: str) -> int:
@@ -235,6 +475,54 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
 
+    def _expected_token(self) -> str:
+        return getattr(self.server, "api_token", None) or API_TOKEN
+
+    def _render_index(self) -> bytes:
+        raw = (WEB / "index.html").read_text(encoding="utf-8")
+        tok = _html.escape(self._expected_token(), quote=True)
+        meta = f'<meta name="lookout-token" content="{tok}">'
+        if '<meta name="lookout-token"' in raw:
+            out = re.sub(r'<meta name="lookout-token" content="[^"]*">', meta, raw, count=1)
+        else:
+            out = raw.replace("</head>", f"{meta}\n</head>", 1)
+        return out.encode("utf-8")
+
+    def _token_exempt(self, method: str, path: str) -> bool:
+        return (
+            method == "GET"
+            and bool(re.fullmatch(r"/api/watches/\d+/(?:feed|atom)\.xml", path))
+            and db.get_settings().get("rss_public") == "1"
+        )
+
+    def _drain_small_body(self) -> None:
+        if self.command != "POST":
+            return
+        raw_len = self.headers.get("Content-Length")
+        if not raw_len:
+            return
+        try:
+            n = int(raw_len)
+        except ValueError:
+            return
+        if 0 < n <= 65536:
+            try:
+                self.rfile.read(n)
+            except OSError:
+                pass
+
+    def _require_token(self, method: str, path: str) -> bool:
+        if not path.startswith("/api/"):
+            return True
+        if self._token_exempt(method, path):
+            return True
+        got = self.headers.get("X-Lookout-Token") or ""
+        if not hmac.compare_digest(got, self._expected_token()):
+            self._drain_small_body()
+            self.send(401, {"error": "unauthorized"})
+            return False
+        return True
+
     def send(self, code: int, body, ctype: str = "application/json; charset=utf-8"):
         data = body if isinstance(body, bytes) else json.dumps(body, ensure_ascii=False, default=str).encode("utf-8")
         try:
@@ -254,6 +542,7 @@ class Handler(BaseHTTPRequestHandler):
         default_hosts = {f"127.0.0.1:{PORT}", f"localhost:{PORT}"}
         allowed_hosts = set(HOSTS) if HOSTS != default_hosts else {f"127.0.0.1:{port}", f"localhost:{port}"}
         if self.headers.get("Host") not in allowed_hosts:
+            self._drain_small_body()
             self.send(403, {"error": "forbidden"})
             return False
         origin = self.headers.get("Origin")
@@ -261,6 +550,7 @@ class Handler(BaseHTTPRequestHandler):
             p = urllib.parse.urlparse(origin)
             if (p.scheme not in ("http", "https") or p.netloc not in allowed_hosts
                     or p.path not in ("", "/") or p.query or p.fragment):
+                self._drain_small_body()
                 self.send(403, {"error": "forbidden"})
                 return False
         last_hit["t"] = time.time()
@@ -289,22 +579,44 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if not self.allowed():
             return
+        parsed = urllib.parse.urlsplit(self.path)
+        if not self._require_token("GET", parsed.path):
+            return
         try:
-            self._get(self.path.split("?")[0])
+            qs = urllib.parse.parse_qs(parsed.query)
+            self._get(parsed.path, qs)
         except ValueError as e:
             self.send(400, {"error": str(e)})
         except Exception:
             traceback.print_exc()
             self.send(500, {"error": "Internal server error"})
 
-    def _get(self, path: str):
+    def _get(self, path: str, qs: Optional[Dict[str, List[str]]] = None):
+        qs = qs or {}
         if path in ("/", "/index.html"):
-            return self.send(200, (WEB / "index.html").read_bytes(), "text/html; charset=utf-8")
+            return self.send(200, self._render_index(), "text/html; charset=utf-8")
         if re.fullmatch(r"/[\w.-]+\.(js|css|svg|ico|png)", path) and (WEB / path[1:]).is_file():
             ctype = mimetypes.guess_type(path)[0] or "application/octet-stream"
             return self.send(200, (WEB / path[1:]).read_bytes(), ctype)
         if path == "/api/state":
-            return self.send(200, state())
+            lim = max(1, min(MAX_ITEMS_LIMIT, _parse_int(qs["limit"][0], "limit"))) if "limit" in qs else DEFAULT_ITEMS_LIMIT
+            off = max(0, _parse_int(qs["offset"][0], "offset")) if "offset" in qs else 0
+            return self.send(200, state(limit=lim, offset=off))
+        if path == "/api/items":
+            lim = max(1, min(MAX_ITEMS_LIMIT, _parse_int(qs["limit"][0], "limit"))) if "limit" in qs else DEFAULT_ITEMS_LIMIT
+            off = max(0, _parse_int(qs["offset"][0], "offset")) if "offset" in qs else 0
+            wid_arg: Any = db._UNSET
+            if "watch_id" in qs and qs["watch_id"][0] != "":
+                raw_w = qs["watch_id"][0]
+                wid_arg = None if raw_w == "global" else _parse_int(raw_w, "watch_id")
+            total = db.items_count(watch_id=wid_arg)
+            rows = db.items(limit=lim, offset=off, watch_id=wid_arg)
+            return self.send(200, {"items": rows, "total": total, "limit": lim, "offset": off,
+                                   "has_more": (off + len(rows)) < total})
+        if m := re.fullmatch(r"/api/items/([\w-]+)/history", path):
+            if not db.item_by_id(m[1]):
+                return self.send(404, {"error": "not found"})
+            return self.send(200, {"history": db.item_history(m[1])})
         if path == "/api/agenda.ics":
             return self.send(200, agenda_ics().encode("utf-8"), "text/calendar; charset=utf-8")
         if path == "/api/export.csv":
@@ -315,20 +627,39 @@ class Handler(BaseHTTPRequestHandler):
             for i in db.items():
                 if i.get("match") == 0:
                     continue
-                w.writerow([i["title"], i["org"], i["category"], i["source_name"], i["deadline"], i["start_date"],
-                            i["location"], i["url"], i["first_seen"], i["status"], i["action"], i["note"]])
+                w.writerow([_csv_cell(x) for x in (
+                    i["title"], i["org"], i["category"], i["source_name"], i["deadline"], i["start_date"],
+                    i["location"], i["url"], i["first_seen"], i["status"], i["action"], i["note"]
+                )])
             return self.send(200, ("\ufeff" + buf.getvalue()).encode("utf-8"), "text/csv; charset=utf-8")
         if path == "/api/backup.json":
             return self.send(200, _backup_payload())
         if m := re.fullmatch(r"/api/watches/(\d+)", path):
             w = db.watch_detail(int(m[1]))
             return self.send(200 if w else 404, w or {"error": "not found"})
+        if m := re.fullmatch(r"/api/watches/(\d+)/feed\.xml", path):
+            base = f"http://127.0.0.1:{self.server.server_address[1]}"
+            xml_txt = _watch_rss(int(m[1]), base)
+            if xml_txt is None:
+                return self.send(404, {"error": "not found"})
+            return self.send(200, xml_txt.encode("utf-8"), "application/rss+xml; charset=utf-8")
+        if m := re.fullmatch(r"/api/watches/(\d+)/atom\.xml", path):
+            base = f"http://127.0.0.1:{self.server.server_address[1]}"
+            xml_txt = _watch_atom(int(m[1]), base)
+            if xml_txt is None:
+                return self.send(404, {"error": "not found"})
+            return self.send(200, xml_txt.encode("utf-8"), "application/atom+xml; charset=utf-8")
         if m := re.fullmatch(r"/api/scans/(\d+)", path):
             d = db.scan_detail(int(m[1]))
             return self.send(200 if d else 404, d or {"error": "not found"})
         if m := re.fullmatch(r"/api/discoveries/(\d+)", path):
             d = db.discovery_detail(int(m[1]))
             return self.send(200 if d else 404, d or {"error": "not found"})
+        if path == "/api/schedule/preview":
+            at = str((qs.get("at") or [db.get_settings().get("schedule_time") or "08:30"])[0]).strip()[:5]
+            if not notify._TIME_RE.fullmatch(at):
+                raise ValueError("Time must be in HH:MM format (e.g. 08:30)")
+            return self.send(200, _schedule_snippets(at))
         if path == "/api/agents":
             return self.send(200, {"agents": agents.detect(), "browser": agents.browser_tool(),
                                    "settings": public_settings()})
@@ -341,9 +672,12 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         if not self.allowed():
             return
+        path = self.path.split("?")[0]
+        if not self._require_token("POST", path):
+            return
         try:
             b = self.body()
-            return self.route(self.path.split("?")[0], b)
+            return self.route(path, b)
         except (ValueError, json.JSONDecodeError) as e:
             return self.send(400, {"error": str(e) if isinstance(e, ValueError) else "bad json"})
         except Exception:
@@ -417,6 +751,29 @@ class Handler(BaseHTTPRequestHandler):
                 if not db.watch_detail(wid):
                     return self.send(404, {"error": "watch not found"})
             return self.send(200, {"id": db.add_source(name, url, str(b.get("notes") or ""), watch_id=wid)})
+        if p == "/api/sources/test":
+            url = str(b.get("url") or "").strip()
+            if not re.match(r"^https?://", url, re.I):
+                raise ValueError("An http(s) URL is required")
+            wid = None
+            if b.get("watch_id") is not None:
+                wid = _parse_int(b["watch_id"], "watch_id")
+            src = {
+                "id": None,
+                "name": (str(b.get("name") or "").strip() or "Preview")[:80],
+                "url": url[:500],
+                "notes": str(b.get("notes") or "").strip()[:1000],
+                "method": "agent",
+                "watch_id": wid,
+            }
+            return self.send(200, scanner.test_source(src))
+        if m := re.fullmatch(r"/api/sources/(\d+)/test", p):
+            src = db.source_by_id(int(m[1]))
+            if not src:
+                return self.send(404, {"error": "not found"})
+            if "notes" in b and b["notes"] is not None:
+                src = {**src, "notes": str(b["notes"]).strip()[:1000]}
+            return self.send(200, scanner.test_source(src))
         if m := re.fullmatch(r"/api/sources/(\d+)", p):
             sid = int(m[1])
             fields: Dict[str, Any] = {}
@@ -490,7 +847,12 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(200, {"ok": True})
 
         if p == "/api/settings":
+            if "custom_command" in b:
+                if b.get("confirm_custom_command") is not True:
+                    return self.send(403, {"error": "Changing custom_command requires confirmation from the Settings form"})
             vals = {k: v for k, v in b.items() if k in db.DEFAULTS and not (k in SECRET_KEYS and not v)}
+            if "custom_command" in vals:
+                vals["custom_command"] = agents.validate_custom_command(str(vals["custom_command"] or ""))
             if vals.get("agent") not in (None, "") and vals["agent"] != "custom" and vals["agent"] not in agents.AGENTS:
                 raise ValueError("unknown agent")
             for k, lo, hi in (("agent_timeout_min", 1, 120), ("parallel", 1, 8), ("smtp_port", 1, 65535)):
@@ -499,7 +861,7 @@ class Handler(BaseHTTPRequestHandler):
                     if n < lo or n > hi:
                         raise ValueError(f"{k} must be between {lo} and {hi}")
                     vals[k] = str(n)
-            for k in ("headed", "notify", "verify_weekly", "first_run_done"):
+            for k in ("headed", "notify", "verify_weekly", "first_run_done", "rss_public", "webhook_allow_local"):
                 if k in vals:
                     if isinstance(vals[k], bool):
                         vals[k] = "1" if vals[k] else "0"
@@ -507,6 +869,11 @@ class Handler(BaseHTTPRequestHandler):
                         vals[k] = str(vals[k])
                     else:
                         raise ValueError(f"{k} must be 0 or 1")
+            if "webhook_url" in vals:
+                wu = str(vals["webhook_url"] or "").strip()[:500]
+                if wu and not re.match(r"^https?://", wu, re.I):
+                    raise ValueError("webhook_url must start with http:// or https://")
+                vals["webhook_url"] = wu
             if "schedule_time" in vals:
                 st_val = str(vals["schedule_time"]).strip()[:5]
                 if not notify._TIME_RE.fullmatch(st_val):
@@ -519,14 +886,59 @@ class Handler(BaseHTTPRequestHandler):
             at = str(b.get("at") or "08:30").strip()[:5]
             if enabled and not notify._TIME_RE.fullmatch(at):
                 raise ValueError("Time must be in HH:MM format (e.g. 08:30)")
-            ok, msg = notify.set_schedule(enabled, at)
+            set_params = inspect.signature(notify.set_schedule).parameters
+            accepts_kw = any(param.kind == inspect.Parameter.VAR_KEYWORD for param in set_params.values())
+            kw = {}
+            if "backend" in set_params or accepts_kw:
+                val = b.get("backend") if b.get("backend") is not None else b.get("method")
+                if val is not None:
+                    kw["backend"] = str(val)
+            ok, msg = notify.set_schedule(enabled, at, **kw)
             _sched_cache.update(t=0.0, key=None, val=None)
             if ok:
                 db.set_settings({"schedule_time": at})
             return self.send(200, {"ok": ok, "message": msg})
+        if p == "/api/schedule/preview":
+            at = str(b.get("at") or db.get_settings().get("schedule_time") or "08:30").strip()[:5]
+            if not notify._TIME_RE.fullmatch(at):
+                raise ValueError("Time must be in HH:MM format (e.g. 08:30)")
+            return self.send(200, _schedule_snippets(at))
         if p == "/api/mail/test":
             port = self.server.server_address[1]
             ok, msg = notify.mail_digest([], f"http://127.0.0.1:{port}/")
+            return self.send(200, {"ok": ok, "message": msg})
+        if p == "/api/webhook/test":
+            st = db.get_settings()
+            url = str(b.get("url") or st.get("webhook_url") or "").strip()
+            if not url:
+                raise ValueError("Webhook URL is empty")
+            if not re.match(r"^https?://", url, re.I):
+                raise ValueError("Webhook URL must start with http:// or https://")
+            fn = getattr(notify, "webhook", None)
+            if not callable(fn):
+                return self.send(200, {"ok": False, "message": "Webhook helper is unavailable."})
+            allow_local = (
+                bool(b["allow_local"]) if "allow_local" in b else (st.get("webhook_allow_local") == "1")
+            )
+            payload = {
+                "event": "test",
+                "title": "Lookout test webhook",
+                "message": "Webhook notifications from Lookout are working.",
+                "items": [],
+            }
+            try:
+                wh_params = inspect.signature(fn).parameters
+                wh_kw = any(param.kind == inspect.Parameter.VAR_KEYWORD for param in wh_params.values())
+                if "allow_local" in wh_params or wh_kw:
+                    res = fn(url, payload, allow_local=allow_local)
+                else:
+                    res = fn(url, payload)
+                if isinstance(res, tuple):
+                    ok, msg = bool(res[0]), str(res[1])
+                else:
+                    ok, msg = bool(res), ("Webhook sent." if res else "Webhook failed.")
+            except Exception as e:
+                ok, msg = False, str(e)[:300]
             return self.send(200, {"ok": ok, "message": msg})
         if p == "/api/import":
             return self.send(200, {"ok": True, "added": _import_payload(b)})
@@ -579,10 +991,14 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def make_server(port: Optional[int] = None) -> ThreadingHTTPServer:
+    global API_TOKEN
     db.init()
     db.mark_interrupted()
     scanner.load_plugins()
+    token = secrets.token_urlsafe(32)
+    API_TOKEN = token
     srv = ThreadingHTTPServer(("127.0.0.1", PORT if port is None else port), Handler)
+    srv.api_token = token
     srv.daemon_threads = True
     return srv
 

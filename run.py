@@ -54,8 +54,7 @@ def start_ui_in_background() -> None:
 
 def cmd_scan(scheduled: bool) -> None:
     db.init()
-    if not port_busy():
-        db.mark_interrupted()
+    db.mark_interrupted()
     if not wait_for_internet():
         print("No internet connection; scan skipped.")
         return
@@ -126,10 +125,11 @@ class WindowApi:
 
 
 def open_window(start_server: bool = True) -> bool:
-    """Native desktop window (pywebview). Returns False when pywebview is not installed."""
+    """Native desktop window (pywebview). Falls back to browser when unavailable or failing to start."""
     try:
         import webview
-    except ImportError:
+    except Exception as e:
+        print(f"Desktop window unavailable ({e}); opening in browser.")
         return False
     import threading
     # One window at a time: a second launch while Lookout is open does nothing.
@@ -139,17 +139,33 @@ def open_window(start_server: bool = True) -> bool:
         _single.bind(("127.0.0.1", server.PORT + 1))
     except OSError:
         return True
+    srv = None
     if start_server:
-        threading.Thread(target=server.serve, daemon=True).start()
+        srv = server.make_server()
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
         for _ in range(50):
             if port_busy():
                 break
             time.sleep(0.1)
-    api = WindowApi()
-    api._window = webview.create_window("Lookout", URL, js_api=api, width=1320, height=860, min_size=(960, 620),
-                                        frameless=True, easy_drag=False, background_color="#0A0A0B")
-    webview.start()
-    return True
+    try:
+        api = WindowApi()
+        api._window = webview.create_window("Lookout", URL, js_api=api, width=1320, height=860, min_size=(960, 620),
+                                            frameless=True, easy_drag=False, background_color="#0A0A0B")
+        webview.start()
+        return True
+    except Exception as e:
+        print(f"Could not start desktop window ({e}); opening in browser.")
+        if srv is not None:
+            try:
+                srv.shutdown()
+                srv.server_close()
+            except Exception:
+                pass
+        try:
+            _single.close()
+        except Exception:
+            pass
+        return False
 
 
 if __name__ == "__main__":

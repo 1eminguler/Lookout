@@ -32,18 +32,34 @@ const SCOPE = `<svg viewBox="0 0 120 120" aria-hidden="true"><defs><radialGradie
   <circle cx="83" cy="40" r="2.6" fill="#7B9CFF"/><circle cx="41" cy="78" r="2" fill="#7B9CFF" opacity=".6"/><circle cx="60" cy="60" r="3" fill="#EDEDEF"/></svg>`;
 
 let S = null, AG = null, route = { view: "home", id: null };
+let itemsLimit = 200, sourcePreview = null, schedPreview = null;
+const API_TOKEN = document.querySelector('meta[name="lookout-token"]')?.content || "";
 const ui = JSON.parse(localStorage.getItem("lookout-ui") || "{}");
-ui.sort ??= "deadline"; ui.cats ??= []; ui.src ??= ""; ui.q = ""; ui.calMonth ??= null; ui.showSnoozed ??= false;
+ui.sort ??= "deadline"; ui.cats ??= []; ui.src ??= ""; ui.q = ""; ui.calMonth ??= null; ui.showSnoozed ??= false; ui.onlyUpdated ??= false;
 const keep = () => localStorage.setItem("lookout-ui", JSON.stringify({ ...ui, q: "" }));
 document.body.classList.add("browser");
 window.addEventListener("pywebviewready", () => document.body.classList.remove("browser"));
 
-const api = (path, body) => fetch(path, body === undefined ? { cache: "no-store" } : {
-  method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }).then(async (r) => {
-  const j = await r.json().catch(() => ({}));
-  if (!r.ok) throw new Error(j.error || r.statusText);
-  return j;
-});
+const api = (path, body) => {
+  const headers = API_TOKEN ? { "X-Lookout-Token": API_TOKEN } : {};
+  const opts = body === undefined
+    ? { cache: "no-store", headers }
+    : { method: "POST", headers: { ...headers, "Content-Type": "application/json" }, body: JSON.stringify(body) };
+  return fetch(path, opts).then(async (r) => {
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(j.error || r.statusText);
+    return j;
+  });
+};
+async function downloadApi(path, filename) {
+  const headers = API_TOKEN ? { "X-Lookout-Token": API_TOKEN } : {};
+  const r = await fetch(path, { cache: "no-store", headers });
+  if (!r.ok) { const j = await r.json().catch(() => ({})); throw new Error(j.error || r.statusText); }
+  const url = URL.createObjectURL(await r.blob());
+  const a = document.createElement("a"); a.href = url; a.download = filename;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
 function toast(msg) { const t = $("#toast"); t.textContent = msg; t.classList.add("on"); clearTimeout(t._h); t._h = setTimeout(() => t.classList.remove("on"), 3200); }
 
 // ---------- dates ----------
@@ -54,7 +70,20 @@ const daysTo = (s) => (s ? Math.round((parseIso(s) - today0()) / 864e5) : null);
 const short = (s) => { const d = parseIso(s); return `${d.getDate()} ${MON[d.getMonth()]}` + (d.getFullYear() !== new Date().getFullYear() ? ` ${d.getFullYear()}` : ""); };
 const target = (i) => i.deadline || i.start_date || null;
 const isNew = (i) => Date.now() - new Date(i.first_seen.replace(" ", "T")).getTime() < 72 * 36e5;
+const isUpdated = (i) => Boolean(i.updated_at && i.last_change_kind && i.last_change_kind !== "closed" && (Date.now() - new Date(i.updated_at.replace(" ", "T")).getTime() < 72 * 36e5));
 const isSnoozed = (i) => Boolean(i.snoozed_until && daysTo(i.snoozed_until) > 0);
+const agendaBase = () => S.agenda_items || S.items || [];
+const findItem = (id) => (S?.items || []).find((x) => x.id === id) || (S?.agenda_items || []).find((x) => x.id === id) || null;
+function syncItem(id, patch) {
+  for (const list of [S?.items, S?.agenda_items]) {
+    const it = list?.find((x) => x.id === id);
+    if (it) Object.assign(it, patch);
+  }
+  if ((patch.action === "saved" || patch.action === "applied") && S?.agenda_items && !S.agenda_items.some((x) => x.id === id)) {
+    const src = findItem(id);
+    if (src) S.agenda_items.unshift({ ...src });
+  }
+}
 function ago(ts) {
   const m = Math.round((Date.now() - new Date(ts.replace(" ", "T")).getTime()) / 6e4);
   if (m < 2) return "just now"; if (m < 60) return `${m} minutes ago`;
@@ -189,7 +218,7 @@ function renderSide() {
   document.querySelectorAll("[data-nav]").forEach((a) => a.classList.toggle("on", a.dataset.nav === route.view));
   const open = openItems(), fresh = open.filter(isNew).length;
   $("#navFeed").textContent = open.length || ""; $("#navFeed").classList.toggle("hot", fresh > 0);
-  $("#navAgenda").textContent = S.items.filter((i) => i.action === "saved").length || "";
+  $("#navAgenda").textContent = agendaBase().filter((i) => i.action === "saved").length || "";
   $("#navSources").textContent = S.sources.filter((s) => s.active).length || "";
   $("#navFilters").textContent = S.filters.filter((f) => !f.watch_id && f.active).length || "";
   const p = S.progress, btn = $("#scanBtn");
@@ -241,21 +270,27 @@ function itemCard(i, opts = {}) {
   const who = [i.org, i.location].filter(Boolean).map((x) => `<span>${esc(x)}</span>`).join("");
   const b = (act, tip, on, cls = "") => `<button class="ib ${on ? "on" : ""} ${cls}" data-item="${esc(i.id)}" data-set="${act}" data-tip="${tip}" aria-label="${tip}">${act === "hidden" && on ? I.undo : I[{ saved: "save", applied: "done", hidden: "hide" }[act]]}</button>`;
   const also = i._alsoOn && i._alsoOn.length ? `<span class="tag">also on ${esc(i._alsoOn.join(", "))}</span>` : "";
+  const upd = isUpdated(i);
+  const updLabel = i.last_change_kind === "deadline_moved" ? "Deadline moved" : i.last_change_kind === "reopened" ? "Reopened" : "Updated";
+  const updTag = upd ? `<span class="tag updated">${updLabel}</span>` : "";
   return `<article class="item">${whenBox(i)}<div class="ibody">
-      <div class="meta">${(opts.isNew ?? isNew(i)) ? '<span class="tag new">New</span>' : ""}${i.category ? `<span class="tag accent">${esc(i.category)}</span>` : ""}<span class="tag">${esc(i.source_name)}</span>${also}${w ? `<a class="tag accent" href="#/watch/${w.id}" style="text-decoration:none">${esc(w.title)}</a>` : ""}${sn ? `<span class="tag warn">snoozed until ${short(i.snoozed_until)}</span>` : ""}${i.status === "gone" ? '<span class="tag bad">no longer listed</span>' : ""}</div>
+      <div class="meta">${(opts.isNew ?? isNew(i)) ? '<span class="tag new">New</span>' : ""}${updTag}${i.category ? `<span class="tag accent">${esc(i.category)}</span>` : ""}<span class="tag">${esc(i.source_name)}</span>${also}${w ? `<a class="tag accent" href="#/watch/${w.id}" style="text-decoration:none">${esc(w.title)}</a>` : ""}${sn ? `<span class="tag warn">snoozed until ${short(i.snoozed_until)}</span>` : ""}${i.status === "gone" ? '<span class="tag bad">no longer listed</span>' : ""}</div>
       <h3><a href="${esc(safeUrl(i.url))}" data-ext target="_blank" rel="noopener noreferrer">${esc(i.title)}</a></h3>
-      ${who ? `<div class="who">${who}</div>` : ""}${i.summary ? `<p class="sum">${esc(i.summary)}</p>` : ""}${i.note ? `<div class="note">${esc(i.note)}</div>` : ""}</div>
+      ${who ? `<div class="who">${who}</div>` : ""}${upd && i.change_summary ? `<div class="change-note">${esc(i.change_summary)}</div>` : ""}${i.summary ? `<p class="sum">${esc(i.summary)}</p>` : ""}${i.note ? `<div class="note">${esc(i.note)}</div>` : ""}</div>
     <div class="acts">${b("saved", a === "saved" ? "Remove from agenda" : "Add to agenda", a === "saved")}${b("applied", a === "applied" ? "Mark as not done" : "Mark as done", a === "applied", "green")}<button class="ib ${sn ? "on" : ""}" data-pick="snooze" data-sid="${esc(i.id)}" data-tip="${sn ? "Snoozed until " + short(i.snoozed_until) : "Snooze"}" aria-label="Snooze">${I.clock}</button>${b("hidden", a === "hidden" ? "Unhide" : "Hide", a === "hidden")}</div></article>`;
 }
 function progressBox() {
   const p = S.progress; if (!p.running) return "";
-  const what = p.learning && p.learning.length ? `Your agent is learning ${esc(p.learning.join(", "))}. This happens once per site and takes a few minutes.` : p.current.length ? `Reading ${esc(p.current.join(", "))}` : "";
+  const learnActive = Math.min(p.learning_total || p.learning?.length || 0, (p.learning_done || 0) + (p.learning?.length || 0));
+  const what = p.learning && p.learning.length
+    ? `Learning ${learnActive} of ${p.learning_total || learnActive}: ${esc(p.learning.join(", "))}. This happens once per site.`
+    : p.current.length ? `Reading ${esc(p.current.join(", "))}` : "";
   return `<div class="progress"><div class="row"><b>Scanning ${p.done} of ${p.total} sources</b><span class="grow"></span><button class="btn sm ghost" data-act="cancel">${I.stop} Stop</button></div>
     <div class="muted" style="font-size:13px;margin-top:2px">${what}</div><div class="pbar"><i style="width:${p.total ? Math.round((p.done / p.total) * 100) : 3}%"></i></div></div>`;
 }
 function openSnoozePicker(anchor) {
   closePops();
-  const it = S.items.find((x) => x.id === anchor.dataset.sid); if (!it) return;
+  const it = findItem(anchor.dataset.sid); if (!it) return;
   const add = (n) => { const d = today0(); d.setDate(d.getDate() + n); return iso(d); };
   const opts = [["Tomorrow", add(1)], ["In 3 days", add(3)], ["In a week", add(7)]];
   const pop = document.createElement("div"); pop.className = "pop"; popEl = pop;
@@ -265,8 +300,7 @@ function openSnoozePicker(anchor) {
   placePop(pop, anchor, "below");
 }
 async function setSnooze(id, date) {
-  const it = S.items.find((x) => x.id === id);
-  if (it) it.snoozed_until = date || null;
+  syncItem(id, { snoozed_until: date || null });
   closePops(); render();
   await api(`/api/items/${encodeURIComponent(id)}`, { snoozed_until: date || "" });
   toast(date ? `Snoozed until ${short(date)}` : "Unsnoozed");
@@ -302,16 +336,17 @@ function renderHome() {
     ${d.running && d.id ? `<div class="disc-bar"><a href="#/search/${d.id}"><i class="live"></i><span>Searching for <b>${esc(d.title || d.request)}</b></span><span class="grow"></span><span class="muted">View search →</span></a><button type="button" class="btn sm ghost" data-act="cancel-disc">${I.stop} Stop</button></div>` : ""}
     ${!d.running && d.error ? `<p style="color:var(--red);font-size:13px;margin:12px 0 0">${esc(d.error)}</p>` : ""}
     ${cands ? `<div class="found"><div class="h2">Suggested sources <span>${d.results.length}</span><span class="grow"></span><button class="btn sm ghost" data-act="clear-disc">Clear</button></div><div class="list">${cands}</div></div>` : ""}
-    <div class="glance">${S.scans.length ? `<a href="#/feed"><b class="${fresh ? "hot" : ""}">${fresh}</b> new in the last 3 days</a><a href="#/feed"><b class="${week ? "warn" : ""}">${week}</b> closing this week</a><a href="#/agenda"><b>${S.items.filter((i) => i.action === "saved").length}</b> in your agenda</a>` : !st.agent ? `<a href="#/settings">Start by choosing your agent</a>` : `<a href="#/sources">Add a website to watch</a>`}</div></div>`;
+    <div class="glance">${S.scans.length ? `<a href="#/feed"><b class="${fresh ? "hot" : ""}">${fresh}</b> new in the last 3 days</a><a href="#/feed"><b class="${week ? "warn" : ""}">${week}</b> closing this week</a><a href="#/agenda"><b>${agendaBase().filter((i) => i.action === "saved").length}</b> in your agenda</a>` : !st.agent ? `<a href="#/settings">Start by choosing your agent</a>` : `<a href="#/sources">Add a website to watch</a>`}</div></div>`;
 }
 
 // ---------- shared feed / watch list ----------
 function renderItemList(rawBase, opts = {}) {
   const deduped = dedupeItems(rawBase), cats = {};
   deduped.forEach((i) => { const c = i.category || "Other"; cats[c] = (cats[c] || 0) + 1; });
+  const updCount = deduped.filter(isUpdated).length;
   const srcs = [...new Set(deduped.map((i) => i.source_name))].sort();
-  let list = deduped.filter((i) => (!ui.cats.length || ui.cats.includes(i.category || "Other")) && (!opts.showSourceSelect || !ui.src || i.source_name === ui.src));
-  if (ui.q) list = list.filter((i) => { const h = `${i.title} ${i.org} ${i.summary} ${i.category} ${i.location} ${i.source_name}`.toLowerCase(); return ui.q.toLowerCase().split(/\s+/).every((w) => h.includes(w)); });
+  let list = deduped.filter((i) => (!ui.cats.length || ui.cats.includes(i.category || "Other")) && (!opts.showSourceSelect || !ui.src || i.source_name === ui.src) && (!ui.onlyUpdated || isUpdated(i)));
+  if (ui.q) list = list.filter((i) => { const h = `${i.title} ${i.org} ${i.summary} ${i.category} ${i.location} ${i.source_name} ${i.change_summary || ""}`.toLowerCase(); return ui.q.toLowerCase().split(/\s+/).every((w) => h.includes(w)); });
   list.sort(ui.sort === "new" ? (a, b) => b.first_seen.localeCompare(a.first_seen) : (a, b) => (target(a) || "9999").localeCompare(target(b) || "9999") || b.first_seen.localeCompare(a.first_seen));
   let body = "";
   if (!list.length) body = opts.emptyHtml || `<div class="empty"><b>${deduped.length ? "Nothing matches" : "No open items yet"}</b>${deduped.length ? "Try a different search or category." : "Run a scan to collect matching items."}</div>`;
@@ -324,12 +359,14 @@ function renderItemList(rawBase, opts = {}) {
   } else body = `<div class="h2">Newest first <span>${list.length}</span></div><div class="list">${list.map((i) => itemCard(i, { showWatch: opts.showWatch })).join("")}</div>`;
   const snCount = opts.snoozedCount || 0;
   const pills = Object.entries(cats).sort((a, b) => b[1] - a[1]).map(([c, n]) => `<button class="pill ${ui.cats.includes(c) ? "on" : ""}" data-cat="${esc(c)}">${esc(c)} <em>${n}</em></button>`).join("")
+    + (updCount || ui.onlyUpdated ? `<button class="pill ${ui.onlyUpdated ? "on" : ""}" data-act="toggle-updated">Updated <em>${updCount}</em></button>` : "")
     + (snCount || ui.showSnoozed ? `<button class="pill ${ui.showSnoozed ? "on" : ""}" data-act="toggle-snoozed">Snoozed <em>${snCount}</em></button>` : "");
   const srcSelect = opts.showSourceSelect ? `<select id="srcSel" aria-label="Source"><option value="">All sources</option>${srcs.map((s) => `<option ${s === ui.src ? "selected" : ""}>${esc(s)}</option>`).join("")}</select>` : "";
+  const loadMore = S.items_has_more ? `<div class="load-more"><span class="muted">Loaded ${S.items.length} of ${S.items_total} total items</span><button type="button" class="btn sm" data-act="load-more">Load more</button></div>` : "";
   return `<div class="toolbar"><div class="search">${I.search}<input type="search" id="q" placeholder="Search titles, organisations, places" value="${esc(ui.q)}"></div>
       ${srcSelect}
       <select id="sortSel" aria-label="Sort"><option value="deadline" ${ui.sort === "deadline" ? "selected" : ""}>By date</option><option value="new" ${ui.sort === "new" ? "selected" : ""}>Newest first</option></select></div>
-    ${pills ? `<div class="pills">${pills}</div>` : ""}${body}`;
+    ${pills ? `<div class="pills">${pills}</div>` : ""}${body}${loadMore}`;
 }
 
 function renderFeed() {
@@ -340,8 +377,18 @@ function renderFeed() {
     : `<div class="empty"><b>Your feed is empty</b>Describe what you want to monitor on Home or add a website directly.<div class="row"><a class="btn sm primary" href="#/home">Describe on Home</a><a class="btn sm" href="#/sources">Add source</a></div></div>`;
   return `<div class="page">${progressBox()}
     <div class="head"><div><h1>Feed</h1><p>${dedupeItems(openItems()).length} open item${dedupeItems(openItems()).length === 1 ? "" : "s"}${lastScan ? `, last scan ${ago(lastScan.started)}` : ""}</p></div>
-      <a class="btn sm ghost" href="/api/export.csv" download="lookout.csv">${I.dl} Export CSV</a></div>
+      <button type="button" class="btn sm ghost" data-dl="/api/export.csv" data-fn="lookout.csv">${I.dl} Export CSV</button></div>
     ${renderItemList(raw, { showSourceSelect: true, showWatch: true, snoozedCount: snCount, emptyHtml })}</div>`;
+}
+
+function renderSourcePreviewBox() {
+  if (!sourcePreview) return "";
+  if (sourcePreview.loading) return `<div class="box pad test-preview"><div class="row"><b>Testing ${esc(sourcePreview.title || "source")}…</b><span class="grow"></span><button type="button" class="btn sm ghost" data-act="close-preview">Close</button></div><p class="muted" style="margin:8px 0 0;font-size:13px">Running reader or quick browser preview…</p></div>`;
+  const r = sourcePreview.result || {};
+  const rows = (r.items || []).slice(0, 15).map((it) => `<div class="tp-row"><a href="${esc(safeUrl(it.url))}" data-ext target="_blank" rel="noopener noreferrer">${esc(it.title)}</a><div class="muted" style="font-size:12px">${esc([it.org, it.location, it.deadline ? "deadline " + it.deadline : "", it.passes_filters === false ? "filtered out" : ""].filter(Boolean).join(" · "))}</div></div>`).join("");
+  return `<div class="box pad test-preview"><div class="row"><b>Preview: ${esc(sourcePreview.title || "source")}</b>${r.method ? `<span class="tag accent">${esc(r.method)}</span>` : ""}${r.ok ? `<span class="tag ok">${r.count} items (${r.matching} matching)</span>` : `<span class="tag bad">failed</span>`}<span class="grow"></span><button type="button" class="btn sm ghost" data-act="close-preview">Close</button></div>
+    ${r.error ? `<p class="err" style="margin:8px 0 0">${esc(r.error)}</p>` : ""}
+    ${r.ok ? (rows ? `<div class="tp-list">${rows}</div>` : `<p class="muted" style="margin:8px 0 0;font-size:13px">Reader ran cleanly and found 0 items.</p>`) : ""}</div>`;
 }
 
 // ---------- watch detail ----------
@@ -355,7 +402,7 @@ function renderWatch() {
   const globalFCount = S.filters.filter((f) => !f.watch_id && f.active).length;
   const dRunning = S.discovery.running && S.discovery.watch_id === w.id;
   const discProg = dRunning ? `<div class="progress"><div class="row"><b>Finding sources and filters…</b><span class="grow"></span><a class="btn sm ghost" href="#/search/${S.discovery.id}">Details</a><button class="btn sm ghost" data-act="cancel-disc">${I.stop} Stop</button></div>
-    <div class="muted" style="font-size:13px;margin-top:2px">Your agent is looking for pages and turning your request into filters.</div><div class="pbar"><i class="indet"></i></div></div>` : "";
+    <div class="muted" style="font-size:13px;margin-top:2px">Your agent is looking for pages and turning your request into filters. Found ${wSources.length} source${wSources.length === 1 ? "" : "s"} so far.</div><div class="pbar"><i class="indet"></i></div></div>` : "";
   const emptyHtml = raw.length ? `<div class="empty"><b>Nothing matches</b>Try a different search or category.</div>`
     : !wSources.length ? `<div class="empty"><b>No sources in this watch yet</b>Add a source on the right to start monitoring.<div class="row"><a class="btn sm" href="#/home">Search with AI</a></div></div>`
     : `<div class="empty"><b>No matching items yet</b>Scan this watch to check its sources.<div class="row"><button class="btn sm primary" data-watch-scan="${w.id}" ${S.progress.running ? "disabled" : ""}>${I.play} Scan watch</button></div></div>`;
@@ -364,16 +411,19 @@ function renderWatch() {
     const stText = !l ? "not scanned yet" : l.ok ? `${l.count} items` : l.error === "cancelled" ? "cancelled" : "failed";
     return `<div class="wrow ${s.active ? "" : "off"}"><label class="switch" title="Watch this source"><input type="checkbox" data-src-active="${s.id}" ${s.active ? "checked" : ""}><i></i></label>
       <div class="wt"><b title="${esc(s.url)}">${esc(s.name)}</b><small>${esc(stText)}</small></div>
-      <div class="row" style="flex-wrap:nowrap;gap:2px"><button class="ib" data-src-scan="${s.id}" data-tip="Scan source" aria-label="Scan source" ${S.progress.running ? "disabled" : ""}>${I.play}</button><button class="ib" data-src-del="${s.id}" data-tip="Delete source" aria-label="Delete source">${I.trash}</button></div></div>`;
+      <div class="row" style="flex-wrap:nowrap;gap:2px"><button class="ib" data-src-test="${s.id}" data-tip="Test source" aria-label="Test source">${I.search}</button><button class="ib" data-src-scan="${s.id}" data-tip="Scan source" aria-label="Scan source" ${S.progress.running ? "disabled" : ""}>${I.play}</button><button class="ib" data-src-del="${s.id}" data-tip="Delete source" aria-label="Delete source">${I.trash}</button></div></div>`;
   }).join("") || `<div class="wcard-note">No sources yet.</div>`;
   const frows = wFilters.map((f) => `<div class="wrow ${f.active ? "" : "off"}"><label class="switch" title="Use this filter"><input type="checkbox" data-f-active="${f.id}" ${f.active ? "checked" : ""}><i></i></label>
       <div class="wt"><b>${esc(f.value)}${f.kind === "deadline_within" ? " days" : ""}</b><small>${esc(FKIND[f.kind]?.[0] || f.kind)}</small></div>
       <button class="ib" data-f-del="${f.id}" data-tip="Delete filter" aria-label="Delete filter">${I.trash}</button></div>`).join("") || `<div class="wcard-note">No watch filters yet.</div>`;
+  const rssUrl = `${location.origin}/api/watches/${w.id}/feed.xml`;
   return `<div class="page wide">${discProg}${progressBox()}
-    <div class="head"><div><h1>${esc(w.title)}</h1>${w.request ? `<p>“${esc(w.request)}”</p>` : ""}</div>
+    <div class="head"><div><h1>${esc(w.title)}</h1>${w.request ? `<p>“${esc(w.request)}”</p>` : ""}
+        <div class="rss-bar"><span>RSS:</span><button type="button" class="btn sm ghost" data-dl="/api/watches/${w.id}/feed.xml" data-fn="watch-${w.id}.xml">Download RSS</button><button type="button" class="btn sm ghost" data-dl="/api/watches/${w.id}/atom.xml" data-fn="watch-${w.id}-atom.xml">Atom</button><button type="button" class="btn sm ghost" data-copy="${esc(rssUrl)}">Copy URL</button><span>${S.settings.rss_public === "1" ? "Public in local network" : "Requires token (enable public RSS in Settings)"}</span></div></div>
       <div class="row"><button class="btn sm ghost" data-watch-rename="${w.id}">${I.edit} Rename</button>
         <button class="btn sm" data-watch-scan="${w.id}" ${S.progress.running ? "disabled" : ""}>${I.play} Scan watch</button>
         <button class="btn sm ghost danger" data-watch-del="${w.id}">${I.trash} Delete</button></div></div>
+    ${renderSourcePreviewBox()}
     <div class="watch-layout">
       <div>${renderItemList(raw, { showSourceSelect: false, showWatch: false, snoozedCount: snCount, emptyHtml })}</div>
       <aside class="watch-side">
@@ -381,7 +431,7 @@ function renderWatch() {
           <form id="addWatchSrc" class="wform" data-watch-id="${w.id}">
             <input type="text" name="name" required placeholder="Source name">
             <input type="url" name="url" required placeholder="https://example.com/listings">
-            <div class="row"><input type="text" name="notes" class="grow" placeholder="Notes (optional)"><button class="btn sm primary">Add</button></div>
+            <div class="row"><input type="text" name="notes" class="grow" placeholder="Notes (optional)"><button type="button" class="btn sm ghost" data-act="test-new-source">Test</button><button class="btn sm primary">Add</button></div>
           </form></div>
         <div class="wcard"><div class="wcard-h">Filters <span>${wFilters.length}</span></div>${frows}
           <form id="addWatchF" class="wform" data-watch-id="${w.id}">
@@ -400,7 +450,7 @@ ui.agView ??= "upcoming";
 let agOpen = null, agDay = null;
 function agendaEntries() {
   const out = [];
-  for (const i of S.items.filter((x) => x.action === "saved" || x.action === "applied")) {
+  for (const i of agendaBase().filter((x) => x.action === "saved" || x.action === "applied")) {
     if (i.deadline) out.push({ i, date: i.deadline, kind: "dl" });
     if (i.remind_on) out.push({ i, date: i.remind_on, kind: "rm" });
   }
@@ -428,7 +478,7 @@ function agRow(i) {
   </div>`;
 }
 function renderUpcoming() {
-  const saved = S.items.filter((i) => i.action === "saved"), done = S.items.filter((i) => i.action === "applied");
+  const saved = agendaBase().filter((i) => i.action === "saved"), done = agendaBase().filter((i) => i.action === "applied");
   const key = (i) => { const r = i.remind_on && daysTo(i.remind_on) >= 0 ? i.remind_on : null; const c = [r, i.deadline].filter(Boolean).sort()[0]; return c || null; };
   const groups = [["Overdue", (d) => d !== null && d < 0, "overdue"], ["Today", (d) => d === 0], ["Tomorrow", (d) => d === 1], ["This week", (d) => d !== null && d <= 7], ["Next week", (d) => d !== null && d <= 14], ["Later", (d) => d !== null], ["No date", () => true]];
   let rest = [...saved].sort((a, b) => (key(a) || "9999").localeCompare(key(b) || "9999")), html = "";
@@ -462,15 +512,15 @@ function renderMonth() {
       ${upcoming.length ? `<div class="sub" style="margin-top:18px">Coming up after this</div>${upcoming.map((e) => entry(e, true)).join("")}` : ""}</div></div>`;
 }
 function renderAgenda() {
-  const n = S.items.filter((i) => i.action === "saved").length;
+  const n = agendaBase().filter((i) => i.action === "saved").length;
   return `<div class="page"><div class="head"><div><h1>Agenda</h1><p>${n ? `${n} item${n > 1 ? "s" : ""} you are tracking.` : "Items you save from the feed."} Deadlines come from the site; reminders are dates you pick.</p></div>
       <div class="row"><div class="seg"><button data-agview="upcoming" class="${ui.agView === "upcoming" ? "on" : ""}">Upcoming</button><button data-agview="month" class="${ui.agView === "month" ? "on" : ""}">Month</button></div>
-      <a class="btn sm ghost" href="/api/agenda.ics" download="lookout-agenda.ics" title="Import into Google Calendar, Outlook or Apple Calendar">${I.dl} Add to calendar</a></div></div>
+      <button type="button" class="btn sm ghost" data-dl="/api/agenda.ics" data-fn="lookout-agenda.ics" title="Import into Google Calendar, Outlook or Apple Calendar">${I.dl} Add to calendar</button></div></div>
     ${ui.agView === "month" ? renderMonth() : renderUpcoming()}</div>`;
 }
 function openRemindPicker(anchor) {
   closePops();
-  const it = S.items.find((x) => x.id === anchor.dataset.rid); if (!it) return;
+  const it = findItem(anchor.dataset.rid); if (!it) return;
   const add = (n) => { const d = today0(); d.setDate(d.getDate() + n); return iso(d); };
   const opts = [["Tomorrow", add(1)], ["In 3 days", add(3)], ["In a week", add(7)]];
   if (it.deadline && daysTo(it.deadline) > 2) opts.push(["2 days before the deadline", iso(new Date(parseIso(it.deadline) - 2 * 864e5))]);
@@ -481,7 +531,7 @@ function openRemindPicker(anchor) {
     (it.remind_on ? `<button class="o" data-remind-set="" data-rid="${esc(it.id)}">Remove reminder</button>` : "");
   placePop(pop, anchor, "below");
 }
-async function setReminder(id, date) { const it = S.items.find((x) => x.id === id); it.remind_on = date || null; closePops(); render(); await api(`/api/items/${encodeURIComponent(id)}`, { remind_on: date || "" }); toast(date ? `Reminder set for ${short(date)}` : "Reminder removed"); }
+async function setReminder(id, date) { syncItem(id, { remind_on: date || null }); closePops(); render(); await api(`/api/items/${encodeURIComponent(id)}`, { remind_on: date || "" }); toast(date ? `Reminder set for ${short(date)}` : "Reminder removed"); }
 
 // ---------- sources ----------
 function sourceRow(s) {
@@ -489,11 +539,12 @@ function sourceRow(s) {
   const status = !l ? '<span class="tag">not scanned yet</span>' : l.ok ? `<span class="tag ok">${l.count} items</span>` : l.error === "cancelled" ? '<span class="tag muted">cancelled</span>' : '<span class="tag bad">failed</span>';
   const learn = !agent ? '<span class="tag">plugin</span>' : s.extractor_ok ? '<span class="tag accent" title="Read with code your agent wrote: seconds, no agent quota">learned</span>' : s.extractor ? '<span class="tag bad" title="The site changed; your agent will fix the reader on the next scan">needs relearning</span>' : '<span class="tag" title="On the first scan your agent browses the site and writes a reader for it">not learned yet</span>';
   const wBadge = w ? `<a class="tag accent" href="#/watch/${w.id}" style="text-decoration:none">${esc(w.title)}</a>` : "";
+  const backoff = s.last_error_kind === "transient" && s.retry_after ? `<span class="tag warn">retry after ${esc(s.retry_after.slice(11, 16))}</span>` : "";
   return `<div class="srow"><label class="switch" title="Watch this source"><input type="checkbox" data-src-active="${s.id}" ${s.active ? "checked" : ""}><i></i></label>
-    <div style="min-width:0"><h4>${esc(s.name)} ${wBadge} ${learn} ${status}</h4><div class="u">${esc(s.url)}</div>
-      ${s.notes && agent ? `<div class="n">${esc(s.notes)}</div>` : ""}${l && !l.ok && l.error !== "cancelled" ? `<div class="err">${esc(l.error)}</div>` : ""}${s.extractor_error && agent && !s.extractor_ok ? `<div class="err">${esc(s.extractor_error)}</div>` : ""}
+    <div style="min-width:0"><h4>${esc(s.name)} ${wBadge} ${learn} ${status} ${backoff}</h4><div class="u">${esc(s.url)}</div>
+      ${s.notes && agent ? `<div class="n">${esc(s.notes)}</div>` : ""}${l && !l.ok && l.error !== "cancelled" ? `<div class="err">${esc(l.error)}</div>` : ""}${s.extractor_error && agent && (!s.extractor_ok || s.last_error_kind === "transient") ? `<div class="err">${esc(s.extractor_error)}</div>` : ""}
       ${s.extractor ? `<details data-key="src-${s.id}"><summary>View the reader your agent wrote${s.extractor_updated ? ", " + short(s.extractor_updated.slice(0, 10)) : ""}${s.extractor_runs ? `, used ${s.extractor_runs} time${s.extractor_runs > 1 ? "s" : ""}` : ""}</summary><div class="code">${esc(s.extractor)}</div></details>` : ""}</div>
-    <div class="row">${agent ? `<button class="btn sm ghost" data-src-edit="${s.id}">Edit notes</button>${s.extractor ? `<button class="btn sm ghost" data-src-relearn="${s.id}">Relearn</button>` : ""}` : ""}
+    <div class="row"><button type="button" class="btn sm ghost" data-src-test="${s.id}">Test</button>${agent ? `<button class="btn sm ghost" data-src-edit="${s.id}">Edit notes</button>${s.extractor ? `<button class="btn sm ghost" data-src-relearn="${s.id}">Relearn</button>` : ""}` : ""}
       <button class="btn sm" data-src-scan="${s.id}" ${S.progress.running ? "disabled" : ""}>${I.play} Scan</button><button class="btn sm ghost danger" data-src-del="${s.id}" aria-label="Delete source">${I.trash}</button></div></div>`;
 }
 function renderSources() {
@@ -504,7 +555,8 @@ function renderSources() {
       <label class="f">Name<input type="text" name="name" required placeholder="Acme careers"></label>
       <label class="f">Address of the page that lists the items<input type="url" name="url" required placeholder="https://"></label>
       <label class="f" style="grid-column:1/-1">Notes for your agent <small>optional: which tab or filter to use, where the dates are</small><textarea name="notes" style="min-height:60px" placeholder="Use the Internships filter. Deadlines are on each detail page."></textarea></label>
-      <div class="row" style="grid-column:1/-1"><span class="grow"></span><button class="btn primary">Add global source</button></div></form></div>
+      <div class="row" style="grid-column:1/-1"><button type="button" class="btn ghost" data-act="test-new-source">Test this source</button><span class="grow"></span><button class="btn primary">Add global source</button></div></form></div>
+    ${renderSourcePreviewBox()}
     <div class="h2">Global sources <span>${globalS.length}</span></div>
     ${globalS.length ? `<div class="box">${globalS.map(sourceRow).join("")}</div>` : `<div class="empty"><b>No global sources yet</b>Add a page above, or describe what you want on <a href="#/home">Home</a> to create a watch.</div>`}
     ${watchS.length ? `<div class="h2">Watch sources <span>${watchS.length}</span></div><div class="box">${watchS.map(sourceRow).join("")}</div>` : ""}</div>`;
@@ -549,8 +601,14 @@ function renderSettings() {
   const agents = AG.agents.map((a) => `<label class="agent ${a.installed || a.id === "custom" ? "" : "off"} ${cur === a.id ? "on" : ""}">
       <input type="radio" name="agent" value="${a.id}" ${cur === a.id ? "checked" : ""} ${a.installed || a.id === "custom" ? "" : "disabled"}>
       <div><b>${esc(a.name)}</b><span class="v">${a.id === "custom" ? "" : a.installed ? (a.version && a.version !== "?" ? "v" + esc(a.version) : "installed") : "not installed"}</span>${a.verified || a.id === "custom" || !a.installed ? "" : ' <span class="tag" title="Command-line flags not yet tested on a real install">experimental</span>'}
-        ${a.id === "custom" ? `<small>Any other command-line agent. Lookout fills in {prompt} and {model}.</small><input type="text" id="customCmd" style="margin-top:8px" placeholder="mycli run --yes {prompt}" value="${esc(a.command || "")}">` : ""}
+        ${a.id === "custom" ? `<small>Any other command-line agent (no shell chains like &&, |, ;, backticks). Lookout fills in {prompt} and {model}.</small><input type="text" id="customCmd" style="margin-top:8px" placeholder="mycli run --yes {prompt}" value="${esc(a.command || "")}">` : ""}
         ${a.installed && a.id !== "custom" ? `<div class="usage">${usage(a.usage)}</div>` : ""}</div></label>`).join("");
+  const snipHtml = schedPreview ? `<div class="sched-snippets">
+    <div><small class="muted">Cron (Linux / macOS)</small><pre>${esc(schedPreview.cron || schedPreview.crontab || "")}</pre></div>
+    <div><small class="muted">systemd --user (~/.config/systemd/user/lookout-scan.service)</small><pre>${esc(schedPreview.systemd_service || "")}</pre></div>
+    <div><small class="muted">systemd --user (~/.config/systemd/user/lookout-scan.timer)</small><pre>${esc(schedPreview.systemd_timer || "")}</pre></div>
+    <div><small class="muted">launchd (~/Library/LaunchAgents/com.lookout.dailyscan.plist)</small><pre>${esc(schedPreview.launchd_plist || "")}</pre></div>
+  </div>` : "";
   return `<div class="page"><div class="head"><div><h1>Settings</h1><p>Stored only on this computer.</p></div></div>
     ${AG.browser.installed ? "" : `<div class="banner">${I.warn}<div><b>agent-browser is missing</b><div class="muted" style="font-size:13px;margin:2px 0 8px">Agents use it to drive a real browser. Install it once in a terminal:</div><div class="cmd">${esc(AG.browser.install)}</div></div></div>`}
     <div class="h2">AI agent</div><div class="box">${agents}</div>
@@ -558,14 +616,20 @@ function renderSettings() {
       <div class="f">Model<div>${cur ? `<button type="button" class="chip model" data-pick="model">${modelChipText(st.model, cur)} ${I.down}</button>` : '<span class="muted">Choose an agent first</span>'}</div></div>
       <label class="f">Minutes your agent may spend on one site<input type="number" id="timeoutIn" min="3" max="60" value="${esc(st.agent_timeout_min)}"></label>
       <label class="check"><input type="checkbox" id="headedIn" ${st.headed === "1" ? "checked" : ""}> Show the browser while your agent works</label>
-      <label class="f">Sites your agent works on at once<input type="number" id="parallelIn" min="1" max="6" value="${esc(st.parallel)}"></label>
-      <label class="check" style="grid-column:1/-1"><input type="checkbox" id="verifyIn" ${st.verify_weekly === "1" ? "checked" : ""}> Once a week, let your agent re-check each learned site and update the reader if the site changed</label>
+      <label class="f">Sites your agent works on at once<input type="number" id="parallelIn" min="1" max="8" value="${esc(st.parallel)}"></label>
+      <label class="check" style="grid-column:1/-1"><input type="checkbox" id="verifyIn" ${st.verify_weekly === "1" ? "checked" : ""}> Once a week, check learned sites and relearn only if results look anomalous</label>
     </div><p class="muted" style="font-size:12.5px;margin:12px 0 0">Agent tools don't report how much quota is left. Lookout counts the calls it makes, remembers the last quota error and skips an agent until its quota resets.</p>
     <div class="row" style="margin-top:12px"><span class="grow"></span><button class="btn primary" data-act="save-agent">Save</button></div></div>
     <div class="h2">Schedule and notifications</div><div class="box pad">
-      <div class="setrow"><div><b>Daily scan</b><small>${sch.supported ? "Runs in the background even when Lookout is closed. If the computer is off, it runs at the next start-up." : esc(sch.hint)}</small></div>
-        ${sch.supported ? `<div class="row"><input type="time" id="schTime" value="${esc(st.schedule_time)}" style="width:110px" aria-label="Time"><label class="switch"><input type="checkbox" id="schOn" ${sch.enabled ? "checked" : ""}><i></i></label></div>` : ""}</div>
-      <div class="setrow"><div><b>Desktop notification</b><small>When a scan finds new items.</small></div><label class="switch"><input type="checkbox" id="notifyIn" ${st.notify === "1" ? "checked" : ""}><i></i></label></div></div>
+      <div class="setrow"><div><b>Daily scan</b><small>${sch.supported ? `Runs in the background even when Lookout is closed${sch.backend ? ` (${esc(sch.backend)})` : ""}.` : esc(sch.hint || "Manual cron/systemd/launchd setup available below.")}</small></div>
+        <div class="row"><input type="time" id="schTime" value="${esc(st.schedule_time)}" style="width:110px" aria-label="Time">${sch.supported ? `<label class="switch"><input type="checkbox" id="schOn" ${sch.enabled ? "checked" : ""}><i></i></label>` : ""}<button type="button" class="btn sm ghost" data-act="sched-preview">${schedPreview ? "Hide configs" : "Cron / systemd / launchd"}</button></div></div>
+      ${snipHtml}
+      <div class="setrow"><div><b>Desktop notification</b><small>When a scan finds new items.</small></div><label class="switch"><input type="checkbox" id="notifyIn" ${st.notify === "1" ? "checked" : ""}><i></i></label></div>
+      <div class="setrow"><div><b>Public watch RSS/Atom feeds</b><small>Allow external feed readers to fetch /api/watches/&lt;id&gt;/feed.xml without the API token (default off).</small></div><label class="switch"><input type="checkbox" id="rssPublicIn" ${st.rss_public === "1" ? "checked" : ""}><i></i></label></div></div>
+    <div class="h2">Webhook notification <span>optional (JSON POST / ntfy)</span></div><div class="box pad"><div class="kv">
+      <label class="f" style="grid-column:1/-1">Webhook or ntfy topic URL<input type="url" id="webhookUrl" value="${esc(st.webhook_url || "")}" placeholder="https://ntfy.sh/my-lookout-alerts"></label>
+      <label class="check" style="grid-column:1/-1"><input type="checkbox" id="webhookLocalIn" ${st.webhook_allow_local === "1" ? "checked" : ""}> Allow local / private network webhook targets</label>
+    </div><div class="row" style="margin-top:12px"><span class="grow"></span><button class="btn" data-act="webhook-test">Send test webhook</button><button class="btn primary" data-act="save-webhook">Save</button></div></div>
     <div class="h2">E-mail digest <span>optional</span></div><div class="box pad"><div class="kv">
       <label class="f">Send to<input type="email" id="mailTo" value="${esc(st.mail_to)}" placeholder="you@example.com"></label>
       <label class="f">SMTP user<input type="email" id="smtpUser" value="${esc(st.smtp_user)}" placeholder="sender@gmail.com"></label>
@@ -573,7 +637,7 @@ function renderSettings() {
       <label class="f">SMTP server<div class="row" style="flex-wrap:nowrap"><input type="text" id="smtpHost" value="${esc(st.smtp_host)}"><input type="number" id="smtpPort" value="${esc(st.smtp_port)}" style="width:90px" aria-label="Port"></div></label>
     </div><div class="row" style="margin-top:12px"><span class="grow"></span><button class="btn" data-act="mail-test">Send test e-mail</button><button class="btn primary" data-act="save-mail">Save</button></div></div>
     <div class="h2">Backup and restore</div><div class="box pad"><div class="setrow"><div><b>Watches, sources and filters</b><small>Export or restore your setup as JSON (passwords are never included).</small></div>
-      <div class="row"><a class="btn sm" href="/api/backup.json" download="lookout-backup.json">${I.dl} Export JSON</a>
+      <div class="row"><button type="button" class="btn sm" data-dl="/api/backup.json" data-fn="lookout-backup.json">${I.dl} Export JSON</button>
         <button type="button" class="btn sm" data-act="import-btn">Import JSON</button>
         <input type="file" id="importFile" accept="application/json" class="hidden"></div></div></div></div>`;
 }
@@ -674,7 +738,7 @@ let timer = null, wasBusy = false;
 async function refresh() {
   clearTimeout(timer);
   try {
-    S = await api("/api/state");
+    S = await api(`/api/state?limit=${itemsLimit}`);
     if (S.settings.agent && !modelCache[S.settings.agent]) modelsFor(S.settings.agent).then(() => { render.force = true; render(); });
     if (!AG) ensureAgents().then(() => render());
     const busy = S.progress.running || S.discovery.running;
@@ -694,6 +758,8 @@ document.addEventListener("click", async (e) => {
   try {
     if (d.win) { e.preventDefault(); return window.pywebview?.api?.[d.win](); }
     if (d.ext !== undefined && window.pywebview?.api) { e.preventDefault(); return window.pywebview.api.open_external(t.href); }
+    if (d.dl) { e.preventDefault(); return await downloadApi(d.dl, d.fn || "download"); }
+    if (d.copy) { e.preventDefault(); try { await navigator.clipboard.writeText(d.copy); toast("Copied URL"); } catch { toast(d.copy); } return; }
     if (d.pick === "model") { e.preventDefault(); return popEl ? closePops() : openModelPicker(t); }
     if (d.pick === "agent") { e.preventDefault(); return popEl ? closePops() : openAgentPicker(t); }
     if (d.pick === "remind") { e.preventDefault(); return popEl ? closePops() : openRemindPicker(t); }
@@ -712,15 +778,33 @@ document.addEventListener("click", async (e) => {
     if (d.act === "cancel") { await api("/api/scan/cancel", {}); toast("Stopping scan…"); return refresh(); }
     if (d.act === "cancel-disc") { await api("/api/discover/cancel", {}); toast("Stopping search…"); return refresh(); }
     if (d.act === "toggle-snoozed") { ui.showSnoozed = !ui.showSnoozed; keep(); return render(); }
+    if (d.act === "toggle-updated") { ui.onlyUpdated = !ui.onlyUpdated; keep(); return render(); }
+    if (d.act === "load-more") { itemsLimit += 200; return refresh(); }
+    if (d.act === "close-preview") { sourcePreview = null; return render(); }
+    if (d.act === "test-new-source") {
+      const form = t.closest("form");
+      const data = Object.fromEntries(new FormData(form));
+      if (!data.url) return toast("Enter an http(s) URL first");
+      const wid = form.dataset.watchId ? Number(form.dataset.watchId) : null;
+      sourcePreview = { loading: true, title: data.name || data.url, result: null }; render();
+      const res = await api("/api/sources/test", { ...data, watch_id: wid });
+      sourcePreview = { loading: false, title: data.name || data.url, result: res }; return render();
+    }
     if (d.act === "import-btn") { $("#importFile")?.click(); return; }
-    if (d.item && d.unsave) { const it = S.items.find((x) => x.id === d.item); it.action = null; render(); await api(`/api/items/${encodeURIComponent(d.item)}`, { action: null }); return toast("Removed from agenda"); }
-    if (d.item) { const it = S.items.find((x) => x.id === d.item); const nv = it.action === d.set ? null : d.set; it.action = nv; render(); await api(`/api/items/${encodeURIComponent(d.item)}`, { action: nv }); if (nv === "saved") toast("Added to agenda"); return; }
+    if (d.item && d.unsave) { syncItem(d.item, { action: null }); render(); await api(`/api/items/${encodeURIComponent(d.item)}`, { action: null }); return toast("Removed from agenda"); }
+    if (d.item) { const it = findItem(d.item); if (!it) return; const nv = it.action === d.set ? null : d.set; syncItem(d.item, { action: nv }); render(); await api(`/api/items/${encodeURIComponent(d.item)}`, { action: nv }); if (nv === "saved") toast("Added to agenda"); return; }
     if (d.cat) { ui.cats = ui.cats.includes(d.cat) ? ui.cats.filter((c) => c !== d.cat) : [...ui.cats, d.cat]; keep(); return render(); }
     if (d.cal) { const base = ui.calMonth ? parseIso(ui.calMonth + "-01") : new Date(); const m = d.cal === "0" ? new Date() : new Date(base.getFullYear(), base.getMonth() + Number(d.cal), 1); ui.calMonth = iso(m).slice(0, 7); keep(); return render(); }
     if (d.agOpen) { agOpen = agOpen === d.agOpen ? null : d.agOpen; return render(); }
+    if (d.srcTest) {
+      const s = S.sources.find((x) => x.id === Number(d.srcTest));
+      sourcePreview = { loading: true, title: s?.name || "Source", result: null }; render();
+      const res = await api(`/api/sources/${d.srcTest}/test`, {});
+      sourcePreview = { loading: false, title: s?.name || "Source", result: res }; return render();
+    }
     if (d.srcScan) { const r = await api("/api/scan", { only: [Number(d.srcScan)] }); toast(r.started ? "Scanning this source" : "A scan is already running"); return refresh(); }
     if (d.srcRelearn) { await api(`/api/sources/${d.srcRelearn}`, { relearn: true }); toast("Your agent will relearn this site on the next scan"); return refresh(); }
-    if (d.srcDel) { if (!confirm("Delete this source? Items already found stay in your feed.")) return; await api(`/api/sources/${d.srcDel}/delete`, {}); return refresh(); }
+    if (d.srcDel) { if (!confirm("Delete this source and its collected items?")) return; await api(`/api/sources/${d.srcDel}/delete`, {}); return refresh(); }
     if (d.srcEdit) { const s = S.sources.find((x) => x.id === Number(d.srcEdit)); const notes = prompt(`Notes for your agent about ${s.name}:`, s.notes || ""); if (notes === null) return; await api(`/api/sources/${s.id}`, { notes }); toast("Notes saved"); return refresh(); }
     if (d.cand !== undefined) { const c = S.discovery.results[Number(d.cand)]; await api("/api/sources", { name: c.name, url: c.url, notes: c.notes || "", watch_id: S.discovery.watch_id || null }); toast(`Added ${c.name}`); return refresh(); }
     if (d.discCand !== undefined) { const dd = discCache[Number(d.discId)]; const c = dd?.results?.[Number(d.discCand)]; if (!c) return; await api("/api/sources", { name: c.name, url: c.url, notes: c.notes || "", watch_id: dd.watch_id || null }); toast(`Added ${c.name}`); return refresh(); }
@@ -730,10 +814,30 @@ document.addEventListener("click", async (e) => {
     if (d.discDel) { if (!confirm("Delete this search from history?")) return; await api(`/api/discoveries/${d.discDel}/delete`, {}); delete discCache[Number(d.discDel)]; location.hash = "#/home"; return refresh(); }
     if (d.watchScan) { const r = await api(`/api/watches/${d.watchScan}/scan`, {}); toast(r.started ? "Scanning watch" : "A scan is already running"); return refresh(); }
     if (d.watchRename) { const w = watchById(Number(d.watchRename)); if (!w) return; const title = prompt("Watch title:", w.title); if (title === null || !title.trim()) return; await api(`/api/watches/${w.id}`, { title: title.trim() }); toast("Renamed"); return refresh(); }
-    if (d.watchDel) { if (!confirm("Delete this watch along with its sources and filters? Found items stay in your feed.")) return; await api(`/api/watches/${d.watchDel}/delete`, {}); location.hash = "#/feed"; return refresh(); }
+    if (d.watchDel) { if (!confirm("Delete this watch along with its sources, filters, scans and items?")) return; await api(`/api/watches/${d.watchDel}/delete`, {}); location.hash = "#/feed"; return refresh(); }
     if (d.act === "save-agent") {
-      await api("/api/settings", { agent: $("input[name=agent]:checked")?.value || "", headed: $("#headedIn").checked ? "1" : "0", agent_timeout_min: $("#timeoutIn").value, parallel: $("#parallelIn").value, verify_weekly: $("#verifyIn").checked ? "1" : "0", custom_command: $("#customCmd")?.value || "" });
+      await api("/api/settings", {
+        agent: $("input[name=agent]:checked")?.value || "",
+        headed: $("#headedIn").checked ? "1" : "0",
+        agent_timeout_min: $("#timeoutIn").value,
+        parallel: $("#parallelIn").value,
+        verify_weekly: $("#verifyIn").checked ? "1" : "0",
+        custom_command: $("#customCmd")?.value || "",
+        confirm_custom_command: true,
+      });
       toast("Saved"); AG = null; render.force = true; return refresh();
+    }
+    if (d.act === "sched-preview") {
+      if (schedPreview) { schedPreview = null; render.force = true; return render(); }
+      const at = $("#schTime")?.value || S.settings.schedule_time || "08:30";
+      schedPreview = await api(`/api/schedule/preview?at=${encodeURIComponent(at)}`);
+      render.force = true; return render();
+    }
+    if (d.act === "save-webhook" || d.act === "webhook-test") {
+      const wu = $("#webhookUrl").value.trim(), allowLocal = $("#webhookLocalIn").checked ? "1" : "0";
+      await api("/api/settings", { webhook_url: wu, webhook_allow_local: allowLocal });
+      if (d.act === "webhook-test") return toast((await api("/api/webhook/test", { url: wu, allow_local: allowLocal === "1" })).message);
+      return toast("Saved");
     }
     if (d.act === "save-mail" || d.act === "mail-test") {
       await api("/api/settings", { mail_to: $("#mailTo").value, smtp_user: $("#smtpUser").value, smtp_password: $("#smtpPass").value, smtp_host: $("#smtpHost").value, smtp_port: $("#smtpPort").value });
@@ -759,7 +863,12 @@ document.addEventListener("change", async (e) => {
     if (d.note !== undefined) { await api(`/api/items/${encodeURIComponent(d.note)}`, { note: t.value }); return toast("Note saved"); }
     if (t.name === "agent") { document.querySelectorAll(".agent").forEach((l) => l.classList.toggle("on", l.contains(t))); return; }
     if (t.id === "notifyIn") { await api("/api/settings", { notify: t.checked ? "1" : "0" }); return toast("Saved"); }
-    if (t.id === "schOn" || t.id === "schTime") { const r = await api("/api/schedule", { enabled: $("#schOn").checked, at: $("#schTime").value }); toast(r.message); return refresh(); }
+    if (t.id === "rssPublicIn") { await api("/api/settings", { rss_public: t.checked ? "1" : "0" }); return toast("Saved"); }
+    if (t.id === "schOn" || t.id === "schTime") {
+      if ($("#schOn")) { const r = await api("/api/schedule", { enabled: $("#schOn").checked, at: $("#schTime").value }); toast(r.message); }
+      if (schedPreview) { schedPreview = await api(`/api/schedule/preview?at=${encodeURIComponent($("#schTime").value || "08:30")}`); render.force = true; }
+      return refresh();
+    }
     if (t.id === "fKind") { $("#fHint").textContent = FKIND[t.value][1]; $("#fVal").placeholder = FKIND[t.value][2]; $("#fVal").type = t.value === "deadline_within" ? "number" : "text"; }
     if (t.id === "wfKind") { $("#wfVal").placeholder = FKIND[t.value][2]; $("#wfVal").type = t.value === "deadline_within" ? "number" : "text"; }
   } catch (err) { toast(err.message); }

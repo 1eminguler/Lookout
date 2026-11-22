@@ -254,16 +254,78 @@ def main() -> None:
         server.serve(on_start=lambda srv: threading.Timer(0.5, lambda: webbrowser.open(_launch_url(srv))).start())
 
 
+def _win_work_area(hwnd: int, user32=None):
+    """(left, top, right, bottom) of the usable area of the monitor showing hwnd, without the taskbar."""
+    import ctypes
+    from ctypes import wintypes
+
+    class MONITORINFO(ctypes.Structure):
+        _fields_ = [("cbSize", wintypes.DWORD), ("rcMonitor", wintypes.RECT),
+                    ("rcWork", wintypes.RECT), ("dwFlags", wintypes.DWORD)]
+
+    user32 = user32 or ctypes.windll.user32
+    monitor = user32.MonitorFromWindow(wintypes.HWND(hwnd), 2)  # MONITOR_DEFAULTTONEAREST
+    info = MONITORINFO()
+    info.cbSize = ctypes.sizeof(MONITORINFO)
+    if not monitor or not user32.GetMonitorInfoW(monitor, ctypes.byref(info)):
+        return None
+    r = info.rcWork
+    return r.left, r.top, r.right, r.bottom
+
+
+def _win_window_rect(hwnd: int, user32=None):
+    import ctypes
+    from ctypes import wintypes
+    user32 = user32 or ctypes.windll.user32
+    r = wintypes.RECT()
+    if not user32.GetWindowRect(wintypes.HWND(hwnd), ctypes.byref(r)):
+        return None
+    return r.left, r.top, r.right, r.bottom
+
+
+def _win_place(hwnd: int, rect, user32=None) -> bool:
+    import ctypes
+    from ctypes import wintypes
+    user32 = user32 or ctypes.windll.user32
+    left, top, right, bottom = rect
+    # SWP_NOZORDER | SWP_SHOWWINDOW
+    return bool(user32.SetWindowPos(wintypes.HWND(hwnd), None, left, top, right - left, bottom - top, 0x0004 | 0x0040))
+
+
 class WindowApi:
     """Called from the page (window.pywebview.api) for the custom title bar."""
     def __init__(self):
         self._window = None
         self._maximized = False
+        self._restore_rect = None
 
     def minimize(self):
         self._window.minimize()
 
+    def _hwnd(self):
+        native = getattr(self._window, "native", None)
+        handle = getattr(native, "Handle", None)
+        if handle is None:
+            return None
+        return int(handle.ToInt64()) if hasattr(handle, "ToInt64") else int(handle)
+
     def toggle_maximize(self):
+        # The window is frameless; maximizing it the normal way on Windows covers the taskbar.
+        # Fill the monitor's work area instead, and put the window back where it was on restore.
+        hwnd = self._hwnd() if sys.platform == "win32" else None
+        if hwnd:
+            try:
+                if not self._maximized:
+                    current, work = _win_window_rect(hwnd), _win_work_area(hwnd)
+                    if current and work and _win_place(hwnd, work):
+                        self._restore_rect = current
+                        self._maximized = True
+                        return
+                elif self._restore_rect and _win_place(hwnd, self._restore_rect):
+                    self._maximized = False
+                    return
+            except Exception:
+                pass
         self._window.restore() if self._maximized else self._window.maximize()
         self._maximized = not self._maximized
 

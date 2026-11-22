@@ -337,6 +337,30 @@ class RunTests(TempLookoutTestCase):
         finally:
             srv.server_close()
 
+    def test_maximize_fills_work_area_on_windows_and_restores(self):
+        api = run.WindowApi()
+        api._window = MagicMock()
+        api._window.native.Handle = 1234
+        placed = []
+        with patch.object(run.sys, "platform", "win32"), \
+             patch.object(run, "_win_window_rect", return_value=(100, 100, 900, 700)), \
+             patch.object(run, "_win_work_area", return_value=(0, 0, 1920, 1032)), \
+             patch.object(run, "_win_place", side_effect=lambda h, r: placed.append((h, r)) or True):
+            api.toggle_maximize()
+            api.toggle_maximize()
+        self.assertEqual(placed, [(1234, (0, 0, 1920, 1032)), (1234, (100, 100, 900, 700))])
+        api._window.maximize.assert_not_called()  # the native maximize would cover the taskbar
+        api._window.restore.assert_not_called()
+
+    def test_maximize_falls_back_to_native_outside_windows(self):
+        api = run.WindowApi()
+        api._window = MagicMock()
+        with patch.object(run.sys, "platform", "linux"):
+            api.toggle_maximize()
+            api.toggle_maximize()
+        api._window.maximize.assert_called_once()
+        api._window.restore.assert_called_once()
+
 
 if __name__ == "__main__":
     unittest.main()

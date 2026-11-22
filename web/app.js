@@ -129,9 +129,11 @@ const isNew = (i) => Date.now() - new Date(i.first_seen.replace(" ", "T")).getTi
 const isUpdated = (i) => Boolean(i.updated_at && i.last_change_kind && i.last_change_kind !== "closed" && (Date.now() - new Date(i.updated_at.replace(" ", "T")).getTime() < 72 * 36e5));
 const isSnoozed = (i) => Boolean(i.snoozed_until && daysTo(i.snoozed_until) > 0);
 const agendaBase = () => S?.agenda_items || [];
-const findItem = (id) => feedState.items.find((x) => x.id === id) || agendaBase().find((x) => x.id === id) || null;
+const searchItemsList = () => Object.values(searchItems).flatMap((x) => x.items || []);
+const findItem = (id) => feedState.items.find((x) => x.id === id) || agendaBase().find((x) => x.id === id)
+  || searchItemsList().find((x) => x.id === id) || null;
 function syncItem(id, patch) {
-  for (const list of [feedState.items, S?.agenda_items]) {
+  for (const list of [feedState.items, S?.agenda_items, searchItemsList()]) {
     const it = list?.find((x) => x.id === id);
     if (it) Object.assign(it, patch);
   }
@@ -517,13 +519,12 @@ function renderHome() {
       <div class="field"><textarea name="request" id="ask" rows="2" placeholder="Machine-learning internships in Berlin, or new hackathons with cash prizes" ${d.running ? "disabled" : ""}>${d.running ? esc(d.request) : ""}</textarea>
         <div class="bar"><a class="chip" href="#/sources" title="Add a website yourself" aria-label="Add a website yourself">${I.plus}</a>
           ${st.agent ? `<button type="button" class="chip model" data-pick="model">${modelChipText(st.model, st.agent)} ${I.down}</button>` : ""}<span class="grow"></span>
-          <button type="button" class="chip" data-act="scan" ${S.progress.running ? "disabled" : ""}>${I.play} Scan now</button>
           <button class="send" aria-label="Find sources" ${d.running || !st.agent ? "disabled" : ""}>${d.running ? '<svg class="spin" viewBox="0 0 24 24"><path d="M21 12a9 9 0 1 1-2.6-6.4"/></svg>' : I.up}</button></div></div>
     </form>
     ${d.running && d.id ? `<div class="disc-bar"><a href="#/search/${d.id}"><i class="live"></i><span>Searching for <b>${esc(d.title || d.request)}</b></span><span class="grow"></span><span class="muted">View search →</span></a><button type="button" class="btn sm ghost" data-act="cancel-disc">${I.stop} Stop</button></div>` : ""}
     ${!d.running && d.error ? `<p class="err-note">${esc(cleanErr(d.error))}</p>` : ""}
     ${cands ? `<div class="found"><div class="h2">Suggested sources <span>${d.results.length}</span><span class="grow"></span><button class="btn sm ghost" data-act="clear-disc">Clear</button></div><div class="list">${cands}</div></div>` : ""}
-    ${latestScan ? `<a class="chip" href="#/scan/${latestScan.id}">Read ${latestScan.sources_ok || 0} of ${(latestScan.sources_ok || 0) + (latestScan.sources_failed || 0) + (latestScan.sources_skipped || 0)} sources</a>` : ""}
+    ${latestScan && ((latestScan.sources_ok || 0) + (latestScan.sources_failed || 0) + (latestScan.sources_skipped || 0)) ? `<a class="chip" href="#/scan/${latestScan.id}">Read ${latestScan.sources_ok || 0} of ${(latestScan.sources_ok || 0) + (latestScan.sources_failed || 0) + (latestScan.sources_skipped || 0)} sources</a>` : ""}
     <div class="glance">${S.scans.length ? `<a href="#/feed"><b class="${fresh ? "hot" : ""}">${fresh}</b> new in the last 3 days</a><a href="#/feed"><b class="${week ? "warn" : ""}">${week}</b> closing this week</a><a href="#/agenda"><b>${savedN}</b> in your agenda</a>` : !st.agent ? `<a href="#/settings">Start by choosing your agent</a>` : `<a href="#/sources">Add a website to watch</a>`}</div></div>`;
 }
 
@@ -1017,26 +1018,77 @@ async function loadDiscovery(id) {
     delete discInFlight[id];
   }
 }
+// The listings a search's watch has found so far, refreshed while the search and its scans run.
+const searchItems = {}, searchItemsInFlight = {};
+async function loadSearchItems(wid) {
+  if (!wid || searchItemsInFlight[wid]) return;
+  searchItemsInFlight[wid] = true;
+  try {
+    const r = await api(`/api/items?watch_id=${wid}&status=open&match=1&exclude_hidden=1&exclude_expired=1&sort=first_seen&limit=30&facets=1`);
+    const prev = searchItems[wid];
+    const next = { items: r.items || [], total: r.total ?? (r.items || []).length, sources: (r.facets && r.facets.sources) || [] };
+    searchItems[wid] = next;
+    if (route.view === "search" && JSON.stringify(prev) !== JSON.stringify(next)) render();
+  } catch (_) {
+    /* the next poll retries */
+  } finally {
+    delete searchItemsInFlight[wid];
+  }
+}
+const hostOf = (u) => { try { return new URL(u).host.replace(/^www\./, ""); } catch (_) { return u; } };
+const chatStep = (state, title, body = "") => `<div class="step ${state}"><span class="dot">${state === "run" ? '<svg class="spin" viewBox="0 0 24 24"><path d="M21 12a9 9 0 1 1-2.6-6.4"/></svg>' : state === "bad" ? I.warn : state === "wait" ? "" : I.done}</span>
+  <div class="sbody"><div class="stitle">${title}</div>${body}</div></div>`;
 function renderSearch() {
   const d = discCache[route.id];
-  if (!d) { loadDiscovery(route.id); return `<div class="page"><div class="head"><div><h1>Search</h1><p>Loading…</p></div></div></div>`; }
+  if (!d) { loadDiscovery(route.id); return `<div class="page chat"><p class="muted">Loading…</p></div>`; }
   if (d.missing) return `<div class="page"><div class="empty"><b>This search no longer exists</b></div></div>`;
-  const running = d.status === "running", results = d.results || [], w = d.watch_id ? watchById(d.watch_id) : null;
-  const stLabel = running ? "searching…" : d.status === "interrupted" ? "interrupted" : d.status === "cancelled" ? "cancelled" : d.finished ? `took ${duration(d.started, d.finished)}` : "";
-  const meta = [d.agent ? `${agentName(d.agent)}${d.model ? ", " + d.model : ""}` : "", stLabel].filter(Boolean).join(" · ");
-  const prog = running ? `<div class="progress"><div class="row"><b>Searching the web…</b><span class="grow"></span><button class="btn sm ghost" data-act="cancel-disc">${I.stop} Stop</button></div>
-    <div class="muted sub-note">Your agent is looking for pages that list relevant items and turning your request into watch filters.</div>
-    <div class="pbar"><i class="indet"></i></div></div>` : "";
-  const banner = d.error ? `<div class="banner">${I.warn}<div><b>Search failed</b><div class="muted sub-note">${esc(cleanErr(d.error))}</div></div></div>`
-    : d.status === "interrupted" ? `<div class="banner">${I.warn}<div><b>Search interrupted</b><div class="muted sub-note">Lookout closed while this search was running.</div></div></div>`
-    : d.status === "cancelled" ? `<div class="banner">${I.warn}<div><b>Search cancelled</b><div class="muted sub-note">Stopped before finishing.</div></div></div>` : "";
-  const list = results.length ? `<div class="h2">Suggested sources <span>${results.length}</span></div><div class="list">${results.map((c, k) => candCard(c, k, d.id, d.watch_id)).join("")}</div>`
-    : (running || banner) ? "" : `<div class="empty"><b>No sources suggested</b>Try describing what you want in a different way on Home.<div class="row"><a class="btn sm" href="#/home">Back to Home</a></div></div>`;
-  return `<div class="page">${prog}
-    <div class="head"><div><h1>${esc(d.title || "Search")}</h1>
-      <p>“${esc(d.request)}”${meta ? ` · ${esc(meta)}` : ""}</p></div>
-      <div class="row">${w ? `<a class="btn sm" href="#/watch/${w.id}">${I.watch} Open watch</a>` : ""}<button class="btn sm ghost danger" data-disc-del="${d.id}" ${running ? "disabled" : ""}>${I.trash} Delete</button></div></div>
-    ${banner}${list}</div>`;
+  const searching = d.status === "running", results = d.results || [], wid = d.watch_id, w = wid ? watchById(wid) : null;
+  const srcs = wid ? S.sources.filter((s) => s.watch_id === wid) : [];
+  const flt = wid ? S.filters.filter((f) => f.watch_id === wid && f.active) : [];
+  const p = S.progress || {}, states = p.running ? (p.sources_state || {}) : {};
+  const scanning = Boolean(p.running && srcs.some((s) => states[s.name] && states[s.name] !== "done" && states[s.name] !== "failed" && states[s.name] !== "cancelled"));
+  if (wid && (!searchItems[wid] || searching || scanning)) loadSearchItems(wid);
+  const found = (wid && searchItems[wid]) || { items: [], total: 0, sources: [] };
+  const countFor = (s) => found.items.filter((i) => i.source_id === s.id || i.source_name === s.name).length;
+
+  // 1. finding sources
+  const ended = d.status === "cancelled" ? "Search stopped" : d.status === "interrupted" ? "Search interrupted" : "";
+  const srcList = results.length ? `<ul class="slist">${results.map((c) => `<li><b>${esc(c.name)}</b> <a href="${esc(safeUrl(c.url))}" data-ext target="_blank" rel="noopener noreferrer">${esc(hostOf(c.url))}</a>${c.why ? `<span class="muted"> — ${esc(c.why)}</span>` : ""}</li>`).join("")}</ul>` : "";
+  const step1 = d.error ? chatStep("bad", "Couldn't find sources", `<p class="muted">${esc(cleanErr(d.error))}</p>`)
+    : searching ? chatStep("run", results.length ? `Found ${results.length} source${results.length === 1 ? "" : "s"} so far…` : "Searching the web for pages that list what you asked for…", srcList)
+    : ended ? chatStep("bad", ended, srcList)
+    : chatStep(results.length ? "ok" : "bad", results.length ? `Found ${results.length} source${results.length === 1 ? "" : "s"}` : "No sources found", results.length ? srcList : `<p class="muted">Try describing it differently on Home, or add a website yourself.</p>`);
+  // 2. filters
+  const step2 = flt.length ? chatStep("ok", `Set ${flt.length} filter${flt.length === 1 ? "" : "s"}`, `<div class="chips">${flt.map((f) => `<span class="tag">${esc(f.kind)}: ${esc(f.value)}</span>`).join("")}</div>`) : "";
+  // 3. reading each source
+  const stateOf = (s) => {
+    const st = states[s.name];
+    if (st === "queued") return ["wait", "waiting"];
+    if (st === "learning") return ["run", "learning the site (once)…"];
+    if (st === "reading") return ["run", "reading…"];
+    if (st === "failed") return ["bad", "couldn't read it"];
+    if (st === "cancelled") return ["bad", "stopped"];
+    if (st === "done" || s.extractor_ok || (!p.running && countFor(s) > 0)) { const n = countFor(s); return ["ok", s.empty_reason ? "no open listings right now" : `${n} listing${n === 1 ? "" : "s"}`]; }
+    if (s.extractor_error && !p.running) return ["bad", esc(cleanErr(s.extractor_error)).slice(0, 120)];
+    return ["wait", "waiting"];
+  };
+  const rows = srcs.map((s) => { const [cls, txt] = stateOf(s); return `<li class="${cls}"><span class="mini">${cls === "run" ? '<svg class="spin" viewBox="0 0 24 24"><path d="M21 12a9 9 0 1 1-2.6-6.4"/></svg>' : cls === "bad" ? I.warn : cls === "ok" ? I.done : ""}</span><b>${esc(s.name)}</b><span class="muted">${txt}</span></li>`; }).join("");
+  const doneN = srcs.filter((s) => stateOf(s)[0] === "ok").length;
+  const step3 = srcs.length ? chatStep(scanning ? "run" : doneN ? "ok" : "bad", scanning ? `Reading ${srcs.length} source${srcs.length === 1 ? "" : "s"}…` : `Read ${doneN} of ${srcs.length} source${srcs.length === 1 ? "" : "s"}`, `<ul class="srows">${rows}</ul>`) : "";
+  // 4. listings as they arrive
+  const busy = searching || scanning;
+  const listing = found.items.length ? `<div class="chat-items"><div class="h2">${busy ? "Listings so far" : "Listings found"} <span>${found.total}</span><span class="grow"></span>${w ? `<a class="btn sm ghost" href="#/watch/${w.id}">See all in the watch ${I.right}</a>` : ""}</div>
+      <div class="list">${found.items.map((i) => itemCard(i)).join("")}</div></div>`
+    : busy && srcs.length ? `<p class="muted chat-wait">Listings will appear here as each source is read.</p>` : "";
+  const finished = !busy && d.status === "done" && srcs.length
+    ? chatStep(found.total ? "ok" : "bad", found.total ? `Done. ${found.total} matching listing${found.total === 1 ? "" : "s"}.` : "Done. Nothing matched yet.", `<p class="muted">Lookout keeps watching these sources on every scan. ${w ? `<a href="#/watch/${w.id}">Open the watch</a> to change its sources or filters.` : ""}</p>`)
+    : "";
+  const stop = searching ? `<button class="btn sm ghost" data-act="cancel-disc">${I.stop} Stop</button>` : scanning ? `<button class="btn sm ghost" data-act="cancel">${I.stop} Stop</button>` : "";
+  return `<div class="page chat">
+    <div class="chat-head"><h1>${esc(d.title || w?.title || "New watch")}</h1><span class="grow"></span>${stop}${w ? `<a class="btn sm" href="#/watch/${w.id}">${I.watch} Open watch</a>` : ""}<button class="btn sm ghost danger" data-disc-del="${d.id}" ${busy ? "disabled" : ""} aria-label="Delete this search">${I.trash}</button></div>
+    <div class="msg-user">${esc(d.request)}</div>
+    <div class="steps">${step1}${step2}${step3}${finished}</div>
+    ${listing}</div>`;
 }
 
 // ---------- render & polling ----------
@@ -1081,6 +1133,7 @@ async function pollProgress() {
     const nowBusy = isBusy();
     if (route.view === "scan" && (nowBusy || scanCache[route.id]?.status === "running")) loadScan(route.id);
     if (route.view === "search" && (nowBusy || discCache[route.id]?.status === "running")) loadDiscovery(route.id);
+    if (route.view === "search" && nowBusy && discCache[route.id]?.watch_id) loadSearchItems(discCache[route.id].watch_id);
     if ((wasBusy && !nowBusy) || (nowBusy && lastScanDone > prevDone)) {
       wasBusy = nowBusy;
       return refresh(true);

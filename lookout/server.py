@@ -18,11 +18,13 @@ from datetime import date, datetime, timezone
 from email.utils import format_datetime
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 from xml.sax.saxutils import escape as _xesc
 
 from lookout import agents, db, eligibility, notify, scanner, tasks
 
+PACKS = Path(__file__).parent / "packs"
 WEB = db.ROOT / "web"
 PORT = int(os.environ.get("LOOKOUT_PORT") or 8780)
 HOSTS = {f"127.0.0.1:{PORT}", f"localhost:{PORT}"}
@@ -686,6 +688,12 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:
                 pass
         _write_launch_secret_file(new_sec)
+        hook = getattr(self.server, "on_new_secret", None)
+        if callable(hook):
+            try:
+                hook(new_sec)
+            except Exception:
+                pass
         return sess
 
     def _render_index(self) -> bytes:
@@ -849,6 +857,9 @@ class Handler(BaseHTTPRequestHandler):
         if re.fullmatch(r"/[\w.-]+\.(js|css|svg|ico|png)", path) and (WEB / path[1:]).is_file():
             ctype = mimetypes.guess_type(path)[0] or "application/octet-stream"
             return self.send(200, (WEB / path[1:]).read_bytes(), ctype)
+        if path == "/api/packs":
+            return self.send(200, [dict(id=f.stem, **json.loads(f.read_text(encoding="utf-8")))
+                                   for f in sorted(PACKS.glob("*.json"))])
         if path == "/api/state":
             lim = max(1, min(MAX_ITEMS_LIMIT, _parse_int(qs["limit"][0], "limit"))) if "limit" in qs else DEFAULT_ITEMS_LIMIT
             off = max(0, _parse_int(qs["offset"][0], "offset")) if "offset" in qs else 0
@@ -1041,6 +1052,34 @@ class Handler(BaseHTTPRequestHandler):
             db.delete_scan(sid)
             return self.send(200, {"ok": True})
 
+        if m := re.fullmatch(r"/api/packs/([a-z0-9-]+)/add", p):
+            pack_file = PACKS / (m[1] + ".json")
+            if not pack_file.is_file():
+                return self.send(404, {"error": "pack not found"})
+            pack = json.loads(pack_file.read_text(encoding="utf-8"))
+            selected = b.get("sources")
+            if not isinstance(selected, list) or not all(isinstance(url, str) for url in selected):
+                raise ValueError("sources must be a list of URLs")
+            available = {s["url"] for s in pack["sources"]}
+            if not selected or not set(selected) <= available:
+                raise ValueError("Select at least one source from the pack")
+            target = b.get("target")
+            if target not in ("watch", "global"):
+                raise ValueError("target must be watch or global")
+            title = str(b.get("title") or pack["name"]).strip()
+            if target == "watch" and not title:
+                raise ValueError("A watch title is required")
+            existing = {s["url"].strip() for s in db.sources(include_code=False)}
+            chosen = set(selected)
+            sources = [s for s in pack["sources"] if s["url"] in chosen and s["url"] not in existing]
+            skipped = len(chosen) - len(sources)
+            wid = db.add_watch(title) if target == "watch" and sources else None
+            if wid is not None:
+                for f in pack["suggested_filters"]:
+                    db.add_filter(f["kind"], f["value"], watch_id=wid)
+            for source in sources:
+                db.add_source(source["name"], source["url"], source["notes"], watch_id=wid)
+            return self.send(200, {"added": len(sources), "skipped": skipped, "watch_id": wid})
         if p == "/api/watches":
             title = str(b.get("title") or "").strip()
             if not title:
@@ -1191,6 +1230,10 @@ class Handler(BaseHTTPRequestHandler):
             if not fields:
                 raise ValueError("No fields to update")
             db.update_source(sid, **fields)
+            if b.get("relearn") and cur.get("method") == "agent":
+                db.invalidate_shared_reader(
+                    cur["url"], notes=cur.get("notes") or "",
+                    fs=db.filters_for_watch(cur.get("watch_id"), active_only=True))
             return self.send(200, {"ok": True})
         if m := re.fullmatch(r"/api/sources/(\d+)/delete", p):
             if not db.delete_source(int(m[1])):

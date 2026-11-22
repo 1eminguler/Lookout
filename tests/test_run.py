@@ -276,6 +276,91 @@ class RunTests(TempLookoutTestCase):
             sec_file.write_text("  file_tok_456 \n", encoding="utf-8")
             self.assertEqual(run._launch_url(), f"http://127.0.0.1:{self.port}/?k=file_tok_456")
 
+    def test_headless_prints_link_on_start_and_after_each_sign_in(self):
+        captured = {}
+
+        def fake_serve(on_start=None, idle_minutes=0):
+            srv = types.SimpleNamespace(launch_secret="first")
+            on_start(srv)
+            captured["srv"] = srv
+            srv.on_new_secret("second")
+
+        out = io.StringIO()
+        with patch.object(server, "PORT", self.port), patch.object(run, "port_busy", return_value=False), \
+             patch.object(server, "serve", side_effect=fake_serve), contextlib.redirect_stdout(out):
+            run.cmd_headless()
+        text = out.getvalue()
+        self.assertIn(f"http://127.0.0.1:{self.port}/?k=first", text)
+        self.assertIn(f"http://127.0.0.1:{self.port}/?k=second", text)
+        self.assertTrue(callable(captured["srv"].on_new_secret))
+
+    def test_headless_refuses_busy_port_and_env_selects_headless(self):
+        err = io.StringIO()
+        with patch.object(run, "port_busy", return_value=True), contextlib.redirect_stderr(err):
+            with self.assertRaises(SystemExit):
+                run.cmd_headless()
+        self.assertIn("--print-url", err.getvalue())
+
+        with patch.dict(os.environ, {"LOOKOUT_HEADLESS": "1"}), patch.object(sys, "argv", ["run.py"]), \
+             patch.object(run, "cmd_headless") as headless, patch.object(run, "open_window") as window:
+            run.main()
+        headless.assert_called_once()
+        window.assert_not_called()
+
+    def test_print_url_reads_secret_of_running_instance(self):
+        sec_file = self.data_dir / ".launch_secret"
+        sec_file.unlink(missing_ok=True)
+        out = io.StringIO()
+        with patch.object(server, "PORT", self.port), patch.object(run, "port_busy", return_value=True):
+            with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                run.cmd_print_url()
+            sec_file.write_text("tok789", encoding="utf-8")
+            with contextlib.redirect_stdout(out):
+                run.cmd_print_url()
+        self.assertEqual(out.getvalue().strip(), f"http://127.0.0.1:{self.port}/?k=tok789")
+        with patch.object(run, "port_busy", return_value=False), contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                run.cmd_print_url()
+
+    def test_consuming_a_secret_calls_the_new_secret_hook(self):
+        with patch.object(server, "PORT", self.port):
+            srv = server.make_server()
+        try:
+            seen = []
+            srv.on_new_secret = seen.append
+            first = srv.launch_secret
+            handler = server.Handler.__new__(server.Handler)
+            handler.server = srv
+            self.assertTrue(handler._consume_launch_secret(first))
+            self.assertEqual(seen, [srv.launch_secret])
+            self.assertNotEqual(seen[0], first)
+        finally:
+            srv.server_close()
+
+    def test_maximize_fills_work_area_on_windows_and_restores(self):
+        api = run.WindowApi()
+        api._window = MagicMock()
+        api._window.native.Handle = 1234
+        placed = []
+        with patch.object(run.sys, "platform", "win32"), \
+             patch.object(run, "_win_window_rect", return_value=(100, 100, 900, 700)), \
+             patch.object(run, "_win_work_area", return_value=(0, 0, 1920, 1032)), \
+             patch.object(run, "_win_place", side_effect=lambda h, r: placed.append((h, r)) or True):
+            api.toggle_maximize()
+            api.toggle_maximize()
+        self.assertEqual(placed, [(1234, (0, 0, 1920, 1032)), (1234, (100, 100, 900, 700))])
+        api._window.maximize.assert_not_called()  # the native maximize would cover the taskbar
+        api._window.restore.assert_not_called()
+
+    def test_maximize_falls_back_to_native_outside_windows(self):
+        api = run.WindowApi()
+        api._window = MagicMock()
+        with patch.object(run.sys, "platform", "linux"):
+            api.toggle_maximize()
+            api.toggle_maximize()
+        api._window.maximize.assert_called_once()
+        api._window.restore.assert_called_once()
+
 
 if __name__ == "__main__":
     unittest.main()

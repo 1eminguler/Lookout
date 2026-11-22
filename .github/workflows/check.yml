@@ -59,3 +59,33 @@ jobs:
           LOOKOUT_PLUGIN_DIR: ${{ runner.temp }}/lookout-plugins-ui
           LOOKOUT_REQUIRE_UI_TEST: "1"
         run: python -m unittest tests/test_ui.py -v
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: docker build -t lookout:ci .
+      - name: Start container
+        run: docker run -d --name lookout -p 127.0.0.1:8780:8780 lookout:ci
+      - name: Sign in with the one-time link and call the API
+        run: |
+          set -e
+          for i in $(seq 1 60); do
+            docker logs lookout 2>&1 | grep -q '?k=' && break
+            sleep 1
+          done
+          docker logs lookout
+          url=$(docker logs lookout 2>&1 | grep -o 'http://127.0.0.1:8780/?k=[A-Za-z0-9_-]*' | head -n1)
+          test -n "$url"
+          curl -fsS http://127.0.0.1:8780/ | grep -q 'Open Lookout'
+          code=$(curl -s -o /dev/null -c cookies.txt -w '%{http_code}' "$url")
+          test "$code" = "302"
+          test "$(curl -s -o /dev/null -b cookies.txt -w '%{http_code}' http://127.0.0.1:8780/api/counts)" = "200"
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8780/api/counts)" = "401"
+          test "$(curl -s -o /dev/null -w '%{http_code}' "$url")" = "401"
+          docker logs lookout 2>&1 | grep -c '?k=' | grep -q '^2$'
+          docker exec lookout python run.py --print-url | grep -q '?k='
+      - name: Stop container
+        if: always()
+        run: docker rm -f lookout

@@ -77,11 +77,185 @@ exec(_code, _ns, _ns)
 items = _ns["fetch"]()
 if not isinstance(items, list):
     raise TypeError("fetch() must return a list")
+if not items and _ns.get("EMPTY_OK") is True:
+    items = [{"empty": True}]
 payload = json.dumps(items, ensure_ascii=False, default=str)
 if len(payload.encode("utf-8")) > max_bytes:
     raise ValueError("extractor output exceeded size limit")
 print(marker + payload)
 """
+
+
+def describe_rules() -> str:
+    """Generate the prompt restriction list directly from the sandbox constants in extractors.py."""
+    mods = ", ".join(sorted(MODULES))
+    helpers = ", ".join(sorted(HELPERS))
+    banned_calls = ", ".join(sorted(BANNED_CALLS))
+    banned_attrs = ", ".join(sorted(BANNED_ATTRS))
+    return (
+        f"- Required entry point: define a top-level `def fetch():` function (`fetch()` is required and must return a `list` of `dict` items).\n"
+        f"- Allowed standard-library imports only: {mods}. No other modules, no relative imports, and no star (`*`) imports.\n"
+        f"- Allowed helper imports from `lookout_extract` only: `from lookout_extract import {helpers}`.\n"
+        f"- No classes: `class` definitions are not allowed.\n"
+        f"- No dynamic `.format()` calls: calling `.format()` on a variable or expression is not allowed — use f-strings instead (and never access `_` or banned attributes inside format strings).\n"
+        f"- No names or attributes starting with `_`: attribute access starting with `_` and names or imports starting with `__` are not allowed.\n"
+        f"- Banned calls: {banned_calls}.\n"
+        f"- Banned attributes: {banned_attrs}."
+    )
+
+
+CHECK_READER = '''"""Validates extractor.py with extractors.check rules and runs a dry run of fetch() in the sandbox."""
+import ast
+import json
+import os
+import re
+import string
+import subprocess
+import sys
+import uuid
+from pathlib import Path
+
+sys.stdout.reconfigure(encoding="utf-8")
+WORK = Path(__file__).resolve().parent
+sys.path.insert(0, str(WORK))
+import lookout_extract as _le
+
+HELPERS = _le.SANDBOX_HELPERS
+MODULES = _le.SANDBOX_MODULES
+BANNED_CALLS = _le.SANDBOX_BANNED_CALLS
+BANNED_ATTRS = _le.SANDBOX_BANNED_ATTRS
+MAX_OUTPUT_BYTES = 5 * 1024 * 1024
+RUNNER = ''' + repr(RUNNER) + '''
+
+
+def _check_name(name: str) -> None:
+    if name in BANNED_CALLS or name.startswith("__"):
+        raise ValueError(f"'{name}' is not allowed")
+
+
+def _check_format_str(fmt: str) -> None:
+    try:
+        parsed = list(string.Formatter().parse(fmt))
+    except ValueError as e:
+        raise ValueError(f"invalid format string: {e}") from None
+    for _, field_name, format_spec, _ in parsed:
+        if field_name is not None:
+            if "__" in field_name or "[_" in field_name:
+                raise ValueError("unsafe access in format string is not allowed")
+            for attr in re.findall(r"\\.([A-Za-z_]\\w*)", field_name):
+                if attr.startswith("_") or attr in BANNED_ATTRS:
+                    raise ValueError(f"access to '{attr}' in format string is not allowed")
+            for bracket in re.findall(r"\\[([^\\]]+)\\]", field_name):
+                key = bracket.strip()
+                if key.startswith("_") or key in BANNED_ATTRS:
+                    raise ValueError(f"access to '{key}' in format string is not allowed")
+        if format_spec:
+            _check_format_str(format_spec)
+
+
+def check(code: str) -> None:
+    try:
+        tree = ast.parse(code)
+    except SyntaxError as e:
+        raise ValueError(f"syntax error: {e}") from None
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ClassDef):
+            raise ValueError("class definitions are not allowed")
+        elif isinstance(node, ast.Import):
+            for a in node.names:
+                if a.name not in MODULES:
+                    raise ValueError(f"import of '{a.name}' is not allowed")
+                if a.asname:
+                    _check_name(a.asname)
+        elif isinstance(node, ast.ImportFrom):
+            if node.level != 0:
+                raise ValueError("relative imports are not allowed")
+            mod = node.module or ""
+            for a in node.names:
+                if a.name == "*":
+                    raise ValueError("star imports are not allowed")
+                if mod == "lookout_extract":
+                    if a.name not in HELPERS:
+                        raise ValueError(f"lookout_extract.{a.name} is not available")
+                elif mod not in MODULES:
+                    raise ValueError(f"import from '{mod}' is not allowed")
+                elif a.name.startswith("_") or a.name in BANNED_CALLS or a.name in BANNED_ATTRS:
+                    raise ValueError(f"import of '{mod}.{a.name}' is not allowed")
+                if a.asname:
+                    _check_name(a.asname)
+        elif isinstance(node, ast.Attribute):
+            if node.attr.startswith("_") or node.attr in BANNED_ATTRS:
+                raise ValueError(f"access to '{node.attr}' is not allowed")
+        elif isinstance(node, ast.Call):
+            if isinstance(node.func, ast.Attribute) and node.func.attr == "format":
+                if not (isinstance(node.func.value, ast.Constant) and isinstance(node.func.value.value, str)):
+                    raise ValueError("dynamic '.format()' calls are not allowed")
+                _check_format_str(node.func.value.value)
+        elif isinstance(node, ast.Name):
+            _check_name(node.id)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            _check_name(node.name)
+        elif isinstance(node, ast.arg):
+            _check_name(node.arg)
+    if not any(isinstance(n, ast.FunctionDef) and n.name == "fetch" for n in tree.body):
+        raise ValueError("no fetch() function")
+
+
+def main() -> int:
+    target = Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else (WORK / "extractor.py")
+    if not target.is_file():
+        print(f"ERROR: {target.name} not found")
+        return 1
+    try:
+        code = target.read_text(encoding="utf-8")
+        check(code)
+    except Exception as e:
+        print(f"ERROR: {e}")
+        return 1
+
+    run_dir = target.parent
+    marker = f"@@LOOKOUT_{uuid.uuid4().hex}@@"
+    try:
+        r = subprocess.run(
+            [sys.executable, "-I", "-c", RUNNER, str(run_dir), marker, str(MAX_OUTPUT_BYTES)],
+            cwd=str(run_dir),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            stdin=subprocess.DEVNULL,
+            timeout=180,
+        )
+    except subprocess.TimeoutExpired:
+        print("ERROR: extractor took longer than 180s")
+        return 1
+    except Exception as e:
+        print(f"ERROR: {e}")
+        return 1
+
+    stdout = r.stdout or ""
+    stderr = r.stderr or ""
+    idx = stdout.rfind(marker)
+    if r.returncode != 0 or idx < 0:
+        err = (stderr or stdout).strip().splitlines()
+        msg = err[-1] if err else f"exit code {r.returncode}"
+        print(f"ERROR: extractor failed: {msg}")
+        return 1
+    try:
+        items = json.loads(stdout[idx + len(marker):])
+    except Exception as e:
+        print(f"ERROR: invalid JSON output: {e}")
+        return 1
+    if not isinstance(items, list):
+        print("ERROR: fetch() must return a list")
+        return 1
+    print(f"OK ({len(items)} items)")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+'''
 
 
 def _check_name(name: str) -> None:

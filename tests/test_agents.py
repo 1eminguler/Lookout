@@ -34,17 +34,18 @@ class AgentTests(TempLookoutTestCase):
 
     def test_codex_command_with_and_without_model(self):
         workdir = str(self.work_dir / "site with spaces")
-        expected = [
-            "/bin/codex", "exec", agents.prompt_for(workdir), "-C", workdir,
-            "--skip-git-repo-check", "--ephemeral", "-s", "workspace-write",
-            "-c", "sandbox_workspace_write.network_access=true",
-        ]
-        with patch("shutil.which", return_value="/bin/codex"):
-            self.assertEqual(agents.build_command("codex", "", workdir, 60), expected)
-            self.assertEqual(
-                agents.build_command("codex", "my-model", workdir, 60),
-                expected + ["-m", "my-model"],
-            )
+        base = ["/bin/codex", "exec", agents.prompt_for(workdir), "-C", workdir,
+                "--skip-git-repo-check", "--ephemeral"]
+        posix = base + ["-s", "workspace-write", "-c", "sandbox_workspace_write.network_access=true"]
+        windows = base + ["-s", "danger-full-access"]
+        for platform, expected in (("linux", posix), ("darwin", posix), ("win32", windows)):
+            with self.subTest(platform=platform), patch("shutil.which", return_value="/bin/codex"), \
+                 patch.object(agents.sys, "platform", platform):
+                self.assertEqual(agents.build_command("codex", "", workdir, 60), expected)
+                self.assertEqual(
+                    agents.build_command("codex", "my-model", workdir, 60),
+                    expected + ["-m", "my-model"],
+                )
 
     def test_gemini_sandbox_flag_only_when_cli_help_advertises_it(self):
         with patch("shutil.which", return_value="/bin/gemini"), patch.object(agents, "_run", return_value=(0, "Options: --sandbox")):

@@ -634,7 +634,7 @@ function renderWatch() {
   const srows = wSources.map((s) => {
     if (editingSourceId === s.id) return sourceEditForm(s, true);
     const l = s.last;
-    const stText = s.paused ? "paused" : !l ? "not scanned yet" : l.ok ? `${l.count} items` : l.error === "cancelled" ? "cancelled" : "failed";
+    const stText = s.paused ? "paused" : !l ? (s.empty_reason || "not scanned yet") : l.ok ? `${l.count} items${!l.count && s.empty_reason ? " · " + s.empty_reason : ""}` : l.error === "cancelled" ? "cancelled" : "failed";
     const fcBadge = s.filters_changed && s.has_extractor ? `<span class="tag warn">filters changed</span>` : "";
     const resumeBtn = s.paused ? `<button class="btn sm" data-src-resume="${s.id}">Resume</button>` : "";
     const relearnBtn = s.filters_changed && s.has_extractor ? `<button class="btn sm ghost" data-src-relearn="${s.id}" title="Relearn reader for updated filters">Relearn</button>` : "";
@@ -794,7 +794,7 @@ async function fetchSourceCode(sid) {
 
 function sourceRow(s) {
   const l = s.last, agent = s.method !== "plugin", w = s.watch_id ? watchById(s.watch_id) : null;
-  const status = !l ? '<span class="tag">not scanned yet</span>' : l.ok ? `<span class="tag ok">${l.count} items</span>` : l.error === "cancelled" ? '<span class="tag muted">cancelled</span>' : '<span class="tag bad">failed</span>';
+  const status = !l ? (s.empty_reason ? '<span class="tag ok">0 items</span>' : '<span class="tag">not scanned yet</span>') : l.ok ? `<span class="tag ok">${l.count} items</span>` : l.error === "cancelled" ? '<span class="tag muted">cancelled</span>' : '<span class="tag bad">failed</span>';
   const learn = !agent ? '<span class="tag">plugin</span>' : s.extractor_ok ? '<span class="tag accent" title="Read with code your agent wrote: seconds, no agent quota">learned</span>' : s.has_extractor ? '<span class="tag bad" title="The site changed; your agent will fix the reader on the next scan">needs relearning</span>' : '<span class="tag" title="On the first scan your agent browses the site and writes a reader for it">not learned yet</span>';
   const wBadge = w ? `<a class="tag accent no-dec" href="#/watch/${w.id}">${esc(w.title)}</a>` : "";
   const pausedBadge = s.paused ? `<span class="tag bad">paused</span>` : "";
@@ -802,15 +802,16 @@ function sourceRow(s) {
   const learnCooldown = !s.paused && s.learn_retry_after ? `<span class="tag warn">relearn cooldown until ${esc(s.learn_retry_after.slice(11, 16))}</span>` : "";
   const backoff = !s.paused && s.last_error_kind === "transient" && s.retry_after ? `<span class="tag warn">retry after ${esc(s.retry_after.slice(11, 16))}</span>` : "";
   const filterChangedBadge = s.filters_changed && s.has_extractor ? `<span class="tag warn">filters changed</span>` : "";
+  const emptyReason = s.empty_reason && agent ? `<div class="n muted">Empty listing: ${esc(s.empty_reason)}</div>` : "";
   const cachedCode = sourceCodeCache[s.id];
   const codeBlock = s.has_extractor ? `<details data-key="src-${s.id}" data-code-id="${s.id}"><summary>View the reader your agent wrote${s.extractor_updated ? ", " + short(s.extractor_updated.slice(0, 10)) : ""}${s.extractor_runs ? `, used ${s.extractor_runs} time${s.extractor_runs > 1 ? "s" : ""}` : ""}</summary>${cachedCode !== undefined ? `<div class="code">${esc(cachedCode)}</div>` : `<div class="muted fs-125 mt-8">Loading reader code…</div>`}</details>` : "";
   const editBlock = editingSourceId === s.id ? sourceEditForm(s, false) : "";
   return `<div class="srow"><label class="switch" title="Watch this source"><input type="checkbox" data-src-active="${s.id}" ${s.active ? "checked" : ""}><i></i></label>
     <div class="minw-0"><h4>${esc(s.name)} ${wBadge} ${learn} ${status} ${pausedBadge} ${blockedBadge} ${learnCooldown} ${backoff} ${filterChangedBadge}</h4><div class="u">${esc(s.url)}</div>
-      ${s.notes && agent ? `<div class="n">${esc(s.notes)}</div>` : ""}${l && !l.ok && l.error !== "cancelled" ? `<div class="err">${esc(cleanErr(l.error))}</div>` : ""}${s.extractor_error && agent && (!s.extractor_ok || s.last_error_kind === "transient" || s.last_error_kind === "blocked" || s.paused) ? `<div class="err">${esc(cleanErr(s.extractor_error))}</div>` : ""}
+      ${s.notes && agent ? `<div class="n">${esc(s.notes)}</div>` : ""}${emptyReason}${l && !l.ok && l.error !== "cancelled" ? `<div class="err">${esc(cleanErr(l.error))}</div>` : ""}${s.extractor_error && agent && (!s.extractor_ok || s.last_error_kind === "transient" || s.last_error_kind === "blocked" || s.paused) ? `<div class="err">${esc(cleanErr(s.extractor_error))}</div>` : ""}
       ${codeBlock}${editBlock}</div>
     <div class="row">${s.paused ? `<button type="button" class="btn sm primary" data-src-resume="${s.id}">Resume</button>` : ""}<button type="button" class="btn sm ghost" data-src-test="${s.id}">Test</button>${agent ? `<button type="button" class="btn sm ghost" data-src-edit="${s.id}">Edit</button>${s.has_extractor ? `<button type="button" class="btn sm ghost" data-src-relearn="${s.id}">Relearn</button>` : ""}` : ""}
-      <button class="btn sm" data-src-scan="${s.id}" ${S.progress.running ? "disabled" : ""}>${I.play} Scan</button><button class="btn sm ghost danger" data-src-del="${s.id}" aria-label="Delete source">${I.trash}</button></div></div>`;
+      <button class="btn sm" data-src-scan="${s.id}" ${S?.progress?.running ? "disabled" : ""}>${I.play} Scan</button><button class="btn sm ghost danger" data-src-del="${s.id}" aria-label="Delete source">${I.trash}</button></div></div>`;
 }
 function renderSources() {
   const globalS = S.sources.filter((s) => !s.watch_id), watchS = S.sources.filter((s) => s.watch_id);
@@ -1358,3 +1359,39 @@ document.addEventListener("keydown", (e) => {
 });
 document.addEventListener("visibilitychange", () => { if (!document.hidden) refresh(false); });
 parseRoute(); refresh(true);
+
+// Render a self-contained pack picker for the settings and new-watch screens.
+async function renderStarterPacks(container) {
+  container.textContent = "Loading starter packs…";
+  try {
+    const packs = await api("/api/packs");
+    container.innerHTML = `<label>Starter pack <select data-pack>${packs.map(p => `<option value="${esc(p.id)}">${esc(p.name)}</option>`).join("")}</select></label><div data-preview></div>`;
+    const select = $("[data-pack]", container), preview = $("[data-preview]", container);
+    function show() {
+      const pack = packs.find(p => p.id === select.value);
+      if (!pack) { preview.textContent = "No starter packs available."; return; }
+      preview.innerHTML = `<p>${esc(pack.description)}</p><p>Suggested filters: ${pack.suggested_filters.map(f => esc(f.value)).join(", ")}</p>
+        <div>${pack.sources.map((s, i) => `<label><input type="checkbox" data-source="${i}" checked> <strong>${esc(s.name)}</strong> — <a href="${esc(safeUrl(s.url))}" target="_blank" rel="noopener noreferrer">${esc(s.url)}</a><br>${esc(s.notes)}</label><br>`).join("")}</div>
+        <label>Destination <select data-target><option value="watch">New watch</option><option value="global">Global sources</option></select></label>
+        <label data-title-label>Watch title <input data-title value="${esc(pack.name)}"></label>
+        <button type="button" data-add>Add selected sources</button><p data-result role="status"></p>`;
+      const target = $("[data-target]", preview);
+      target.addEventListener("change", () => { $("[data-title-label]", preview).hidden = target.value !== "watch"; });
+      $("[data-add]", preview).addEventListener("click", async (event) => {
+        const result = $("[data-result]", preview);
+        const sources = [...preview.querySelectorAll("[data-source]:checked")].map(el => pack.sources[Number(el.dataset.source)].url);
+        if (!sources.length) { result.textContent = "Select at least one source."; return; }
+        const button = event.currentTarget;
+        button.disabled = true;
+        try {
+          const added = await api(`/api/packs/${encodeURIComponent(pack.id)}/add`, { sources, target: target.value, title: $("[data-title]", preview).value });
+          result.textContent = `Added ${added.added} sources; skipped ${added.skipped} existing URLs.`;
+          await refresh();
+        } catch (err) { result.textContent = cleanErr(err.message); }
+        finally { button.disabled = false; }
+      });
+    }
+    select.addEventListener("change", show);
+    show();
+  } catch (err) { container.textContent = `Could not load starter packs: ${cleanErr(err.message)}`; }
+}

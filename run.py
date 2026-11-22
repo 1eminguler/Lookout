@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Lookout — monitor any website with the AI agent you already have installed.
 
-    python run.py            open the app in your browser
-    python run.py scan       run one scan now (used by the daily schedule)
+    python run.py              open the app in a window (or your browser)
+    python run.py --headless   serve without opening anything; print the sign-in link (servers, Docker)
+    python run.py --print-url  print the sign-in link of the instance that is already running
+    python run.py scan         run one scan now (used by the daily schedule)
 """
 import argparse
 import os
@@ -183,6 +185,37 @@ def cmd_scan(scheduled: bool) -> None:
           f"{sum(1 for s in d['sources'] if s['ok'])}/{len(d['sources'])} sources read.")
 
 
+def _announce_link(secret: str) -> None:
+    print(f"Sign in to Lookout: http://127.0.0.1:{server.PORT}/?k={secret}  (one-time link)", flush=True)
+
+
+def cmd_headless() -> None:
+    """Serve without a window or browser; print each new one-time sign-in link."""
+    if port_busy():
+        print(f"Port {server.PORT} is already in use. If Lookout is running, use: python run.py --print-url",
+              file=sys.stderr)
+        sys.exit(1)
+
+    def on_start(srv) -> None:
+        srv.on_new_secret = _announce_link
+        print(f"Lookout is serving on port {server.PORT}.", flush=True)
+        if getattr(srv, "launch_secret", None):
+            _announce_link(srv.launch_secret)
+
+    server.serve(on_start=on_start)
+
+
+def cmd_print_url() -> None:
+    if not port_busy():
+        print(f"Lookout is not running on port {server.PORT}.", file=sys.stderr)
+        sys.exit(1)
+    url = _launch_url()
+    if "?k=" not in url:
+        print("No sign-in link is available. Restart Lookout to get a new one.", file=sys.stderr)
+        sys.exit(1)
+    print(url)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Lookout")
     ap.add_argument("command", nargs="?", default="ui", choices=["ui", "scan"])
@@ -190,7 +223,14 @@ def main() -> None:
     ap.add_argument("--background", action="store_true", help=argparse.SUPPRESS)
     ap.add_argument("--browser", action="store_true", help="open in your web browser instead of a window")
     ap.add_argument("--custom-command", default=None, help="custom agent command template (local CLI only)")
+    ap.add_argument("--headless", action="store_true",
+                    help="serve without opening a window or browser and print the sign-in link "
+                         "(also when LOOKOUT_HEADLESS=1)")
+    ap.add_argument("--print-url", action="store_true",
+                    help="print the sign-in link of the Lookout that is already running")
     a = ap.parse_args()
+    if a.print_url:
+        return cmd_print_url()
     if a.custom_command is not None:
         try:
             agents.set_cli_custom_command(a.custom_command)
@@ -199,6 +239,8 @@ def main() -> None:
             sys.exit(2)
     if a.command == "scan":
         return cmd_scan(a.scheduled)
+    if a.headless or os.environ.get("LOOKOUT_HEADLESS", "").strip().lower() in ("1", "true", "yes"):
+        return cmd_headless()
     if port_busy():
         if not a.background and (a.browser or not open_window(start_server=False)):
             webbrowser.open(_launch_url())
@@ -212,16 +254,78 @@ def main() -> None:
         server.serve(on_start=lambda srv: threading.Timer(0.5, lambda: webbrowser.open(_launch_url(srv))).start())
 
 
+def _win_work_area(hwnd: int, user32=None):
+    """(left, top, right, bottom) of the usable area of the monitor showing hwnd, without the taskbar."""
+    import ctypes
+    from ctypes import wintypes
+
+    class MONITORINFO(ctypes.Structure):
+        _fields_ = [("cbSize", wintypes.DWORD), ("rcMonitor", wintypes.RECT),
+                    ("rcWork", wintypes.RECT), ("dwFlags", wintypes.DWORD)]
+
+    user32 = user32 or ctypes.windll.user32
+    monitor = user32.MonitorFromWindow(wintypes.HWND(hwnd), 2)  # MONITOR_DEFAULTTONEAREST
+    info = MONITORINFO()
+    info.cbSize = ctypes.sizeof(MONITORINFO)
+    if not monitor or not user32.GetMonitorInfoW(monitor, ctypes.byref(info)):
+        return None
+    r = info.rcWork
+    return r.left, r.top, r.right, r.bottom
+
+
+def _win_window_rect(hwnd: int, user32=None):
+    import ctypes
+    from ctypes import wintypes
+    user32 = user32 or ctypes.windll.user32
+    r = wintypes.RECT()
+    if not user32.GetWindowRect(wintypes.HWND(hwnd), ctypes.byref(r)):
+        return None
+    return r.left, r.top, r.right, r.bottom
+
+
+def _win_place(hwnd: int, rect, user32=None) -> bool:
+    import ctypes
+    from ctypes import wintypes
+    user32 = user32 or ctypes.windll.user32
+    left, top, right, bottom = rect
+    # SWP_NOZORDER | SWP_SHOWWINDOW
+    return bool(user32.SetWindowPos(wintypes.HWND(hwnd), None, left, top, right - left, bottom - top, 0x0004 | 0x0040))
+
+
 class WindowApi:
     """Called from the page (window.pywebview.api) for the custom title bar."""
     def __init__(self):
         self._window = None
         self._maximized = False
+        self._restore_rect = None
 
     def minimize(self):
         self._window.minimize()
 
+    def _hwnd(self):
+        native = getattr(self._window, "native", None)
+        handle = getattr(native, "Handle", None)
+        if handle is None:
+            return None
+        return int(handle.ToInt64()) if hasattr(handle, "ToInt64") else int(handle)
+
     def toggle_maximize(self):
+        # The window is frameless; maximizing it the normal way on Windows covers the taskbar.
+        # Fill the monitor's work area instead, and put the window back where it was on restore.
+        hwnd = self._hwnd() if sys.platform == "win32" else None
+        if hwnd:
+            try:
+                if not self._maximized:
+                    current, work = _win_window_rect(hwnd), _win_work_area(hwnd)
+                    if current and work and _win_place(hwnd, work):
+                        self._restore_rect = current
+                        self._maximized = True
+                        return
+                elif self._restore_rect and _win_place(hwnd, self._restore_rect):
+                    self._maximized = False
+                    return
+            except Exception:
+                pass
         self._window.restore() if self._maximized else self._window.maximize()
         self._maximized = not self._maximized
 

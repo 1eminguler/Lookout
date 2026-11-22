@@ -1,0 +1,47 @@
+{
+  "name": "Computer engineering internships (T?rkiye)",
+  "description": "Internship listings and career centres with opportunities in T?rkiye.",
+  "suggested_filters": [
+    {
+      "kind": "include",
+      "value": "software, computer engineering, IT or technology internship"
+    }
+  ],
+  "sources": [
+    {
+      "name": "Indeed software internships",
+      "url": "https://tr.indeed.com/q-yazilim-stajyer-is-ilanlari.html",
+      "notes": "Search results may include non-internship roles."
+    },
+    {
+      "name": "Youthall",
+      "url": "https://www.youthall.com/tr/is-ilanlari/",
+      "notes": "Search for software internships and early-career programmes."
+    },
+    {
+      "name": "Bo?azi?i career centre",
+      "url": "https://kariyermerkezi.bogazici.edu.tr/ilanlar",
+      "notes": "Job and internship listings; check eligibility."
+    },
+    {
+      "name": "?sk?dar internship announcements",
+      "url": "https://kariyer.uskudar.edu.tr/tr/kategori/staj-duyuru",
+      "notes": "Internship announcements across disciplines; check eligibility."
+    },
+    {
+      "name": "Medipol career centre",
+      "url": "https://kariyermerkezi.medipol.edu.tr/is-ilanlari/",
+      "notes": "Job and internship listings for students and graduates; check eligibility."
+    },
+    {
+      "name": "Yeni Y?zy?l career centre",
+      "url": "https://kariyermerkezi.yeniyuzyil.edu.tr/staj-ve-is-imkanlari/",
+      "notes": "Job and internship announcements; check eligibility."
+    },
+    {
+      "name": "Ondokuz May?s career centre",
+      "url": "https://kariyer.omu.edu.tr/tr/staj-kurs/staj-ilanlari",
+      "notes": "Internship programme announcements; check dates and eligibility."
+    }
+  ]
+}

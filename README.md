@@ -1,35 +1,61 @@
-<p align="center">
-  <img src="docs/banner.png" alt="Lookout — watch any website with the AI agent you already have" width="100%">
-</p>
+<p align="center"><img src="docs/banner.png" alt="Lookout watches websites for opportunities, products, and events" width="100%"></p>
 
-<p align="center">
-  <b>A local web monitor with self-healing readers powered by the coding-agent CLI you already use.</b><br>
-  CLI flags checked against <code>--help</code>: Claude Code · Gemini CLI · Antigravity CLI · opencode &nbsp;|&nbsp; Experimental (unverified flags): Codex CLI · Cursor Agent · Qwen Code · Copilot CLI · local custom CLI
-</p>
+Lookout is a local web monitor that uses your coding-agent CLI to learn sites and collect matching updates.
 
-<p align="center">
-  <a href="https://github.com/1eminguler/lookout/actions/workflows/check.yml"><img alt="check" src="https://github.com/1eminguler/lookout/actions/workflows/check.yml/badge.svg"></a>
-  <img alt="Python 3.10+" src="https://img.shields.io/badge/python-3.10%2B-3776AB?logo=python&logoColor=white">
-  <img alt="Platforms" src="https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-555">
-  <img alt="Storage" src="https://img.shields.io/badge/storage-local%20SQLite-2ea44f">
-  <img alt="Security policy" src="https://img.shields.io/badge/security-SECURITY.md-informational">
-  <img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-blue">
-</p>
+## Quick start
 
----
+A supported signed-in agent CLI uses its own subscription and quota; pages, item details, and prompts may be sent to its provider. See [first-run expectations](#first-run-time-and-quota-expectations) and [agent support](#supported-agents--permission-modes).
 
-**Lookout** monitors job boards, careers pages, hackathon lists, grant calls, product drops, and announcement pages — and notifies you via desktop toasts, SMTP e-mail digests, or webhooks (JSON, Slack, Discord, Telegram, ntfy) when matching items appear or change.
+**Prerequisites:**
 
-Instead of asking for a separate LLM API key, Lookout delegates browser inspection and code generation to a coding-agent CLI **you already have installed, signed in, and subscribed to**. On first sight of a website, the agent browses it and writes a reusable Python **reader** (`extractor.py`). Subsequent scans run that Python reader directly in seconds without calling the agent. When a site's HTML or API layout breaks, Lookout sends the reader back to your agent to repair.
+- Python 3.10+ (stdlib only for the server and browser UI; optional `pywebview>=5` for a frameless desktop window)
+- Google Chrome / Chromium (on Linux desktop mode, `pywebview` also needs WebKitGTK / Qt WebEngine; `--browser` mode needs only any web browser)
+- Node.js (for `agent-browser`)
+- At least one supported agent CLI installed and signed in (unless you only use local `plugins/`)
 
-> **Important expectations before you start:**
-> - **Agent subscription & quota:** Lookout uses no separate LLM API key, **not** free unlimited compute — you still need an active, signed-in agent subscription and spend its quota during source discovery, learning/healing, unlearned source previews, and semantic filtering.
-> - **What stays local vs. what leaves your machine:** Your watches, sources, learned readers, items, filters, and scan history are stored locally in `data/lookout.db`. However, **visited web pages, item details, and filter prompts are sent to your chosen agent CLI and its model provider** during discovery, learning/healing, and semantic filtering. Ordinary read scans with healthy readers contact only the monitored websites (plus any notifications you enable).
-> - **Agent safety:** Claude Code uses per-task `--allowedTools` restrictions, Codex uses its workspace-write sandbox, and Gemini uses `--sandbox` when its CLI help advertises it. Other built-in adapters run without a Lookout-managed sandbox. Agent tasks run from a temporary folder and receive a filtered environment with secret-like variables removed except known login variables for the selected CLI. These are defense-in-depth measures; prefer the included [Docker container](#docker-isolated-execution) or a VM when scanning untrusted sites. See [Safety & Security](#safety--security) and [SECURITY.md](SECURITY.md).
+```bash
+# 1. Install the browser CLI used by agents and JS readers
+npm install -g agent-browser
+agent-browser install
 
-<p align="center">
-  <img src="docs/screenshots/feed.png" alt="Lookout feed: new listings grouped by deadline" width="92%">
-</p>
+# 2. Clone and run Lookout (standard git clone or editable package install)
+git clone https://github.com/1eminguler/lookout.git
+cd lookout
+
+# Option A: run directly with zero Python dependencies (opens in browser if pywebview is absent)
+python run.py
+
+# Option B: install via pyproject.toml / pip (or pipx) with optional desktop window extra
+pip install -e .                 # or: pip install -e ".[desktop]"
+lookout                          # or: lookout --browser
+```
+
+If `pywebview` is not installed or cannot initialize a native window backend, Lookout automatically falls back to opening your default web browser at `http://127.0.0.1:8780/?k=<one-time-launch-secret>`. A PID lockfile (`data/window.pid`) prevents duplicate native windows and prints the active URL if Lookout is already open.
+
+1. Open **Settings** → pick your agent and default model.
+2. Open **Home** → describe what you want to follow (creates a watch + finds sources), or go to **Sources** → add listing URLs directly.
+3. Review **Filters** → refine global or watch-specific rules.
+4. Run **New scan**, then optionally enable **Daily scan** and notifications in **Settings**.
+
+From a terminal or scheduler:
+
+```bash
+python run.py scan               # or: lookout scan
+```
+
+## A tour
+
+**Opportunities:** See matching updates from your watches together.
+
+<img src="docs/screenshots/opportunities.png" alt="Opportunities from different watches" width="900">
+
+**Watch settings:** Review the sources and rules for a watch.
+
+<img src="docs/screenshots/watch-settings.png" alt="Summer internships watch settings with sources and a location rule" width="800">
+
+**Agenda:** Keep an item, choose a reminder, and add a note.
+
+<img src="docs/screenshots/agenda.png" alt="Agenda with an item and its details open" width="900">
 
 ## Contents
 
@@ -37,8 +63,6 @@ Instead of asking for a separate LLM API key, Lookout delegates browser inspecti
 - [How it works](#how-it-works)
 - [First-run time and quota expectations](#first-run-time-and-quota-expectations)
 - [How self-healing works — and its limits](#how-self-healing-works--and-its-limits)
-- [A tour](#a-tour)
-- [Quick start](#quick-start)
 - [Docker (isolated execution)](#docker-isolated-execution)
 - [Environment variables](#environment-variables)
 - [Supported agents & permission modes](#supported-agents--permission-modes)
@@ -124,102 +148,32 @@ Lookout separates temporary outages and bot walls from actual website redesigns:
 - **Filter changes vs. learned sections:** Editing filters immediately re-evaluates deterministic rules (`exclude`, `deadline_within`) on stored open items and queues semantic rules (`include`, `type`, `location`, `instruction`) for the next scan. However, if a reader was originally written to fetch only a specific site tab (e.g., *"Full-time"* instead of *"Internships"*), click **Relearn** on sources badged `filters changed` so the agent inspects the new section.
 - **Date formats:** `scanner.parse_date()` parses ISO (`YYYY-MM-DD`), day-first numeric (`DD.MM.YYYY` / `DD/MM/YYYY`), and English/Turkish month names (`15 Jan 2027`, `Jan 15, 2027`, `15 Nisan 2027`). Ambiguous US numeric dates (`MM/DD/YYYY` where `MM <= 12`) and dates without a 4-digit year are not supported unless the reader normalizes them to `YYYY-MM-DD`.
 
-## A tour
-
-### Home: describe what to watch
-
-Pick an installed agent and model right in the composer. Model families with effort levels open in a side submenu.
-
-<p align="center"><img src="docs/screenshots/model-picker.png" alt="Model picker with effort levels" width="92%"></p>
-
-### Sources: the readers your agent wrote
-
-Inspect every source's status, run an async **Test** preview (with a **Stop** button), edit name/URL/notes/watch inline, resume paused sources, request a relearn, or load the exact Python code of each learned reader on demand.
-
-<p align="center"><img src="docs/screenshots/sources.png" alt="Sources with learned readers" width="92%"></p>
-
-### Agenda: deadlines and reminders
-
-Track saved items in an upcoming timeline or month calendar, add notes, snooze items, and export `.ics` events for Google Calendar, Outlook, or Apple Calendar.
-
-<table>
-<tr>
-<td width="50%"><img src="docs/screenshots/agenda.png" alt="Agenda, upcoming list"></td>
-<td width="50%"><img src="docs/screenshots/agenda-month.png" alt="Agenda, month view"></td>
-</tr>
-</table>
-
-### Filters and scan history
-
-Add or edit global and watch filters inline alongside the exact prompt instructions sent to the agent, and audit every scan source-by-source in History.
-
-<table>
-<tr>
-<td width="50%"><img src="docs/screenshots/filters.png" alt="Filters sent to the agent"></td>
-<td width="50%"><img src="docs/screenshots/scan.png" alt="A scan in the history"></td>
-</tr>
-</table>
-
-### Settings: agents, schedule, alerts, and backups
-
-<p align="center"><img src="docs/screenshots/settings.png" alt="Agents detected on this computer" width="92%"></p>
-
-## Quick start
-
-**Prerequisites:**
-
-- Python 3.10+ (stdlib only for the server and browser UI; optional `pywebview>=5` for a frameless desktop window)
-- Google Chrome / Chromium (on Linux desktop mode, `pywebview` also needs WebKitGTK / Qt WebEngine; `--browser` mode needs only any web browser)
-- Node.js (for `agent-browser`)
-- At least one supported agent CLI installed and signed in (unless you only use local `plugins/`)
-
-```bash
-# 1. Install the browser CLI used by agents and JS readers
-npm install -g agent-browser
-agent-browser install
-
-# 2. Clone and run Lookout (standard git clone or editable package install)
-git clone https://github.com/1eminguler/lookout.git
-cd lookout
-
-# Option A: run directly with zero Python dependencies (opens in browser if pywebview is absent)
-python run.py
-
-# Option B: install via pyproject.toml / pip (or pipx) with optional desktop window extra
-pip install -e .                 # or: pip install -e ".[desktop]"
-lookout                          # or: lookout --browser
-```
-
-If `pywebview` is not installed or cannot initialize a native window backend, Lookout automatically falls back to opening your default web browser at `http://127.0.0.1:8780/?k=<one-time-launch-secret>`. A PID lockfile (`data/window.pid`) prevents duplicate native windows and prints the active URL if Lookout is already open.
-
-1. Open **Settings** → pick your agent and default model.
-2. Open **Home** → describe what you want to follow (creates a watch + finds sources), or go to **Sources** → add listing URLs directly.
-3. Review **Filters** → refine global or watch-specific rules.
-4. Run **New scan**, then optionally enable **Daily scan** and notifications in **Settings**.
-
-From a terminal or scheduler:
-
-```bash
-python run.py scan               # or: lookout scan
-```
-
 ## Docker (isolated execution)
 
 Because most coding-agent CLIs run with auto-approve flags (`--yolo`, `--dangerously-skip-permissions`, etc.), running Lookout inside a container isolates agent file and shell access from your host home directory (`~/.ssh`, `~/.aws`, browser profiles).
 
-The included [`Dockerfile`](Dockerfile) uses `python:3.13-slim`, installs Node.js, `agent-browser`, and system Chromium, and runs as a non-root `lookout` user with `/data` mounted as a volume:
+The included [`Dockerfile`](Dockerfile) uses `python:3.13-slim`, installs Node.js, `agent-browser`, and system Chromium, runs as a non-root `lookout` user with `/data` as a volume, and starts Lookout in headless mode. CI builds the image and signs in to it on every push.
 
 ```bash
-docker build -t lookout .
+# Pick the agent CLIs to bake in: claude, codex, gemini (space separated). Leave it out for none.
+docker build --build-arg AGENTS="codex" -t lookout .
 
-# Publish ONLY on host loopback (127.0.0.1) so Lookout's Host header check and local boundary remain intact:
-docker run --rm -it \
-  -p 127.0.0.1:8780:8780 \
-  -v lookout-data:/data \
-  lookout
+# Publish ONLY on host loopback (127.0.0.1); the server only accepts Host: 127.0.0.1:8780 / localhost:8780.
+docker run -d --name lookout -p 127.0.0.1:8780:8780 -v lookout-data:/data lookout
+
+# Sign in: open the one-time link the container printed.
+docker logs lookout | grep "k="
+# Later, or after the link was used: print the current one
+docker exec lookout python run.py --print-url
+
+# Log the agent in once, inside the container (kept in the container's home directory),
+# by starting it and following its sign-in steps:
+docker exec -it lookout codex
 ```
 
-Inside the container, `LOOKOUT_BIND=0.0.0.0` lets Docker bridge port forwarding reach the server while `lookout/server.py` still enforces `Host: 127.0.0.1:8780` / `localhost:8780` and one-time launch-secret authentication. To sign in on the host browser after starting the container, read the one-time secret from `/data/.launch_secret` (e.g. `docker exec <container> cat /data/.launch_secret`) and open `http://127.0.0.1:8780/?k=<secret>`. Mount or install your chosen agent CLI credentials inside the container (not your entire host home directory).
+Each sign-in link works once; after it is used, the container prints the next one. Without an agent in the image, Lookout still runs scans with readers it already learned and with plugins, but it cannot learn new sites or find sources. Prefer logging the agent in inside the container over mounting your host home directory.
+
+`python run.py --headless` (or `LOOKOUT_HEADLESS=1`) works outside Docker too, for example on a home server: it serves without opening a window and prints each sign-in link.
 
 ## Environment variables
 
@@ -243,7 +197,7 @@ Adapters marked **CLI `--help` checked** in [`lookout/agents.py`](lookout/agents
 | [Gemini CLI](https://github.com/google-gemini/gemini-cli) | `gemini -p … --yolo [--sandbox]` (+ `-m <model>`) | `--sandbox` added only if `--help` lists it | **Conditional CLI sandbox** |
 | Antigravity CLI | `agy -p … --add-dir <dir> --dangerously-skip-permissions --print-timeout <t>s` (+ `--model <model>`) | CLI `--help` checked | **Auto-approve** |
 | [opencode](https://opencode.ai) | `opencode run … --auto` (+ `-m <model>`) | CLI `--help` checked | **Auto-approve** |
-| [Codex CLI](https://github.com/openai/codex) | `codex exec <prompt> -C <workdir> --skip-git-repo-check --ephemeral -s workspace-write -c sandbox_workspace_write.network_access=true` (+ `-m <model>`) | CLI `--help` checked | **Workspace-write sandbox with network access** |
+| [Codex CLI](https://github.com/openai/codex) | `codex exec <prompt> -C <workdir> --skip-git-repo-check --ephemeral -s workspace-write -c sandbox_workspace_write.network_access=true` (+ `-m <model>`); on Windows `-s danger-full-access` | CLI `--help` checked | **Workspace-write sandbox with network access** (macOS/Linux); **no sandbox** on Windows |
 | Cursor Agent | `cursor-agent -p … --force` (+ `--model <model>`) | experimental | **Auto-approve** |
 | Qwen Code | `qwen -p … --yolo` (+ `-m <model>`) | experimental | **Auto-approve** |
 | GitHub Copilot CLI | `copilot -p … --allow-all-tools` (+ `--model <model>`) | experimental | **Auto-approve** |

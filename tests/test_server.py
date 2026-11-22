@@ -917,8 +917,15 @@ class ServerTests(TempLookoutTestCase):
         self.assertEqual(self.req("POST", f"/api/sources/{sid}", {"name": "Src1 Edited", "notes": "tab B"})[0], 200)
         self.assertEqual(db.source_by_id(sid)["name"], "Src1 Edited")
         self.assertEqual(db.source_by_id(sid)["filters_changed"], 1)
+        src_now = db.source_by_id(sid)
+        shared_fs = db.filters_for_watch(src_now.get("watch_id"), active_only=True)
+        db.save_shared_reader(src_now["url"], "def fetch(): return []", ok=True, propagate=False,
+                              notes=src_now.get("notes") or "", fs=shared_fs)
+        self.assertIsNotNone(db.get_shared_reader(src_now["url"], notes=src_now.get("notes") or "", fs=shared_fs))
         self.assertEqual(self.req("POST", f"/api/sources/{sid}", {"relearn": True})[0], 200)
         self.assertEqual(db.source_by_id(sid)["filters_changed"], 0)
+        # Relearn also retires the shared reader, so the next scan really learns again
+        self.assertIsNone(db.get_shared_reader(src_now["url"], notes=src_now.get("notes") or "", fs=shared_fs))
 
         db.update_source(sid, extractor_ok=1, filters_changed=0)
         self.assertEqual(self.req("POST", f"/api/sources/{sid}", {"watch_id": w2})[0], 200)
@@ -1065,6 +1072,28 @@ class ServerTests(TempLookoutTestCase):
                     break
                 time.sleep(0.05)
         self.assertEqual(db.scans()[0]["status"], "cancelled")
+
+    def test_starter_packs_and_duplicate_sources(self):
+        code, packs = self.req("GET", "/api/packs")
+        self.assertEqual(code, 200)
+        self.assertEqual(len(packs), 3)
+        for pack in packs:
+            self.assertTrue(pack["name"] and pack["description"] and pack["suggested_filters"])
+            for source in pack["sources"]:
+                self.assertTrue(source["name"] and source["notes"])
+                self.assertTrue(source["url"].startswith("https://"))
+        pack = packs[0]
+        urls = [s["url"] for s in pack["sources"][:2]]
+        db.add_source("Existing", urls[0])
+        code, result = self.req("POST", f"/api/packs/{pack['id']}/add", {"target": "watch", "sources": urls})
+        self.assertEqual(code, 200)
+        self.assertEqual((result["added"], result["skipped"]), (1, 1))
+        self.assertEqual(len(db.sources(watch_id=result["watch_id"])), 1)
+        self.assertTrue(db.filters(watch_id=result["watch_id"]))
+        code, result = self.req("POST", f"/api/packs/{pack['id']}/add", {"target": "global", "sources": urls})
+        self.assertEqual((code, result["added"], result["skipped"]), (200, 0, 2))
+        self.assertEqual(self.req("POST", f"/api/packs/{pack['id']}/add", {"target": "global", "sources": ["https://invalid.example"]})[0], 400)
+        self.assertEqual(self.req("POST", "/api/packs/missing/add", {"target": "global", "sources": urls})[0], 404)
 
     def test_discovery_streams_partial_sources_into_scan_early(self):
         wid = db.add_watch("Early Watch", "early grants")

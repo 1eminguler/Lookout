@@ -8,9 +8,9 @@ import threading
 import urllib.parse
 import uuid
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from lookout import agents, db, eligibility
+from lookout import agents, db, eligibility, extractors
 
 WORK = Path(tempfile.gettempdir()) / "lookout_agent"
 
@@ -73,6 +73,14 @@ Make at most 40 detail requests per run. Return the original yearless deadline t
 deadline date is available anywhere in the source for that listing. If the detail page cannot be checked, leave
 the deadline null unless you already have the full deadline date."""
 
+
+def reader_rules() -> str:
+    """Return the sandbox restriction list generated directly from extractors.py constants."""
+    return extractors.describe_rules()
+
+
+_DEFAULT_READER_RULES = reader_rules()
+
 LEARN = ("""# Task: learn how to read one website, and write a small program that reads it
 
 {browser}
@@ -99,18 +107,19 @@ Write `results.json` early and keep it updated: a JSON array of the listings you
 Return ONLY listings that are currently open: skip cards marked closed, completed or expired (e.g.
 "Tamamlandı", "Kapandı", "Başvurular sona erdi", "Süresi doldu", "Closed", "Expired",
 "Applications closed").
+If the listing page honestly has zero currently open entries (for example, every card shows "Başvurular Tamamlandı"
+or the listing section is genuinely empty), write `[]` to `results.json` (or `items.json`) and write a short
+`empty_reason` in `result.json` (or `results.json`), e.g. `{{"items": [], "empty_reason": "all 181 cards show 'Başvurular Tamamlandı'"}}`.
 
 """ + DEADLINE_GUIDANCE + """
 
 ## Part 2 — write `extractor.py`
 A Python file with a function `fetch()` that returns the same kind of list for ALL current listings in that section
-(follow every page), so the site can be read again later in seconds without you. Rules for extractor.py:
-- Only these imports are allowed: json, re, html, math, time, datetime, itertools, collections, typing, urllib.parse,
-  unicodedata, string, functools, and `from lookout_extract import get, get_json, post_json, browser_eval, absolute`.
-  No other modules, no file or network access except through those helpers. Do not use eval/exec/open/getattr
-  or names starting with an underscore.
+(follow every page), so the site can be read again later in seconds without you.
+Restrictions enforced by `extractors.check` on `extractor.py`:
+""" + _DEFAULT_READER_RULES + """
 - Helpers: `get(url, headers=None) -> str` (HTTP GET text), `get_json(url, headers=None)`, `post_json(url, payload,
-  headers=None)`, `absolute(base, href) -> str`, and `browser_eval(url, js, wait_ms=2500, scrolls=4)` which opens the
+  headers=None)`, `absolute(base, href) -> str`, `allowed(url) -> bool`, and `browser_eval(url, js, wait_ms=2500, scrolls=4)` which opens the
   page in a real browser, scrolls, evaluates the JavaScript EXPRESSION `js` (e.g.
   `[...document.querySelectorAll('.job')].map(e => ({{title: e.querySelector('h3').innerText, url: e.querySelector('a').href}}))`)
   and returns its JSON value. Prefer a JSON API with get_json (fastest); use browser_eval for pages that need
@@ -121,9 +130,8 @@ A Python file with a function `fetch()` that returns the same kind of list for A
 - Only currently open listings go in the output: skip cards marked closed/completed/expired (e.g. "Tamamlandı",
   "Kapandı", "Closed").
 - If the expected listing section, container, or API structure is missing or changed, raise `RuntimeError("page/API shape changed: ...")` instead of silently returning `[]`.
-- If the page or API explicitly confirms zero active listings, have `fetch()` return only `[{{"empty": True}}]` (serialized as `[{{"empty": true}}]`). Otherwise, an empty list needs a second consecutive empty scan to close previous listings.
-- If you can run shell commands, test it with `python test_extractor.py` (prints what fetch() returns) and fix it
-  until it returns the listings. Make sure the titles and links match what you saw in Part 1.
+- If the page or API explicitly confirms zero active listings, have `fetch()` return only `[{{"empty": True}}]` (serialized as `[{{"empty": true}}]`, or return `[]` with module-level `EMPTY_OK = True`). Otherwise, an empty list needs a second consecutive empty scan to close previous listings.
+- Before finishing, run `python check_reader.py` in this folder (it runs `extractors.check` and a dry run of `fetch()` through the sandbox runner and prints `OK` or the exact error; you can also run `python test_extractor.py` to inspect output). Fix any errors until `python check_reader.py` prints `OK`, and make sure the titles and links match what you saw in Part 1.
 
 When done, close the browser: `agent-browser --session {session} close`.
 
@@ -150,7 +158,10 @@ Return ONLY listings that are currently open: skip cards marked closed, complete
 
 """ + DEADLINE_GUIDANCE + """
 
-Do NOT write extractor.py. Close the browser when done: `agent-browser --session {session} close`.
+Reader sandbox restrictions enforced by `extractors.check` (for reference when evaluating site feasibility; do NOT write `extractor.py` in this preview task):
+""" + _DEFAULT_READER_RULES + """
+
+Close the browser when done: `agent-browser --session {session} close`.
 
 {safety}""")
 
@@ -241,30 +252,87 @@ def _session(name: str, source_id: Any = None) -> str:
     return f"lookout-{slug}-{uuid.uuid4().hex[:6]}"
 
 
-def _parse_json_output(txt: str, name: str) -> Any:
+def _parse_raw_json(txt: str) -> Any:
     if not txt:
         return None
     try:
-        parsed = json.loads(txt)
+        return json.loads(txt)
     except json.JSONDecodeError:
         a, b = txt.find("["), txt.rfind("]")
         oa, ob = txt.find("{"), txt.rfind("}")
         if oa >= 0 and (a < 0 or oa < a):
             try:
-                parsed = json.loads(txt[oa:ob + 1])
+                return json.loads(txt[oa:ob + 1])
             except json.JSONDecodeError:
-                parsed = None
-        else:
-            parsed = None
-        if parsed is None and a >= 0 and b > a:
+                pass
+        if a >= 0 and b > a:
             try:
-                parsed = json.loads(txt[a:b + 1])
+                return json.loads(txt[a:b + 1])
             except json.JSONDecodeError:
-                parsed = None
+                pass
+    return None
+
+
+def _parse_json_output(txt: str, name: str) -> Any:
+    parsed = _parse_raw_json(txt)
     stem = Path(name).stem
     if isinstance(parsed, dict) and isinstance(parsed.get(stem), list):
         return parsed[stem]
     return parsed
+
+
+def _extract_learned_items_and_reason(raw_texts: Dict[str, str], files: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+    items: Optional[List[Dict[str, Any]]] = None
+    empty_reason: Optional[str] = None
+
+    for fname in ("results.json", "result.json", "items.json", "empty_reason.json"):
+        raw = (raw_texts.get(fname) or "").strip()
+        parsed = _parse_raw_json(raw) if raw else files.get(fname)
+        if parsed is None:
+            continue
+        if isinstance(parsed, dict):
+            cand_reason = parsed.get("empty_reason")
+            if not cand_reason and (
+                parsed.get("empty") is True
+                or parsed.get("items") == []
+                or parsed.get("results") == []
+                or fname in ("result.json", "empty_reason.json")
+            ):
+                cand_reason = parsed.get("reason")
+            if isinstance(cand_reason, str) and cand_reason.strip() and not empty_reason:
+                empty_reason = re.sub(r"\s+", " ", cand_reason).strip()[:300]
+            for list_key in ("items", "results", Path(fname).stem):
+                val = parsed.get(list_key)
+                if isinstance(val, list) and items is None:
+                    items = [i for i in val if isinstance(i, dict)]
+        elif isinstance(parsed, list):
+            clean_list: List[Dict[str, Any]] = []
+            for entry in parsed:
+                if not isinstance(entry, dict):
+                    continue
+                if "empty_reason" in entry and not entry.get("title"):
+                    r_val = entry.get("empty_reason")
+                    if isinstance(r_val, str) and r_val.strip() and not empty_reason:
+                        empty_reason = re.sub(r"\s+", " ", r_val).strip()[:300]
+                    continue
+                if entry.get("empty") is True and set(entry.keys()) <= {"empty", "empty_reason", "reason"}:
+                    r_val = entry.get("empty_reason") or entry.get("reason")
+                    if isinstance(r_val, str) and r_val.strip() and not empty_reason:
+                        empty_reason = re.sub(r"\s+", " ", r_val).strip()[:300]
+                    continue
+                clean_list.append(entry)
+            if items is None or (not items and clean_list):
+                items = clean_list
+
+    if not empty_reason:
+        txt_reason = (raw_texts.get("empty_reason.txt") or "").strip()
+        if txt_reason:
+            empty_reason = re.sub(r"\s+", " ", txt_reason).strip()[:300]
+
+    final_items = items if items is not None else []
+    if final_items:
+        empty_reason = None
+    return final_items, empty_reason
 
 
 def _run_agent(task_text: str, outputs: List[str], timeout: int, settings: Dict[str, str],
@@ -272,7 +340,8 @@ def _run_agent(task_text: str, outputs: List[str], timeout: int, settings: Dict[
                session: Optional[str] = None, cancel_event: Optional[threading.Event] = None,
                watch_files: Optional[List[str]] = None,
                on_file_update: Optional[Callable[[Path], None]] = None,
-               task_kind: Optional[str] = None) -> Dict[str, Any]:
+               task_kind: Optional[str] = None,
+               repair_check: Optional[Callable[[Path], Optional[str]]] = None) -> Dict[str, Any]:
     agent_id, model = settings["agent"], settings["model"]
     if not agent_id:
         raise RuntimeError("No AI agent selected (Settings → Agent)")
@@ -318,6 +387,12 @@ def _run_agent(task_text: str, outputs: List[str], timeout: int, settings: Dict[
             if task_kind and ("task_kind" in rt_params or accepts_kw):
                 rt_kw["task_kind"] = task_kind
             log = agents.run_task(agent_id, model, work, timeout, **rt_kw)
+            if repair_check is not None and not (cancel_event and cancel_event.is_set()):
+                repair_task = repair_check(work)
+                if repair_task:
+                    (work / "TASK.md").write_text(header + repair_task, encoding="utf-8")
+                    log2 = agents.run_task(agent_id, model, work, timeout, **rt_kw)
+                    log = f"{log}\n{log2}" if log else log2
         finally:
             stop_watch.set()
             if watcher is not None:
@@ -338,7 +413,6 @@ def _run_agent(task_text: str, outputs: List[str], timeout: int, settings: Dict[
 def learn_source(source: Dict[str, Any], fs: List[Dict[str, Any]],
                  cancel_event: Optional[threading.Event] = None) -> Dict[str, Any]:
     """Agent browses the site, returns what it saw and the extractor code it wrote."""
-    from lookout import extractors
     s = db.get_settings()
     minutes = max(4, int(s.get("agent_timeout_min") or 12))
     session = _session(source["name"], source.get("id"))
@@ -348,19 +422,49 @@ def learn_source(source: Dict[str, Any], fs: List[Dict[str, Any]],
         previous = ("\nA previous extractor for this site stopped working" +
                     (f" (error: {source.get('extractor_error')})" if source.get("extractor_error") else "") +
                     ". Here it is; fix it or rewrite it:\n```python\n" + prev_code[:6000] + "\n```\n")
-    text = LEARN.format(
+    live_rules = reader_rules()
+    text = LEARN.replace(_DEFAULT_READER_RULES, live_rules).format(
         browser=BROWSER.format(session=session, headed=" --headed" if s.get("headed") == "1" else ""),
         name=source["name"], url=source["url"], notes=source.get("notes") or "none", previous=previous,
         filters=describe_filters(fs), minutes=minutes - 1, session=session, safety=SAFETY)
-    extras = {"test_extractor.py": extractors.RUNNER.replace("sys.argv[1]", "'.'"),
-              "lookout_extract.py": Path(extractors.__file__).with_name("lookout_extract.py").read_text(encoding="utf-8")}
-    out = _run_agent(text, ["results.json"], minutes * 60, s, extras=extras, raw=["extractor.py"],
-                     tag="scan", session=session, cancel_event=cancel_event, task_kind="learn")
-    items = out["files"].get("results.json")
-    if not isinstance(items, list):
-        items = []
-    return {"items": [i for i in items if isinstance(i, dict)], "code": out["raw"].get("extractor.py"),
-            "log": out["log"]}
+    extras = {
+        "check_reader.py": extractors.CHECK_READER,
+        "test_extractor.py": extractors.RUNNER.replace("sys.argv[1]", "'.'"),
+        "lookout_extract.py": Path(extractors.__file__).with_name("lookout_extract.py").read_text(encoding="utf-8"),
+    }
+
+    def _repair_if_rejected(work: Path) -> Optional[str]:
+        ext_path = work / "extractor.py"
+        if not ext_path.is_file():
+            return None
+        code = ext_path.read_text(encoding="utf-8", errors="replace")
+        try:
+            extractors.check(code)
+            return None
+        except Exception as err:
+            exact_err = str(err)
+            return (
+                f"## Repair required — Lookout's reader check rejected `extractor.py`\n"
+                f"Exact error from `extractors.check`: {exact_err}\n\n"
+                f"Fix `extractor.py` in this working directory so it obeys every restriction below, "
+                f"run `python check_reader.py` until it prints `OK`, and keep your result files in place.\n\n"
+                f"{text}"
+            )
+
+    raw_files = ["extractor.py", "results.json", "result.json", "items.json", "empty_reason.json", "empty_reason.txt"]
+    out = _run_agent(
+        text, ["results.json", "result.json", "items.json"], minutes * 60, s,
+        extras=extras, raw=raw_files,
+        tag="scan", session=session, cancel_event=cancel_event, task_kind="learn",
+        repair_check=_repair_if_rejected,
+    )
+    items, empty_reason = _extract_learned_items_and_reason(out.get("raw") or {}, out.get("files") or {})
+    return {
+        "items": items,
+        "empty_reason": empty_reason,
+        "code": (out.get("raw") or {}).get("extractor.py"),
+        "log": out["log"],
+    }
 
 
 def quick_read_source(source: Dict[str, Any], fs: List[Dict[str, Any]],
@@ -369,7 +473,8 @@ def quick_read_source(source: Dict[str, Any], fs: List[Dict[str, Any]],
     s = db.get_settings()
     minutes = min(4, max(2, int(s.get("agent_timeout_min") or 12) // 4))
     session = _session(source.get("name") or "preview", source.get("id")) + "-test"
-    text = QUICK_READ.format(
+    live_rules = reader_rules()
+    text = QUICK_READ.replace(_DEFAULT_READER_RULES, live_rules).format(
         browser=BROWSER.format(session=session, headed=" --headed" if s.get("headed") == "1" else ""),
         name=source.get("name") or "Source", url=source["url"], notes=source.get("notes") or "none",
         filters=describe_filters(fs), minutes=minutes, session=session, safety=SAFETY)

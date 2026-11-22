@@ -874,8 +874,15 @@ class ServerTests(TempLookoutTestCase):
         self.assertEqual(self.req("POST", f"/api/sources/{sid}", {"name": "Src1 Edited", "notes": "tab B"})[0], 200)
         self.assertEqual(db.source_by_id(sid)["name"], "Src1 Edited")
         self.assertEqual(db.source_by_id(sid)["filters_changed"], 1)
+        src_now = db.source_by_id(sid)
+        shared_fs = db.filters_for_watch(src_now.get("watch_id"), active_only=True)
+        db.save_shared_reader(src_now["url"], "def fetch(): return []", ok=True, propagate=False,
+                              notes=src_now.get("notes") or "", fs=shared_fs)
+        self.assertIsNotNone(db.get_shared_reader(src_now["url"], notes=src_now.get("notes") or "", fs=shared_fs))
         self.assertEqual(self.req("POST", f"/api/sources/{sid}", {"relearn": True})[0], 200)
         self.assertEqual(db.source_by_id(sid)["filters_changed"], 0)
+        # Relearn also retires the shared reader, so the next scan really learns again
+        self.assertIsNone(db.get_shared_reader(src_now["url"], notes=src_now.get("notes") or "", fs=shared_fs))
 
         db.update_source(sid, extractor_ok=1, filters_changed=0)
         self.assertEqual(self.req("POST", f"/api/sources/{sid}", {"watch_id": w2})[0], 200)

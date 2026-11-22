@@ -465,6 +465,29 @@ class TestDatabase(LookoutTestCase):
         self.assertIsNone(db.agent_blocked_until("gemini", "gemini-2.5-flash"))
         self.assertEqual(db.agent_usage("gemini")[0]["calls"], 2)
 
+    def test_invalidate_shared_reader_stops_handing_back_the_old_reader(self):
+        url = "https://relearn.example.com/list"
+        code = "def fetch(): return [{'title': 'Old', 'url': 'https://relearn.example.com/1'}]"
+        s1 = db.add_source("A", url, notes="Interns")
+        s2 = db.add_source("B", url + "/?utm_source=x", notes="interns")
+        s_other = db.add_source("C", url, notes="Grants")
+        db.save_shared_reader(url, code, ok=True, propagate=True, notes="Interns", fs=[])
+        other_code = "def fetch(): return [{'title': 'G', 'url': 'https://relearn.example.com/g'}]"
+        db.save_shared_reader(url, other_code, ok=True, propagate=True, notes="Grants", fs=[])
+        self.assertEqual(db.get_shared_reader(url, notes="Interns", fs=[])["extractor"], code)
+
+        db.update_source(s1, extractor_ok=0, extractor_error="relearn requested")
+        touched = db.invalidate_shared_reader(url, notes="Interns", fs=[])
+
+        self.assertEqual(touched, 1)  # s2; s1 was already cleared by the relearn request
+        self.assertIsNone(db.get_shared_reader(url, notes="Interns", fs=[]))
+        for sid in (s1, s2):
+            src = db.source_by_id(sid)
+            self.assertEqual(src["extractor_ok"], 0)
+            self.assertEqual(src["last_good_extractor"], code)  # kept for fallback
+        self.assertEqual(db.source_by_id(s_other)["extractor_ok"], 1)  # other context untouched
+        self.assertEqual(db.get_shared_reader(url, notes="Grants", fs=[])["extractor"], other_code)
+
     def test_shared_readers_scoped_by_notes_filters_and_mark_filters_changed(self):
         w1 = db.add_watch("Watch One", "internships")
         w2 = db.add_watch("Watch Two", "research grants")

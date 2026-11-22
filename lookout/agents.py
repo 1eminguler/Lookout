@@ -63,8 +63,13 @@ class CancelledError(RuntimeError):
 
 
 def _codex(exe, model, workdir, timeout):
-    cmd = [exe, "exec", prompt_for(workdir), "-C", workdir, "--skip-git-repo-check", "--ephemeral",
-           "-s", "workspace-write", "-c", "sandbox_workspace_write.network_access=true"]
+    cmd = [exe, "exec", prompt_for(workdir), "-C", workdir, "--skip-git-repo-check", "--ephemeral"]
+    if sys.platform == "win32":
+        # Codex's Windows sandbox blocks every shell command it would need, so on Windows it runs
+        # without its sandbox, like the other auto-approve agents.
+        cmd += ["-s", "danger-full-access"]
+    else:
+        cmd += ["-s", "workspace-write", "-c", "sandbox_workspace_write.network_access=true"]
     return cmd + (["-m", model] if model else [])
 
 

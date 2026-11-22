@@ -750,6 +750,32 @@ def get_shared_reader(url: str, notes: str = "", fs: Optional[List[Dict[str, Any
     return None
 
 
+def invalidate_shared_reader(url: str, notes: str = "", fs: Optional[List[Dict[str, Any]]] = None,
+                             error: str = "relearn requested") -> int:
+    """Mark the reader for this URL + context as needing relearning everywhere it is used.
+
+    Clears the shared row and every agent source that would otherwise hand the same reader back
+    through get_shared_reader(); the last good reader is kept for fallback. Returns sources touched.
+    """
+    canon = canonical_reader_url(url)
+    if not canon:
+        return 0
+    ctx_hash = reader_context_hash(notes, fs)
+    key = f"{canon}#{ctx_hash}"
+    touched = []
+    for s in _rows("SELECT id, url, notes, watch_id FROM sources WHERE method='agent' AND extractor_ok=1"):
+        if canonical_reader_url(s["url"]) != canon:
+            continue
+        if reader_context_hash(s.get("notes") or "", filters_for_watch(s.get("watch_id"), active_only=True)) == ctx_hash:
+            touched.append(s["id"])
+    with _conn() as c:
+        c.execute("UPDATE url_readers SET extractor_ok=0, extractor_error=? WHERE url_key=?", (error[:300], key))
+        for sid in touched:
+            c.execute("UPDATE sources SET extractor_ok=0, extractor_error=? WHERE id=?", (error[:300], sid))
+        c.commit()
+    return len(touched)
+
+
 def save_shared_reader(url: str, extractor: str, ok: bool = True, error: Optional[str] = None,
                        stats: Optional[str] = None, updated: Optional[str] = None,
                        propagate: bool = True, notes: str = "",

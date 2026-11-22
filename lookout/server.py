@@ -1165,6 +1165,10 @@ class Handler(BaseHTTPRequestHandler):
             if not fields:
                 raise ValueError("No fields to update")
             db.update_source(sid, **fields)
+            if b.get("relearn") and cur.get("method") == "agent":
+                db.invalidate_shared_reader(
+                    cur["url"], notes=cur.get("notes") or "",
+                    fs=db.filters_for_watch(cur.get("watch_id"), active_only=True))
             return self.send(200, {"ok": True})
         if m := re.fullmatch(r"/api/sources/(\d+)/delete", p):
             if not db.delete_source(int(m[1])):

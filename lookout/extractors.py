@@ -13,7 +13,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 from lookout import agents, lookout_extract
 
@@ -316,16 +316,92 @@ def run(
         shutil.rmtree(work, ignore_errors=True)
 
 
-def agrees(agent_items: List[Dict], code_items: List[Dict]) -> bool:
+class _UnverifiedResult:
+    """Sentinel returned by agrees() when agent_items is empty and verification cannot occur."""
+
+    def __bool__(self) -> bool:
+        return False
+
+    def __str__(self) -> str:
+        return "unverified"
+
+    def __repr__(self) -> str:
+        return "UNVERIFIED"
+
+    def __eq__(self, other: object) -> bool:
+        return other is self or (isinstance(other, str) and other == "unverified")
+
+    def __hash__(self) -> int:
+        return hash("unverified")
+
+
+UNVERIFIED = _UnverifiedResult()
+
+
+def _norm_title(s: Any) -> str:
+    return " ".join(str(s or "").lower().split())[:80]
+
+
+def _norm_url(s: Any) -> str:
+    return str(s or "").strip().rstrip("/")
+
+
+def _overlap_hits(source_items: List[Dict[str, Any]], target_items: List[Dict[str, Any]]) -> int:
+    target_titles = {t for i in target_items if (t := _norm_title(i.get("title")))}
+    target_urls = {u for i in target_items if (u := _norm_url(i.get("url")))}
+    return sum(
+        1 for item in source_items
+        if ((t := _norm_title(item.get("title"))) and t in target_titles)
+        or ((u := _norm_url(item.get("url"))) and u in target_urls)
+    )
+
+
+def agrees(agent_items: List[Dict], code_items: List[Dict]) -> Union[bool, _UnverifiedResult]:
     """Does the code find (most of) what the agent found by browsing?"""
     if not agent_items:
-        return True
-    norm = lambda s: " ".join(str(s or "").lower().split())[:80]
-    code_titles = {t for i in code_items if (t := norm(i.get("title")))}
-    code_urls = {u for i in code_items if (u := str(i.get("url") or "").strip().rstrip("/"))}
-    hits = sum(
-        1 for a in agent_items
-        if ((t := norm(a.get("title"))) and t in code_titles)
-        or ((u := str(a.get("url") or "").strip().rstrip("/")) and u in code_urls)
-    )
+        return UNVERIFIED
+    hits = _overlap_hits(agent_items, code_items)
     return hits >= max(1, int(len(agent_items) * 0.6))
+
+
+def run_and_compare(
+    code: str,
+    *,
+    timeout: int = 180,
+    max_output: int = MAX_OUTPUT_BYTES,
+    tag: Optional[str] = None,
+    cancel_event: Optional[threading.Event] = None,
+    min_overlap: float = 0.7,
+    allow_empty: bool = False,
+    delay: float = 0.0,
+) -> Tuple[bool, List[Dict[str, Any]], str]:
+    """Execute `code` twice and verify that its outputs are consistent and non-empty."""
+    first = run(code, timeout=timeout, max_output=max_output, tag=tag, cancel_event=cancel_event)
+    if delay and delay > 0:
+        if cancel_event is not None:
+            if cancel_event.wait(delay):
+                raise agents.CancelledError("cancelled")
+        else:
+            time.sleep(delay)
+    if cancel_event is not None and cancel_event.is_set():
+        raise agents.CancelledError("cancelled")
+    second = run(code, timeout=timeout, max_output=max_output, tag=tag, cancel_event=cancel_event)
+
+    if not first and not second:
+        return (True, second, "") if allow_empty else (False, second, "extractor returned no items on both runs")
+    if bool(first) != bool(second):
+        return False, second, f"extractor results changed between runs ({len(first)} vs {len(second)})"
+
+    lo, hi = min(len(first), len(second)), max(len(first), len(second))
+    if lo / hi < min_overlap:
+        return False, second, f"extractor item count varied between runs ({len(first)} vs {len(second)})"
+
+    fwd_ratio = _overlap_hits(first, second) / len(first)
+    rev_ratio = _overlap_hits(second, first) / len(second)
+    if min(fwd_ratio, rev_ratio) < min_overlap:
+        return (
+            False,
+            second,
+            f"extractor results changed between runs ({min(fwd_ratio, rev_ratio):.0%} overlap < {min_overlap:.0%})",
+        )
+    return True, second, ""

@@ -47,19 +47,19 @@ python run.py scan               # or: lookout scan
 
 Start on **Home** to describe what you want to watch. Open **Feed** to see matches across watches and save an item to your agenda.
 
-<img src="docs/screenshots/feed.png" alt="Feed showing matches and deadlines across watches" width="900">
+<img src="docs/screenshots/feed-2026.png" alt="Feed showing matches and deadlines across watches" width="900">
 
 In **Sources**, add a listing URL or check the status of a source you already follow.
 
-<img src="docs/screenshots/sources.png" alt="Sources grouped by global and watch sources" width="900">
+<img src="docs/screenshots/sources-2026.png" alt="Sources grouped by global and watch sources" width="900">
 
 In **Agenda**, open a saved item to add a note or set a reminder.
 
-<img src="docs/screenshots/agenda.png" alt="Agenda with a saved internship and its reminder open" width="900">
+<img src="docs/screenshots/agenda-2026.png" alt="Agenda with a saved internship and its reminder open" width="900">
 
 In **Settings**, choose your agent, daily scan time, desktop notifications, and appearance. System follows your device, or you can choose Light or Dark.
 
-<img src="docs/screenshots/settings.png" alt="Settings in Light mode with Advanced sections collapsed" width="900">
+<img src="docs/screenshots/settings-2026.png" alt="Settings in Light mode with Advanced sections collapsed" width="900">
 
 ## Contents
 

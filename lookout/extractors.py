@@ -15,31 +15,12 @@ import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from lookout import agents
+from lookout import agents, lookout_extract
 
-HELPERS = {"get", "get_json", "post_json", "browser_eval", "absolute"}
-MODULES = {"json", "re", "html", "math", "time", "datetime", "itertools", "collections", "typing", "urllib.parse",
-           "unicodedata", "string", "functools"}
-BANNED_CALLS = {
-    "eval", "exec", "compile", "open", "__import__", "globals", "locals", "vars", "getattr", "setattr",
-    "delattr", "hasattr", "input", "breakpoint", "memoryview", "help", "type", "object", "super", "dir",
-    "issubclass", "classmethod", "staticmethod", "property", "exit", "quit", "license", "credits",
-    "copyright", "Formatter",
-}
-BANNED_ATTRS = {
-    "gi_frame", "gi_code", "gi_yieldfrom", "gi_running", "gi_suspended",
-    "cr_frame", "cr_code", "cr_await", "cr_origin", "cr_running", "cr_suspended",
-    "ag_frame", "ag_code", "ag_await", "ag_running", "ag_suspended",
-    "tb_frame", "tb_next", "tb_lasti", "tb_lineno",
-    "f_builtins", "f_globals", "f_locals", "f_back", "f_code", "f_trace", "f_generator",
-    "co_code", "co_consts", "co_names", "co_varnames", "co_freevars", "co_cellvars",
-    "func_globals", "func_code", "func_closure", "im_func", "im_self", "im_class",
-    "sys", "os", "builtins", "subprocess", "importlib", "codecs", "types",
-    "operator", "warnings", "copyreg", "enum", "abc", "ipaddress", "io",
-    "shutil", "pathlib", "inspect", "gc", "ctypes", "socket", "signal",
-    "threading", "multiprocessing", "format_map", "vformat", "get_field", "get_value",
-    "Formatter",
-}
+HELPERS = lookout_extract.SANDBOX_HELPERS
+MODULES = lookout_extract.SANDBOX_MODULES
+BANNED_CALLS = lookout_extract.SANDBOX_BANNED_CALLS
+BANNED_ATTRS = lookout_extract.SANDBOX_BANNED_ATTRS
 MAX_OUTPUT_BYTES = 5 * 1024 * 1024
 
 RUNNER = """import importlib, json, os, sys, types
@@ -50,23 +31,10 @@ max_bytes = int(sys.argv[3]) if len(sys.argv) > 3 else 5242880
 sys.path.insert(0, work)
 import lookout_extract as _le
 
-_HELPERS = {"get", "get_json", "post_json", "browser_eval", "absolute"}
-_MODULES = {"json", "re", "html", "math", "time", "datetime", "itertools", "collections", "typing", "urllib.parse",
-            "unicodedata", "string", "functools"}
-_BANNED_ATTRS = {
-    "gi_frame", "gi_code", "gi_yieldfrom", "gi_running", "gi_suspended",
-    "cr_frame", "cr_code", "cr_await", "cr_origin", "cr_running", "cr_suspended",
-    "ag_frame", "ag_code", "ag_await", "ag_running", "ag_suspended",
-    "tb_frame", "tb_next", "tb_lasti", "tb_lineno",
-    "f_builtins", "f_globals", "f_locals", "f_back", "f_code", "f_trace", "f_generator",
-    "co_code", "co_consts", "co_names", "co_varnames", "co_freevars", "co_cellvars",
-    "func_globals", "func_code", "func_closure", "im_func", "im_self", "im_class",
-    "sys", "os", "builtins", "subprocess", "importlib", "codecs", "types",
-    "operator", "warnings", "copyreg", "enum", "abc", "ipaddress", "io",
-    "shutil", "pathlib", "inspect", "gc", "ctypes", "socket", "signal",
-    "threading", "multiprocessing", "format_map", "vformat", "get_field", "get_value",
-    "Formatter",
-}
+_HELPERS = _le.SANDBOX_HELPERS
+_MODULES = _le.SANDBOX_MODULES
+_BANNED_CALLS = _le.SANDBOX_BANNED_CALLS
+_BANNED_ATTRS = _le.SANDBOX_BANNED_ATTRS
 
 def _safe_import(name, globals=None, locals=None, fromlist=(), level=0):
     if level != 0:
@@ -76,7 +44,7 @@ def _safe_import(name, globals=None, locals=None, fromlist=(), level=0):
             raise ImportError("unsupported import from lookout_extract")
         return types.SimpleNamespace(**{k: getattr(_le, k) for k in _HELPERS})
     if name in _MODULES:
-        if fromlist and any(a == "*" or a.startswith("_") or a in _BANNED_ATTRS for a in fromlist):
+        if fromlist and any(a == "*" or a.startswith("_") or a in _BANNED_ATTRS or a in _BANNED_CALLS for a in fromlist):
             raise ImportError(f"import from '{name}' is not allowed")
         mod = importlib.import_module(name)
         if name == "urllib.parse" and not fromlist:

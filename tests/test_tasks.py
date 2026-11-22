@@ -1,5 +1,7 @@
 """Unit tests for lookout.tasks."""
 import json
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -123,6 +125,78 @@ class TaskTests(TempLookoutTestCase):
                          "Machine learning internships")
         self.assertEqual(tasks.quick_title("   "), "Web search")
         self.assertLessEqual(len(tasks.quick_title("word " * 20)), 48)
+
+    def test_parallel_setting_applied_at_runtime(self):
+        active_lock = threading.Lock()
+        state = {"cur": 0, "peak": 0}
+
+        def slow_agent(aid, model, workdir: Path, timeout, **kw):
+            with active_lock:
+                state["cur"] += 1
+                state["peak"] = max(state["peak"], state["cur"])
+            time.sleep(0.15)
+            with active_lock:
+                state["cur"] -= 1
+            (workdir / "decisions.json").write_text("{}", encoding="utf-8")
+            return ""
+
+        # parallel=1 forces strict sequential execution even across 3 threads
+        db.set_settings({"parallel": "1"})
+        with patch.object(agents, "run_task", side_effect=slow_agent):
+            threads = [threading.Thread(target=tasks.classify, args=([], [])) for _ in range(3)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(timeout=5)
+        self.assertEqual(state["peak"], 1)
+
+        # Raising parallel=3 dynamically allows 3 concurrent agent calls without restart
+        state["peak"] = 0
+        db.set_settings({"parallel": "3"})
+        with patch.object(agents, "run_task", side_effect=slow_agent):
+            threads = [threading.Thread(target=tasks.classify, args=([], [])) for _ in range(3)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(timeout=5)
+        self.assertGreaterEqual(state["peak"], 2)
+
+    def test_quick_read_and_discover_early_progress_and_last_good_fallback(self):
+        src = {"name": "Site", "url": "https://site.example.com", "last_good_extractor": "def fetch(): return []"}
+
+        def fake_learn(aid, model, workdir: Path, timeout, **kw):
+            task_txt = (workdir / "TASK.md").read_text(encoding="utf-8")
+            self.assertIn("def fetch(): return []", task_txt)
+            (workdir / "results.json").write_text("[]", encoding="utf-8")
+            return ""
+
+        with patch.object(agents, "run_task", side_effect=fake_learn):
+            tasks.learn_source(src, [])
+
+        def fake_quick(aid, model, workdir: Path, timeout, **kw):
+            (workdir / "results.json").write_text(json.dumps([{"title": "Preview", "url": "https://site.example.com/1"}]), encoding="utf-8")
+            return ""
+
+        with patch.object(agents, "run_task", side_effect=fake_quick):
+            q = tasks.quick_read_source(src, [])
+        self.assertEqual(q["items"], [{"title": "Preview", "url": "https://site.example.com/1"}])
+
+        snaps = []
+
+        def fake_streaming_disc(aid, model, workdir: Path, timeout, **kw):
+            (workdir / "title.txt").write_text("ML Grants\n", encoding="utf-8")
+            (workdir / "sources.json").write_text(json.dumps([{"name": "S1", "url": "https://s1.example/jobs"}]), encoding="utf-8")
+            time.sleep(0.75)
+            (workdir / "sources.json").write_text(json.dumps([
+                {"name": "S1", "url": "https://s1.example/jobs"},
+                {"name": "S2", "url": "https://s2.example/jobs"},
+            ]), encoding="utf-8")
+            return ""
+
+        with patch.object(agents, "run_task", side_effect=fake_streaming_disc):
+            out = tasks.discover_sources("ml grants", on_progress=lambda snap: snaps.append(snap))
+        self.assertEqual(len(out["sources"]), 2)
+        self.assertTrue(any(len(s["sources"]) == 1 for s in snaps))
 
 
 if __name__ == "__main__":

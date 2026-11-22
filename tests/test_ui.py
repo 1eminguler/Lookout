@@ -116,6 +116,11 @@ class UiSmokeTests(TempLookoutTestCase):
                 if route_hash == "#/agenda":
                     page.click('[data-agview="month"]')
                     page.wait_for_selector(".cal")
+                elif route_hash == "#/settings":
+                    page.wait_for_selector("#webhookUrl")
+                    page.wait_for_selector("#rssPublicIn")
+                    page.click('[data-act="sched-preview"]')
+                    page.wait_for_selector("pre")
 
             # Scroll position survives a background refresh during a fake running scan
             scanner.progress.update(running=True, scan_id=scan_id, done=1, total=5, current=["EuroTech"])

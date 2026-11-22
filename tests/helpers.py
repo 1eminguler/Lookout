@@ -175,9 +175,10 @@ def seed_db(item_count: int = 6) -> Dict[str, Any]:
 class LiveServer:
     """Context manager running Lookout's ThreadingHTTPServer on an ephemeral local port."""
 
-    def __init__(self, port: Optional[int] = None):
+    def __init__(self, port: Optional[int] = None, api_token: Optional[str] = None):
         self.requested_port = port or 0
         self.port = 0
+        self.api_token = api_token or server.API_TOKEN
         self.srv: Optional[ThreadingHTTPServer] = None
         self.thread: Optional[threading.Thread] = None
         self._patches: List[Any] = []
@@ -185,6 +186,7 @@ class LiveServer:
     def __enter__(self) -> "LiveServer":
         db.init()
         self.srv = ThreadingHTTPServer(("127.0.0.1", self.requested_port), server.Handler)
+        self.srv.api_token = self.api_token
         self.srv.daemon_threads = True
         try:
             self.port = self.srv.server_address[1]
@@ -223,9 +225,12 @@ class LiveServer:
         path: str,
         body: Optional[Union[Dict[str, Any], List[Any], bytes, str]] = None,
         headers: Optional[Dict[str, str]] = None,
+        include_token: bool = True,
     ) -> Tuple[int, Dict[str, str], bytes, Any]:
         conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
         hdrs = dict(headers or {})
+        if include_token and path.startswith("/api/") and "X-Lookout-Token" not in hdrs:
+            hdrs["X-Lookout-Token"] = self.api_token
         raw_body: Optional[bytes] = None
         if body is not None:
             if isinstance(body, (dict, list)):

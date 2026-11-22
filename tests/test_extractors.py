@@ -1,8 +1,10 @@
-"""Tests for extractor AST/runtime sandbox hardening, process-tree timeouts, cancel, output caps and HTTP helpers."""
+"""Tests for extractor AST/runtime sandbox hardening, SSRF guards, process-tree timeouts, cancel and HTTP helpers."""
+import contextlib
 import ctypes
 import http.server
 import json
 import os
+import socket
 import subprocess
 import sys
 import threading
@@ -38,7 +40,14 @@ class _StubHandler(http.server.BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
 
+    def _record(self):
+        hits = getattr(self.server, "hits", None)
+        if hits is not None:
+            hits.append((self.command, self.path))
+
     def do_GET(self):
+        self._record()
+        port = self.server.server_address[1]
         if self.path == "/ok":
             body = b"hello world"
             self.send_response(200)
@@ -75,13 +84,51 @@ class _StubHandler(http.server.BaseHTTPRequestHandler):
                 self.wfile.write(b"late")
             except OSError:
                 pass
+        elif self.path == "/secret":
+            body = b"SECRET"
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        elif self.path == "/redir-loopback":
+            self.send_response(302)
+            self.send_header("Location", f"http://127.0.0.1:{port}/secret")
+            self.end_headers()
+        elif self.path == "/redir-localhost":
+            self.send_response(302)
+            self.send_header("Location", f"http://localhost:{port}/secret")
+            self.end_headers()
+        elif self.path == "/redir-private-dns":
+            self.send_response(302)
+            self.send_header("Location", f"http://meta.internal:{port}/secret")
+            self.end_headers()
+        elif self.path == "/redir-308-loopback":
+            self.send_response(308)
+            self.send_header("Location", f"http://127.0.0.1:{port}/secret")
+            self.end_headers()
+        elif self.path == "/redir-public":
+            self.send_response(302)
+            self.send_header("Location", f"http://public.example:{port}/ok")
+            self.end_headers()
+        elif self.path == "/redir-relative":
+            self.send_response(302)
+            self.send_header("Location", "/ok")
+            self.end_headers()
         else:
             self.send_response(404)
             self.end_headers()
 
     def do_POST(self):
+        self._record()
+        port = self.server.server_address[1]
         n = int(self.headers.get("Content-Length") or 0)
-        got = json.loads(self.rfile.read(n).decode("utf-8"))
+        raw = self.rfile.read(n) if n > 0 else b""
+        if self.path == "/redir-308-loopback":
+            self.send_response(308)
+            self.send_header("Location", f"http://127.0.0.1:{port}/secret")
+            self.end_headers()
+            return
+        got = json.loads(raw.decode("utf-8")) if raw else {}
         body = json.dumps({"echo": got}).encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
@@ -90,7 +137,82 @@ class _StubHandler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(body)
 
 
+@contextlib.contextmanager
+def _mock_public_dns(local_port: int):
+    """Map public.example/example.com -> 93.184.216.34 (routed to local_port), meta.internal -> 169.254.169.254."""
+    orig_getaddrinfo = socket.getaddrinfo
+    orig_create_connection = socket.create_connection
+
+    def fake_getaddrinfo(host, port, *args, **kwargs):
+        h = str(host or "").rstrip(".").lower()
+        p = int(port) if port else 80
+        if h in ("public.example", "example.com"):
+            return [(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", ("93.184.216.34", p))]
+        if h == "meta.internal":
+            return [(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", ("169.254.169.254", p))]
+        if h == "dual.example":
+            return [
+                (socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", ("93.184.216.34", p)),
+                (socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", ("127.0.0.1", p)),
+            ]
+        return orig_getaddrinfo(host, port, *args, **kwargs)
+
+    def fake_create_connection(address, timeout=socket._GLOBAL_DEFAULT_TIMEOUT, source_address=None):
+        host, port = address
+        h = str(host or "").rstrip(".").lower()
+        if h in ("public.example", "example.com", "93.184.216.34"):
+            return orig_create_connection(("127.0.0.1", local_port), timeout=timeout, source_address=source_address)
+        return orig_create_connection(address, timeout=timeout, source_address=source_address)
+
+    with mock.patch.object(socket, "getaddrinfo", side_effect=fake_getaddrinfo), \
+         mock.patch.object(socket, "create_connection", side_effect=fake_create_connection):
+        yield
+
+
 class TestExtractors(LookoutTestCase):
+    def test_sandbox_single_source_of_truth_runtime_and_parse_time(self):
+        self.assertIs(extractors.HELPERS, lookout_extract.SANDBOX_HELPERS)
+        self.assertIs(extractors.MODULES, lookout_extract.SANDBOX_MODULES)
+        self.assertIs(extractors.BANNED_CALLS, lookout_extract.SANDBOX_BANNED_CALLS)
+        self.assertIs(extractors.BANNED_ATTRS, lookout_extract.SANDBOX_BANNED_ATTRS)
+        self.assertIn("_HELPERS = _le.SANDBOX_HELPERS", extractors.RUNNER)
+        self.assertIn("_MODULES = _le.SANDBOX_MODULES", extractors.RUNNER)
+        self.assertIn("_BANNED_CALLS = _le.SANDBOX_BANNED_CALLS", extractors.RUNNER)
+        self.assertIn("_BANNED_ATTRS = _le.SANDBOX_BANNED_ATTRS", extractors.RUNNER)
+        self.assertNotIn('"gi_frame"', extractors.RUNNER)
+        self.assertNotIn('"browser_eval"', extractors.RUNNER)
+        self.assertNotIn('"unicodedata"', extractors.RUNNER)
+
+        # Verify the runtime runner process sees the exact same sets as parse-time check().
+        work = self.tmp_root / "ssot"
+        work.mkdir()
+        (work / "lookout_extract.py").write_text(
+            Path(extractors.__file__).with_name("lookout_extract.py").read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
+        prelude = extractors.RUNNER.split("_src_path =", 1)[0]
+        probe = (
+            f"import sys\nsys.argv = ['runner.py', {str(work)!r}]\n"
+            + prelude
+            + "\nprint(json.dumps({"
+            + "'helpers': sorted(_HELPERS), 'modules': sorted(_MODULES), "
+            + "'banned_calls': sorted(_BANNED_CALLS), 'banned_attrs': sorted(_BANNED_ATTRS)}))\n"
+        )
+        r = subprocess.run([sys.executable, "-I", "-c", probe], capture_output=True, text=True, timeout=10)
+        self.assertEqual(r.returncode, 0, msg=r.stderr)
+        rt = json.loads(r.stdout.strip())
+        self.assertEqual(set(rt["helpers"]), set(extractors.HELPERS))
+        self.assertEqual(set(rt["modules"]), set(extractors.MODULES))
+        self.assertEqual(set(rt["banned_calls"]), set(extractors.BANNED_CALLS))
+        self.assertEqual(set(rt["banned_attrs"]), set(extractors.BANNED_ATTRS))
+
+        # Verify tasks.py's inline test_extractor.py convention works with single-source RUNNER.
+        (work / "test_extractor.py").write_text(extractors.RUNNER.replace("sys.argv[1]", "'.'"), encoding="utf-8")
+        (work / "extractor.py").write_text("from lookout_extract import absolute\ndef fetch():\n    return [{'title': 'T', 'url': absolute('https://a.test/', '1')}]\n", encoding="utf-8")
+        r2 = subprocess.run([sys.executable, "-I", "test_extractor.py"], cwd=work, capture_output=True, text=True, timeout=10)
+        self.assertEqual(r2.returncode, 0, msg=r2.stderr)
+        self.assertIn("@@LOOKOUT@@", r2.stdout)
+
     def test_valid_extractor_runs(self):
         code = (
             "import json, re\n"
@@ -128,6 +250,7 @@ class TestExtractors(LookoutTestCase):
             "from . import helper\ndef fetch(): return []\n",
             "from json import *\ndef fetch(): return []\n",
             "from lookout_extract import _ab\ndef fetch(): return []\n",
+            "from lookout_extract import SANDBOX_MODULES\ndef fetch(): return []\n",
             "import typing\ndef fetch(): return typing.sys.modules\n",
             "from typing import sys\ndef fetch(): return []\n",
             "from typing import operator\ndef fetch(): return []\n",
@@ -184,6 +307,12 @@ class TestExtractors(LookoutTestCase):
                            capture_output=True, text=True, timeout=10)
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("not allowed", r.stderr)
+
+        (work / "extractor.py").write_text("from lookout_extract import SANDBOX_MODULES\ndef fetch(): return []\n", encoding="utf-8")
+        r2 = subprocess.run([sys.executable, "-I", str(work / "runner.py"), str(work)],
+                            capture_output=True, text=True, timeout=10)
+        self.assertNotEqual(r2.returncode, 0)
+        self.assertIn("unsupported import", r2.stderr.lower())
 
     def test_timeout_cancel_and_process_tree_kill(self):
         with self.assertRaises(RuntimeError) as cm:
@@ -259,6 +388,7 @@ class TestLookoutExtractHelpers(LookoutTestCase):
     def setUp(self) -> None:
         super().setUp()
         self.srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _StubHandler)
+        self.srv.hits = []
         self.port = self.srv.server_address[1]
         threading.Thread(target=self.srv.serve_forever, daemon=True).start()
 
@@ -267,36 +397,116 @@ class TestLookoutExtractHelpers(LookoutTestCase):
         self.srv.server_close()
         super().tearDown()
 
-    def test_http_helpers_success_errors_timeouts_and_caps(self):
-        base = f"http://127.0.0.1:{self.port}"
-        self.assertEqual(lookout_extract.get(f"{base}/ok"), "hello world")
-        self.assertEqual(lookout_extract.get_json(f"{base}/json"), {"items": [1, 2]})
-        self.assertEqual(lookout_extract.post_json(f"{base}/post", {"a": 1}), {"echo": {"a": 1}})
-        self.assertEqual(lookout_extract.absolute("https://a.test/jobs/", "1"), "https://a.test/jobs/1")
+    def test_ssrf_blocks_local_private_link_local_cgnat_multicast_ipv6_and_dns(self):
+        blocked_urls = [
+            f"http://127.0.0.1:{self.port}/ok",
+            f"http://localhost:{self.port}/ok",
+            f"http://sub.localhost:{self.port}/ok",
+            f"http://LOCALHOST.:{self.port}/ok",
+            f"http://service.local:{self.port}/ok",
+            f"http://[::1]:{self.port}/ok",
+            f"http://[::ffff:127.0.0.1]:{self.port}/ok",
+            f"http://[::127.0.0.1]:{self.port}/ok",
+            f"http://0.0.0.0:{self.port}/ok",
+            f"http://[::]:{self.port}/ok",
+            "http://10.0.0.1/secret",
+            "http://172.16.0.1/secret",
+            "http://192.168.1.1/secret",
+            "http://169.254.169.254/latest/meta-data/",
+            "http://[fe80::1]/secret",
+            "http://100.64.0.1/secret",
+            "http://100.127.255.254/secret",
+            "http://224.0.0.1/",
+            "http://[ff02::1]/",
+            "http://[fc00::1]/",
+            "http://[fd12:3456::1]/",
+            "http://[fec0::1]/",
+            "http://[::ffff:10.0.0.1]/",
+            "http://[::ffff:169.254.169.254]/",
+            "http://[2002:7f00:0001::]/",
+        ]
+        for url in blocked_urls:
+            with self.subTest(url=url):
+                with self.assertRaises(ValueError) as cm_get:
+                    lookout_extract.get(url)
+                self.assertIn("blocked", str(cm_get.exception).lower())
+                with self.assertRaises(ValueError):
+                    lookout_extract.get_json(url)
+                with self.assertRaises(ValueError):
+                    lookout_extract.post_json(url, {"a": 1})
+                with mock.patch.object(lookout_extract, "_ab") as ab_mock:
+                    with self.assertRaises(ValueError):
+                        lookout_extract.browser_eval(url, "[]")
+                    ab_mock.assert_not_called()
 
-        for bad_url in ("file:///etc/passwd", "ftp://example.com/a", "javascript:alert(1)"):
+        # Multi-record DNS response containing both public and loopback must be blocked.
+        with _mock_public_dns(self.port):
             with self.assertRaises(ValueError):
-                lookout_extract.get(bad_url)
+                lookout_extract.get(f"http://dual.example:{self.port}/ok")
+            with self.assertRaises(ValueError):
+                lookout_extract.get(f"http://meta.internal:{self.port}/ok")
+            with self.assertRaises(ValueError):
+                lookout_extract.browser_eval(f"http://meta.internal:{self.port}/ok", "[]")
 
-        with self.assertRaises(RuntimeError) as cm_404:
-            lookout_extract.get(f"{base}/missing")
-        self.assertIn("404", str(cm_404.exception))
+        # Verify local server never received a single request from blocked calls.
+        self.assertEqual(self.srv.hits, [])
 
-        with self.assertRaises(RuntimeError) as cm_json:
-            lookout_extract.get_json(f"{base}/badjson")
-        self.assertIn("invalid JSON", str(cm_json.exception))
+        # Even inside isolated extractor subprocess, localhost access is rejected.
+        with self.assertRaises(RuntimeError) as cm_sub:
+            extractors.run(
+                f"from lookout_extract import get\ndef fetch():\n    return [{{'title': get('http://127.0.0.1:{self.port}/secret'), 'url': 'https://a.test'}}]\n",
+                timeout=15,
+            )
+        self.assertIn("blocked", str(cm_sub.exception).lower())
+        self.assertEqual(self.srv.hits, [])
 
-        with self.assertRaises(RuntimeError) as cm_to:
-            lookout_extract.get(f"{base}/slow", timeout=0.1)
-        self.assertIn("timed out", str(cm_to.exception))
+    def test_redirect_ssrf_blocks_loopback_localhost_and_private_dns(self):
+        with _mock_public_dns(self.port):
+            for path in ("/redir-loopback", "/redir-localhost", "/redir-private-dns", "/redir-308-loopback"):
+                with self.subTest(path=path):
+                    with self.assertRaises(ValueError) as cm:
+                        lookout_extract.get(f"http://public.example:{self.port}{path}")
+                    self.assertIn("blocked", str(cm.exception).lower())
+            with self.assertRaises(ValueError):
+                lookout_extract.post_json(f"http://public.example:{self.port}/redir-308-loopback", {"a": 1})
 
-        with self.assertRaises(RuntimeError) as cm_cap1:
-            lookout_extract.get(f"{base}/big", max_bytes=128)
-        self.assertIn("exceeded", str(cm_cap1.exception))
+            # Safe redirects between public targets succeed.
+            self.assertEqual(lookout_extract.get(f"http://public.example:{self.port}/redir-public"), "hello world")
+            self.assertEqual(lookout_extract.get(f"http://public.example:{self.port}/redir-relative"), "hello world")
 
-        with self.assertRaises(RuntimeError) as cm_cap2:
-            lookout_extract.get(f"{base}/big-noclen", max_bytes=128)
-        self.assertIn("exceeded", str(cm_cap2.exception))
+        self.assertFalse(any(p == "/secret" for _, p in self.srv.hits))
+
+    def test_http_helpers_public_path_success_errors_timeouts_and_caps(self):
+        base = f"http://public.example:{self.port}"
+        with _mock_public_dns(self.port):
+            self.assertEqual(lookout_extract.get(f"{base}/ok"), "hello world")
+            self.assertEqual(lookout_extract.get_json(f"{base}/json"), {"items": [1, 2]})
+            self.assertEqual(lookout_extract.post_json(f"{base}/post", {"a": 1}), {"echo": {"a": 1}})
+            self.assertEqual(lookout_extract.absolute("https://a.test/jobs/", "1"), "https://a.test/jobs/1")
+
+            for bad_url in ("file:///etc/passwd", "ftp://example.com/a", "javascript:alert(1)"):
+                with self.assertRaises(ValueError):
+                    lookout_extract.get(bad_url)
+
+            with self.assertRaises(RuntimeError) as cm_404:
+                lookout_extract.get(f"{base}/missing")
+            self.assertIn("404", str(cm_404.exception))
+
+            with self.assertRaises(RuntimeError) as cm_json:
+                lookout_extract.get_json(f"{base}/badjson")
+            self.assertIn("invalid JSON", str(cm_json.exception))
+
+            with self.assertRaises(RuntimeError) as cm_to:
+                lookout_extract.get(f"{base}/slow", timeout=0.1)
+            self.assertIn("timed out", str(cm_to.exception))
+
+            with self.assertRaises(RuntimeError) as cm_cap1:
+                lookout_extract.get(f"{base}/big", max_bytes=128)
+            self.assertIn("exceeded", str(cm_cap1.exception))
+
+            with self.assertRaises(RuntimeError) as cm_cap2:
+                lookout_extract.get(f"{base}/big-noclen", max_bytes=128)
+            self.assertIn("exceeded", str(cm_cap2.exception))
 
     def test_browser_eval_always_closes_session_even_on_errors(self):
         calls = []
@@ -307,7 +517,8 @@ class TestLookoutExtractHelpers(LookoutTestCase):
                 return json.dumps({"success": True, "data": {"result": json.dumps([{"title": "X"}])}})
             return ""
 
-        with mock.patch.object(lookout_extract, "_ab", side_effect=fake_ab), \
+        with _mock_public_dns(self.port), \
+             mock.patch.object(lookout_extract, "_ab", side_effect=fake_ab), \
              mock.patch.object(lookout_extract.time, "sleep"):
             res = lookout_extract.browser_eval("https://example.com", "[]", wait_ms=10, scrolls=1)
         self.assertEqual(res, [{"title": "X"}])
@@ -323,7 +534,8 @@ class TestLookoutExtractHelpers(LookoutTestCase):
                 raise RuntimeError("close failed")
             return ""
 
-        with mock.patch.object(lookout_extract, "_ab", side_effect=failing_ab), \
+        with _mock_public_dns(self.port), \
+             mock.patch.object(lookout_extract, "_ab", side_effect=failing_ab), \
              mock.patch.object(lookout_extract.time, "sleep"):
             with self.assertRaises(RuntimeError) as cm:
                 lookout_extract.browser_eval("https://example.com", "[]", wait_ms=0, scrolls=0)

@@ -44,6 +44,30 @@ class AgentTests(TempLookoutTestCase):
         with self.assertRaises(ValueError):
             agents.build_command("unknown-agent", "", "/tmp/w", 60)
 
+    def test_validate_custom_command_rejects_shell_metacharacters(self):
+        self.assertEqual(agents.validate_custom_command(""), "")
+        self.assertEqual(
+            agents.validate_custom_command("mycli run -m {model} {prompt}"),
+            "mycli run -m {model} {prompt}",
+        )
+        for bad in (
+            "mycli --yes && rm -rf /",
+            "mycli --yes || echo pwn",
+            "mycli --yes | cat",
+            "mycli --yes; id",
+            "mycli `id`",
+            "mycli $(whoami)",
+            "mycli --yes\necho pwn",
+            'mycli "unterminated',
+        ):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    agents.validate_custom_command(bad)
+                db.set_settings({"custom_command": bad})
+                self.assertIsNone(agents.which("custom"))
+                with self.assertRaises(RuntimeError):
+                    agents.build_command("custom", "", "/tmp/w", 60)
+
     def test_custom_command_strips_outer_quotes_on_windows(self):
         db.set_settings({"custom_command": 'mycli --dir "{dir}" "{prompt}"'})
         with patch.object(agents.sys, "platform", "win32"), \

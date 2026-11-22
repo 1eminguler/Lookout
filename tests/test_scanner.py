@@ -1,12 +1,12 @@
 """Unit tests for lookout.scanner."""
-import sys
+import json
 import threading
 import time
 import unittest
 from datetime import date, timedelta
 from unittest.mock import patch
 
-from lookout import agents, db, scanner, tasks
+from lookout import agents, db, notify, scanner, tasks
 from tests.helpers import TempLookoutTestCase
 
 
@@ -28,8 +28,8 @@ class ScannerTests(TempLookoutTestCase):
         self.assertIsNone(scanner.parse_date(""))
         self.assertIsNone(scanner.parse_date(None))
 
-    def test_normalise_strips_html_placeholders_and_tracking(self):
-        src = {"name": "Board"}
+    def test_normalise_strips_html_placeholders_tracking_and_keys_by_url(self):
+        src = {"id": 7, "name": "Board", "url": "https://ex.com/list"}
         self.assertIsNone(scanner.normalise({"url": "https://ex.com/1"}, src))
         self.assertIsNone(scanner.normalise({"title": "Job", "url": "javascript:alert(1)"}, src))
 
@@ -49,6 +49,10 @@ class ScannerTests(TempLookoutTestCase):
         self.assertIsNone(it["location"])
         self.assertIsNone(it["summary"])
         self.assertEqual(it["deadline"], "2027-04-15")
+
+        # Title edit on the same source+URL preserves item id rather than creating a duplicate
+        it_edited = scanner.normalise({"title": "ML Intern (Updated)", "url": "https://ex.com/jobs?id=7"}, src)
+        self.assertEqual(it["id"], it_edited["id"])
 
     def test_passes_exclude_and_deadlines(self):
         tomorrow = (date.today() + timedelta(days=1)).isoformat()
@@ -82,12 +86,53 @@ class ScannerTests(TempLookoutTestCase):
         names = {s["name"] for s in db.sources()}
         self.assertEqual(names, {"Good", "Legacy"})
 
-    def test_self_healing_triggers_and_weekly_recheck(self):
-        db.set_settings({"agent": "claude", "verify_weekly": "1"})
-        ok_code = "def fetch():\n    return [{'title': 'A', 'url': 'https://ex.com/a'}]\n"
-        learned_ret = {"items": [{"title": "A", "url": "https://ex.com/a"}], "code": ok_code, "log": ""}
+    def test_transient_vs_structural_failures_and_backoff(self):
+        db.set_settings({"agent": "claude", "verify_weekly": "0"})
+        good_code = "def fetch():\n    return [{'title': 'A', 'url': 'https://ex.com/a'}]\n"
+        sid = db.add_source("Site", "https://ex.com")
+        db.update_source(sid, extractor=good_code, last_good_extractor=good_code, extractor_ok=1, extractor_updated=db.now())
 
-        # 1. Runtime error from broken extractor triggers relearn
+        # Transient failure (e.g. 503 or timeout) keeps reader intact, skips learn_source, sets retry_after backoff
+        for exc in (TimeoutError("timed out"), RuntimeError("HTTP 503 for https://ex.com: Service Unavailable")):
+            with self.subTest(exc=str(exc)), \
+                 patch.object(scanner, "_run_fast_reader", side_effect=exc), \
+                 patch.object(tasks, "learn_source") as m_learn:
+                with self.assertRaises(scanner.TransientError):
+                    scanner.read_agent_source(db.source_by_id(sid), [])
+                m_learn.assert_not_called()
+            s = db.source_by_id(sid)
+            self.assertEqual(s["extractor_ok"], 1)
+            self.assertEqual(s["last_good_extractor"], good_code)
+            self.assertEqual(s["last_error_kind"], "transient")
+            self.assertGreater(s["fail_count"], 0)
+            self.assertTrue(s["retry_after"] > db.now())
+
+        # Subsequent call within backoff window fails immediately without calling reader or agent
+        with patch.object(scanner, "_run_fast_reader") as m_fast, \
+             patch.object(tasks, "learn_source") as m_learn:
+            with self.assertRaises(scanner.TransientError):
+                scanner.read_agent_source(db.source_by_id(sid), [])
+            m_fast.assert_not_called()
+            m_learn.assert_not_called()
+
+        # Structural error (e.g. 404 or JSON parse error) triggers relearn
+        db.update_source(sid, retry_after=None, last_error_kind=None, fail_count=0)
+        repaired_code = "def fetch():\n    return [{'title': 'B', 'url': 'https://ex.com/b'}]\n"
+        learned_ret = {"items": [{"title": "B", "url": "https://ex.com/b"}], "code": repaired_code, "log": ""}
+        with patch.object(scanner, "_run_fast_reader", side_effect=RuntimeError("HTTP 404 for https://ex.com")), \
+             patch.object(tasks, "learn_source", return_value=learned_ret) as m_learn:
+            got = scanner.read_agent_source(db.source_by_id(sid), [])
+        self.assertEqual(m_learn.call_count, 1)
+        self.assertEqual(got, [{"title": "B", "url": "https://ex.com/b"}])
+        self.assertEqual(db.source_by_id(sid)["last_good_extractor"], repaired_code)
+
+    def test_self_healing_triggers_last_good_preservation_and_cheap_weekly_check(self):
+        db.set_settings({"agent": "claude", "verify_weekly": "1"})
+        ok_code = "def fetch():\n    return [{'title': 'A', 'url': 'https://ex.com/jobs/a', 'org': 'Org', 'deadline': '2027-06-01'}]\n"
+        learned_ret = {"items": [{"title": "A", "url": "https://ex.com/jobs/a", "org": "Org", "deadline": "2027-06-01"}],
+                       "code": ok_code, "log": ""}
+
+        # 1. Runtime structural error triggers relearn
         sid = db.add_source("Site", "https://ex.com")
         db.update_source(sid, extractor="def fetch(): raise ZeroDivisionError()", extractor_ok=1,
                          extractor_updated=db.now())
@@ -95,9 +140,25 @@ class ScannerTests(TempLookoutTestCase):
             res = scanner.read_agent_source(db.source_by_id(sid), [])
         self.assertEqual(m_learn.call_count, 1)
         self.assertEqual(len(res), 1)
-        self.assertEqual(db.source_by_id(sid)["extractor_ok"], 1)
+        self.assertEqual(db.source_by_id(sid)["last_good_extractor"], ok_code)
 
-        # 2. Empty result when site previously had open items triggers relearn
+        # 2. Failed heal (agent error or disagreeing reader) NEVER overwrites last_good_extractor
+        db.update_source(sid, extractor="def fetch(): raise KeyError('k')", extractor_ok=1, extractor_updated=db.now())
+        bad_heal = {
+            "items": [{"title": "X", "url": "https://ex.com/x"}, {"title": "Y", "url": "https://ex.com/y"}, {"title": "Z", "url": "https://ex.com/z"}],
+            "code": "def fetch():\n    return [{'title': 'Wrong', 'url': 'https://ex.com/wrong'}]\n",
+            "log": "",
+        }
+        with patch.object(tasks, "learn_source", return_value=bad_heal):
+            got = scanner.read_agent_source(db.source_by_id(sid), [])
+        self.assertEqual(len(got), 3)
+        self.assertEqual(db.source_by_id(sid)["last_good_extractor"], ok_code)
+        self.assertEqual(db.source_by_id(sid)["extractor"], ok_code)
+
+        # Restore working extractor
+        db.update_source(sid, extractor=ok_code, last_good_extractor=ok_code, extractor_ok=1, extractor_updated=db.now())
+
+        # 3. Empty result when site previously had open items triggers relearn
         scan1 = db.start_scan("manual", "claude", "", [])
         for k in range(5):
             db.save_item(scan1, db.source_by_id(sid), {"id": f"old{k}", "title": f"Old {k}", "url": f"https://ex.com/{k}"})
@@ -106,33 +167,196 @@ class ScannerTests(TempLookoutTestCase):
             scanner.read_agent_source(db.source_by_id(sid), [])
         self.assertEqual(m_learn.call_count, 1)
 
-        # 3. Sharp drop (<30% of >=5 open items) triggers relearn
+        # 4. Sharp drop (<30% of >=5 open items) triggers relearn
         db.update_source(sid, extractor="def fetch(): return [{'title': 'Only1', 'url': 'https://ex.com/1'}]",
                          extractor_ok=1, extractor_updated=db.now())
         with patch.object(tasks, "learn_source", return_value=learned_ret) as m_learn:
             scanner.read_agent_source(db.source_by_id(sid), [])
         self.assertEqual(m_learn.call_count, 1)
 
-        # 4. Rows without title/url (<80% usable) triggers relearn
+        # 5. Rows without title/url (<80% usable) triggers relearn
         bad_rows = "def fetch(): return [{'title': '', 'url': 'bad'}, {'title': 'Ok', 'url': 'https://ex.com/ok'}]"
         db.update_source(sid, extractor=bad_rows, extractor_ok=1, extractor_updated=db.now())
         with patch.object(tasks, "learn_source", return_value=learned_ret) as m_learn:
             scanner.read_agent_source(db.source_by_id(sid), [])
         self.assertEqual(m_learn.call_count, 1)
 
-        # 5. Weekly re-check: >7 days old relearns when verify_weekly=1, skips when verify_weekly=0
+        # 6. Cheap weekly check: stale reader runs first; healthy output does NOT call agent
         db._exec("UPDATE items SET status='gone' WHERE source_id=?", (sid,))
+        rich_items = [
+            {"title": f"Job {k}", "url": f"https://ex.com/jobs/{k}", "org": f"Org {k}", "deadline": "2027-06-01"}
+            for k in range(4)
+        ]
+        rich_code = f"def fetch():\n    return {rich_items!r}\n"
+        rich_stats = json.dumps(scanner.compute_item_stats(rich_items))
         old_ts = (date.today() - timedelta(days=10)).isoformat() + " 00:00:00"
-        db.update_source(sid, extractor=ok_code, extractor_ok=1, extractor_updated=old_ts)
-        with patch.object(tasks, "learn_source", return_value=learned_ret) as m_learn:
-            scanner.read_agent_source(db.source_by_id(sid), [])
-        self.assertEqual(m_learn.call_count, 1)
+        db.update_source(sid, extractor=rich_code, last_good_extractor=rich_code, extractor_ok=1,
+                         extractor_updated=old_ts, last_good_stats=rich_stats)
+        with patch.object(tasks, "learn_source") as m_learn:
+            res_healthy = scanner.read_agent_source(db.source_by_id(sid), [])
+        self.assertEqual(m_learn.call_count, 0)
+        self.assertEqual(len(res_healthy), 4)
+        self.assertGreater(db.source_by_id(sid)["extractor_updated"], old_ts)
 
+        # 7. Weekly check DOES relearn when output is anomalous vs history (URL pattern / fill rate collapse)
+        drifted_items = [{"title": f"Post {k}", "url": f"https://ex.com/blog/{k}"} for k in range(4)]
+        drifted_code = f"def fetch():\n    return {drifted_items!r}\n"
+        db.update_source(sid, extractor=drifted_code, last_good_extractor=rich_code, extractor_ok=1,
+                         extractor_updated=old_ts, last_good_stats=rich_stats)
+        with patch.object(tasks, "learn_source", return_value={"items": rich_items, "code": rich_code, "log": ""}) as m_learn:
+            res_healed = scanner.read_agent_source(db.source_by_id(sid), [])
+        self.assertEqual(m_learn.call_count, 1)
+        self.assertEqual(len(res_healed), 4)
+
+        # 8. If weekly anomalous relearn fails, weekly fallback returns reader items and keeps extractor_ok=1
+        db.update_source(sid, extractor=drifted_code, last_good_extractor=rich_code, extractor_ok=1,
+                         extractor_updated=old_ts, last_good_stats=rich_stats)
+        with patch.object(tasks, "learn_source", side_effect=RuntimeError("quota used")):
+            res_fb = scanner.read_agent_source(db.source_by_id(sid), [])
+        self.assertEqual(len(res_fb), 4)
+        self.assertEqual(db.source_by_id(sid)["extractor_ok"], 1)
+
+        # 9. verify_weekly=0 skips weekly check entirely even when stale & drifted
         db.set_settings({"verify_weekly": "0"})
-        db.update_source(sid, extractor=ok_code, extractor_ok=1, extractor_updated=old_ts)
-        with patch.object(tasks, "learn_source", return_value=learned_ret) as m_learn:
+        db.update_source(sid, extractor=drifted_code, extractor_ok=1, extractor_updated=old_ts, last_good_stats=rich_stats)
+        with patch.object(tasks, "learn_source") as m_learn:
             scanner.read_agent_source(db.source_by_id(sid), [])
         self.assertEqual(m_learn.call_count, 0)
+
+    def test_verify_reader_output_checks_fill_rates_duplicates_and_counts(self):
+        agent_items = [
+            {"title": f"Role {i}", "url": f"https://ex.com/{i}", "org": f"Org {i}", "deadline": "2027-07-01"}
+            for i in range(4)
+        ]
+        self.assertTrue(scanner.verify_reader_output(agent_items, agent_items)[0])
+        # Missing deadline fill rate rejected
+        no_dl = [{"title": i["title"], "url": i["url"], "org": i["org"]} for i in agent_items]
+        ok_dl, reason_dl = scanner.verify_reader_output(agent_items, no_dl)
+        self.assertFalse(ok_dl)
+        self.assertIn("deadline", reason_dl)
+        # Duplicate items (>50% identical title+url) rejected even when agrees() passes
+        small_agent = agent_items[:2]
+        dups = [agent_items[0], agent_items[1], agent_items[0], agent_items[0], agent_items[0], agent_items[0]]
+        ok_dup, reason_dup = scanner.verify_reader_output(small_agent, dups)
+        self.assertFalse(ok_dup)
+        self.assertIn("duplicate", reason_dup)
+
+    def test_shared_readers_concurrent_learning_progressive_saves_and_lock(self):
+        db.set_settings({"agent": "claude", "parallel": "2"})
+        w1 = db.add_watch("W1", "req1")
+        w2 = db.add_watch("W2", "req2")
+        # Same canonical URL in two different watches should learn only once
+        db.add_source("Board 0", "https://other.example.com/jobs", watch_id=w1)
+        db.add_source("Board A", "https://shared.example.com/jobs/", watch_id=w1)
+        db.add_source("Board B", "https://shared.example.com/jobs?utm_source=test", watch_id=w2)
+
+        learn_urls = []
+        active_lock = threading.Lock()
+        conc = {"cur": 0, "peak": 0}
+        shared_code = (
+            "def fetch():\n"
+            "    return [{'title': 'Shared Job', 'url': 'https://shared.example.com/jobs/1'}]\n"
+        )
+        both_started = threading.Barrier(2, timeout=2.0)
+        other_gate = threading.Event()
+
+        def fake_learn(src, fs, cancel_event=None):
+            with active_lock:
+                learn_urls.append(src["url"])
+                conc["cur"] += 1
+                conc["peak"] = max(conc["peak"], conc["cur"])
+            try:
+                both_started.wait()
+                if "other.example.com" in src["url"]:
+                    other_gate.wait(timeout=3.0)
+                    return {
+                        "items": [{"title": "Other Job", "url": "https://other.example.com/jobs/1"}],
+                        "code": "def fetch(): return [{'title': 'Other Job', 'url': 'https://other.example.com/jobs/1'}]\n",
+                        "log": "",
+                    }
+                return {"items": [{"title": "Shared Job", "url": "https://shared.example.com/jobs/1"}], "code": shared_code, "log": ""}
+            finally:
+                with active_lock:
+                    conc["cur"] -= 1
+
+        observed_progressive = {"found_mid_scan": 0, "learning_total": 0}
+
+        def watcher():
+            for _ in range(80):
+                prog = scanner.get_progress()
+                if prog["learning_total"] > 0:
+                    observed_progressive["learning_total"] = max(observed_progressive["learning_total"], prog["learning_total"])
+                if len(db.items()) >= 1 and prog["scan_id"]:
+                    det = db.scan_detail(prog["scan_id"])
+                    if det and det["found"] >= 1:
+                        observed_progressive["found_mid_scan"] = det["found"]
+                        other_gate.set()
+                        return
+                time.sleep(0.05)
+            other_gate.set()
+
+        t_watch = threading.Thread(target=watcher, daemon=True)
+        with patch.object(tasks, "learn_source", side_effect=fake_learn), \
+             patch.object(tasks, "classify", return_value={}):
+            t_watch.start()
+            scan_id = scanner.run_scan("manual")
+            t_watch.join(timeout=5)
+
+        self.assertIsNotNone(scan_id)
+        # Only 2 learns happened (shared URL learned once, other URL learned once) concurrently
+        self.assertEqual(len(learn_urls), 2)
+        self.assertEqual(conc["peak"], 2)
+        self.assertGreaterEqual(observed_progressive["found_mid_scan"], 1)
+        self.assertGreaterEqual(observed_progressive["learning_total"], 2)
+
+        # Cross-process DB scan lock prevents concurrent run_scan / start_scan_async
+        self.assertTrue(db.acquire_scan_lock("external-proc"))
+        try:
+            self.assertIsNone(scanner.run_scan("manual"))
+            self.assertFalse(scanner.start_scan_async("manual"))
+        finally:
+            db.release_scan_lock("external-proc")
+
+    def test_test_source_preview_and_webhook_wiring(self):
+        db.set_settings({"agent": "claude", "notify": "1", "webhook_url": "https://hooks.example.com/lookout", "webhook_allow_local": "1"})
+        sid = db.add_source("PreviewBoard", "https://preview.example.com/jobs")
+        db.update_source(sid, extractor="def fetch(): return [{'title': 'Good Intern', 'url': 'https://preview.example.com/1'}, {'title': 'Senior Lead', 'url': 'https://preview.example.com/2'}]",
+                         extractor_ok=1, extractor_updated=db.now())
+        db.add_filter("exclude", "senior")
+
+        res = scanner.test_source(db.source_by_id(sid))
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["method"], "reader")
+        self.assertEqual(res["count"], 2)
+        self.assertEqual(res["matching"], 1)
+        # test_source does not persist items to DB
+        self.assertEqual(db.items(), [])
+
+        # Unlearned source falls back to tasks.quick_read_source
+        sid2 = db.add_source("FreshBoard", "https://fresh.example.com/jobs")
+        with patch.object(tasks, "quick_read_source", return_value={"items": [{"title": "Fresh Role", "url": "https://fresh.example.com/1"}], "log": ""}):
+            res2 = scanner.test_source(db.source_by_id(sid2))
+        self.assertTrue(res2["ok"])
+        self.assertEqual(res2["method"], "agent_preview")
+        self.assertEqual(res2["count"], 1)
+
+        # Scan finished triggers notify.webhook when new/updated items exist
+        db.update_source(sid2, active=0)
+        hook_calls = []
+
+        def fake_webhook(url, payload, allow_local=False):
+            hook_calls.append((url, payload, allow_local))
+            return True, "ok"
+
+        with patch.object(notify, "webhook", new=fake_webhook):
+            scan_id = scanner.run_scan("manual", only=[sid])
+        self.assertIsNotNone(scan_id)
+        self.assertEqual(len(hook_calls), 1)
+        hook_url, payload, allow_local = hook_calls[0]
+        self.assertEqual(hook_url, "https://hooks.example.com/lookout")
+        self.assertEqual(payload["event"], "scan_finished")
+        self.assertEqual(payload["new_count"], 1)
+        self.assertTrue(allow_local)
 
     def test_mark_gone(self):
         flag = self.tmp / "second_scan.flag"

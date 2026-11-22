@@ -261,6 +261,154 @@ class TestDatabase(LookoutTestCase):
         db.delete_discovery(did)
         self.assertIsNone(db.discovery_detail(did))
 
+    def test_wal_mode_user_version_and_v1_to_v2_migration(self):
+        with contextlib.closing(db.connect()) as c:
+            mode = c.execute("PRAGMA journal_mode").fetchone()[0]
+            ver = c.execute("PRAGMA user_version").fetchone()[0]
+        self.assertEqual(str(mode).lower(), "wal")
+        self.assertEqual(ver, db.SCHEMA_VERSION)
+
+        # Simulate a v1 database with an existing working extractor
+        db.DB_PATH.unlink()
+        with contextlib.closing(sqlite3.connect(str(db.DB_PATH))) as c:
+            c.executescript(db.SCHEMA)
+            db._add_columns(c, db.MIGRATIONS)
+            c.execute(
+                "INSERT INTO sources(name, url, method, extractor, extractor_ok, extractor_updated, created) "
+                "VALUES('V1', 'https://v1.example', 'agent', 'def fetch(): return []', 1, '2026-01-01 00:00:00', '2026-01-01 00:00:00')"
+            )
+            c.execute("PRAGMA user_version = 1")
+            c.commit()
+
+        db.init()
+        with contextlib.closing(db.connect()) as c:
+            self.assertEqual(c.execute("PRAGMA user_version").fetchone()[0], db.SCHEMA_VERSION)
+        src = db.sources()[0]
+        self.assertEqual(src["last_good_extractor"], "def fetch(): return []")
+        self.assertEqual(src["last_good_updated"], "2026-01-01 00:00:00")
+
+    def test_cross_process_scan_lock_and_safe_mark_interrupted(self):
+        # Live lock prevents second owner from acquiring, while heartbeat keeps it alive
+        self.assertTrue(db.acquire_scan_lock("tok-1"))
+        self.assertFalse(db.acquire_scan_lock("tok-2"))
+        s_live = db.start_scan("manual", "claude", "haiku", [])
+        s_stale = db.start_scan("manual", "claude", "haiku", [])
+        db._exec("UPDATE scans SET started='2020-01-01 00:00:00' WHERE id=?", (s_stale,))
+        self.assertTrue(db.update_scan_lock("tok-1", scan_id=s_live))
+
+        d_live = db.start_discovery("live req", "Live", "claude", "haiku")
+        d_stale = db.start_discovery("stale req", "Stale", "claude", "haiku")
+        self.assertTrue(db.acquire_scan_lock("disc-1", name="discover"))
+        self.assertTrue(db.update_scan_lock("disc-1", scan_id=d_live, name="discover"))
+
+        s_cnt, d_cnt = db.mark_interrupted()
+        self.assertEqual((s_cnt, d_cnt), (1, 1))
+        self.assertEqual(db.scan_detail(s_live)["status"], "running")
+        self.assertEqual(db.scan_detail(s_stale)["status"], "interrupted")
+        self.assertEqual(db.discovery_detail(d_live)["status"], "running")
+        self.assertEqual(db.discovery_detail(d_stale)["status"], "interrupted")
+
+        # Wrong token cannot release; right token releases
+        db.release_scan_lock("wrong-tok")
+        self.assertIsNotNone(db.active_scan_lock("scan"))
+        db.release_scan_lock("tok-1")
+        db.release_scan_lock("disc-1", name="discover")
+        self.assertIsNone(db.active_scan_lock("scan"))
+
+        # Stale lock (dead PID) can be taken over by a new owner
+        self.assertTrue(db.acquire_scan_lock("dead-tok", pid=999999))
+        self.assertTrue(db.acquire_scan_lock("tok-3"))
+        db.release_scan_lock("tok-3")
+
+    def test_shared_url_readers_and_cascade_deletes(self):
+        w1 = db.add_watch("W1", "req1")
+        w2 = db.add_watch("W2", "req2")
+        s1 = db.add_source("Board W1", "https://jobs.example.com/list/?utm_source=abc&b=2&a=1", watch_id=w1)
+        code = "def fetch(): return [{'title': 'X', 'url': 'https://jobs.example.com/1'}]"
+        db.save_shared_reader("https://jobs.example.com/list?a=1&b=2", code, ok=True, propagate=True)
+
+        # New source with equivalent canonical URL across another watch gets the shared reader immediately
+        s2 = db.add_source("Board W2", "https://jobs.example.com/list/?a=1&b=2&fbclid=xyz", watch_id=w2)
+        src2 = db.source_by_id(s2)
+        self.assertEqual(src2["extractor_ok"], 1)
+        self.assertEqual(src2["extractor"], code)
+        self.assertEqual(src2["last_good_extractor"], code)
+
+        # Cascade delete on watch and source cleans up items, history, scans, scan_items, scan_sources, discoveries
+        g_src = db.add_source("Global", "https://global.example.com")
+        sc1 = db.start_scan("manual", "claude", "", [], watch_id=w1)
+        sc_g = db.start_scan("manual", "claude", "", [])
+        db.save_item(sc1, db.source_by_id(s1), {"id": "w1-it", "title": "W1 Item", "url": "https://jobs.example.com/1"})
+        db.save_item(sc1, db.source_by_id(s1), {"id": "w1-it", "title": "W1 Item", "url": "https://jobs.example.com/1", "deadline": "2027-05-01"})
+        db.save_item(sc_g, db.source_by_id(g_src), {"id": "g-it", "title": "G Item", "url": "https://global.example.com/1"})
+        db.record_source_result(sc1, db.source_by_id(s1), True, 1, 1, "", 10)
+        db.start_discovery("w1 req", "W1", "claude", "", watch_id=w1)
+
+        self.assertTrue(db.delete_watch(w1))
+        self.assertIsNone(db.scan_detail(sc1))
+        self.assertEqual(db.item_history("w1-it"), [])
+        self.assertIsNone(db.item_by_id("w1-it"))
+        self.assertIsNotNone(db.item_by_id("g-it"))
+
+        # Cascade delete on a standalone source cleans up its items and history
+        sc_g2 = db.start_scan("manual", "claude", "", [])
+        db.save_item(sc_g2, db.source_by_id(g_src), {"id": "g-it", "title": "G Item v2", "url": "https://global.example.com/1"})
+        self.assertTrue(db.item_history("g-it"))
+        self.assertTrue(db.delete_source(g_src))
+        self.assertIsNone(db.item_by_id("g-it"))
+        self.assertEqual(db.item_history("g-it"), [])
+
+    def test_item_change_history_no_resurrection_and_paging(self):
+        sid = db.add_source("Board", "https://board.example.com/jobs")
+        src = db.source_by_id(sid)
+        sc1 = db.start_scan("manual", "claude", "", [])
+        is_new = db.save_item(sc1, src, {
+            "id": "it-1",
+            "title": "Intern",
+            "url": "https://board.example.com/jobs/101",
+            "deadline": "2027-03-01",
+        })
+        self.assertTrue(is_new)
+
+        # Deadline moved updates existing item (matched by source_id+url even if raw id changed)
+        sc2 = db.start_scan("manual", "claude", "", [])
+        is_new2 = db.save_item(sc2, src, {
+            "id": "it-1-different-hash",
+            "title": "Intern",
+            "url": "https://board.example.com/jobs/101",
+            "deadline": "2027-03-15",
+        })
+        self.assertFalse(is_new2)
+        it = db.item_by_id("it-1")
+        self.assertIn("2027-03-01", it["change_summary"])
+        self.assertIn("2027-03-15", it["change_summary"])
+        self.assertEqual(it["last_change_kind"], "deadline_moved")
+        hist = db.item_history("it-1")
+        self.assertEqual(hist[0]["kind"], "deadline_moved")
+
+        # Mark gone records closed; re-appearing later records reopened WITHOUT returning is_new=True
+        sc3 = db.start_scan("manual", "claude", "", [])
+        self.assertEqual(db.mark_gone(src, sc3), 1)
+        self.assertEqual(db.item_by_id("it-1")["status"], "gone")
+        sc4 = db.start_scan("manual", "claude", "", [])
+        is_new4 = db.save_item(sc4, src, {
+            "id": "it-1",
+            "title": "Intern",
+            "url": "https://board.example.com/jobs/101",
+            "deadline": "2027-03-15",
+        })
+        self.assertFalse(is_new4)
+        self.assertEqual(db.item_by_id("it-1")["status"], "open")
+        self.assertTrue(any(h["kind"] == "reopened" for h in db.item_history("it-1")))
+
+        # Pagination
+        for k in range(5):
+            db.save_item(sc4, src, {"id": f"p-{k}", "title": f"Item {k}", "url": f"https://board.example.com/jobs/p/{k}"})
+        self.assertEqual(db.items_count(), 6)
+        self.assertEqual(len(db.items(limit=2, offset=0)), 2)
+        self.assertEqual(len(db.items(limit=2, offset=4)), 2)
+        self.assertEqual(len(db.items(limit=2, offset=6)), 0)
+
     def test_agent_usage_and_quota_block(self):
         future = (datetime.now() + timedelta(hours=2)).strftime(db.TS)
         past = (datetime.now() - timedelta(hours=2)).strftime(db.TS)

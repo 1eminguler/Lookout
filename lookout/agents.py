@@ -62,6 +62,12 @@ class CancelledError(RuntimeError):
     """Raised when an in-flight agent or extractor process is cancelled."""
 
 
+def _codex(exe, model, workdir, timeout):
+    cmd = [exe, "exec", prompt_for(workdir), "-C", workdir, "--skip-git-repo-check", "--ephemeral",
+           "-s", "workspace-write", "-c", "sandbox_workspace_write.network_access=true"]
+    return cmd + (["-m", model] if model else [])
+
+
 def _agy(exe, model, workdir, timeout):
     cmd = [exe, "-p", prompt_for(workdir), "--add-dir", workdir, "--dangerously-skip-permissions", "--print-timeout", f"{timeout}s"]
     return cmd + (["--model", model] if model else [])
@@ -71,9 +77,8 @@ def _agy(exe, model, workdir, timeout):
 AGENTS: Dict[str, Dict] = {
     "claude": {"name": "Claude Code", "exe": "claude", "verified": True, "build": _claude,
                "models": [("haiku", "Claude Haiku (fastest)"), ("sonnet", "Claude Sonnet"), ("opus", "Claude Opus")]},
-    "codex": {"name": "Codex CLI", "exe": "codex", "verified": False,
-              "build": lambda e, m, w, t: [e, "exec", prompt_for(w), "--full-auto"] + (["-m", m] if m else []),
-              "models": []},
+    "codex": {"name": "Codex CLI", "exe": "codex", "verified": True, "build": _codex,
+              "models": [("gpt-6.2-sol", "GPT-6.2-Sol"), ("gpt-6.2-astra", "GPT-6.2-Astra")]},
     "gemini": {"name": "Gemini CLI", "exe": "gemini", "verified": True,
                "build": lambda e, m, w, t: [e, "-p", prompt_for(w), "--yolo"] + (["-m", m] if m else []),
                "models": [("gemini-2.5-flash", "Gemini 2.5 Flash"), ("gemini-2.5-pro", "Gemini 2.5 Pro")]},

@@ -242,7 +242,7 @@ Adapters marked **CLI `--help` checked** in [`lookout/agents.py`](lookout/agents
 | [Gemini CLI](https://github.com/google-gemini/gemini-cli) | `gemini -p … --yolo` (+ `-m <model>`) | CLI `--help` checked | **Auto-approve** |
 | Antigravity CLI | `agy -p … --add-dir <dir> --dangerously-skip-permissions --print-timeout <t>s` (+ `--model <model>`) | CLI `--help` checked | **Auto-approve** |
 | [opencode](https://opencode.ai) | `opencode run … --auto` (+ `-m <model>`) | CLI `--help` checked | **Auto-approve** |
-| [Codex CLI](https://github.com/openai/codex) | `codex exec … --full-auto` (+ `-m <model>`) | experimental | **Auto-approve** |
+| [Codex CLI](https://github.com/openai/codex) | `codex exec <prompt> -C <workdir> --skip-git-repo-check --ephemeral -s workspace-write -c sandbox_workspace_write.network_access=true` (+ `-m <model>`) | CLI `--help` checked | **Workspace-write sandbox with network access** |
 | Cursor Agent | `cursor-agent -p … --force` (+ `--model <model>`) | experimental | **Auto-approve** |
 | Qwen Code | `qwen -p … --yolo` (+ `-m <model>`) | experimental | **Auto-approve** |
 | GitHub Copilot CLI | `copilot -p … --allow-all-tools` (+ `--model <model>`) | experimental | **Auto-approve** |

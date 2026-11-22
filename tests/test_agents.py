@@ -31,6 +31,20 @@ class AgentTests(TempLookoutTestCase):
                     self.assertNotIn("my-model", cmd_no_model)
                     self.assertTrue(any("/tmp/work" in part for part in cmd_with_model))
 
+    def test_codex_command_with_and_without_model(self):
+        workdir = str(self.work_dir / "site with spaces")
+        expected = [
+            "/bin/codex", "exec", agents.prompt_for(workdir), "-C", workdir,
+            "--skip-git-repo-check", "--ephemeral", "-s", "workspace-write",
+            "-c", "sandbox_workspace_write.network_access=true",
+        ]
+        with patch("shutil.which", return_value="/bin/codex"):
+            self.assertEqual(agents.build_command("codex", "", workdir, 60), expected)
+            self.assertEqual(
+                agents.build_command("codex", "my-model", workdir, 60),
+                expected + ["-m", "my-model"],
+            )
+
     def test_custom_command_template_and_errors(self):
         db.set_settings({"custom_command": "mycli run -m {model} --dir {dir} {prompt}"})
         with patch("shutil.which", return_value="/bin/mycli"):
@@ -124,6 +138,8 @@ class AgentTests(TempLookoutTestCase):
     def test_quota_detection_and_resets_at(self):
         self.assertTrue(agents.QUOTA.search("Error: 429 Too Many Requests"))
         self.assertTrue(agents.QUOTA.search("RESOURCE_EXHAUSTED"))
+        self.assertTrue(agents.QUOTA.search("You've hit your usage limit"))
+        self.assertTrue(agents.QUOTA.search("usage limit"))
         self.assertIsNotNone(agents._resets_at("Quota resets in 4h29m"))
         self.assertIsNotNone(agents._resets_at("Limit reset in 1h 5m 10s"))
         self.assertIsNone(agents._resets_at("Quota exceeded, try later"))

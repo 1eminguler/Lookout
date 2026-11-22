@@ -21,7 +21,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, List, Optional
 from xml.sax.saxutils import escape as _xesc
 
-from lookout import agents, db, notify, scanner, tasks
+from lookout import agents, db, eligibility, notify, scanner, tasks
 
 WEB = db.ROOT / "web"
 PORT = int(os.environ.get("LOOKOUT_PORT") or 8780)
@@ -106,6 +106,7 @@ def _cached_schedule_status() -> Dict[str, Any]:
 def public_settings() -> Dict[str, Any]:
     s = db.get_settings()
     out = {k: v for k, v in s.items() if k not in SECRET_KEYS}
+    out["eligibility_profile"] = eligibility.read_profile(s["eligibility_profile"])
     out["smtp_password_set"] = bool(s.get("smtp_password"))
     out["custom_command_configured"] = bool(agents.get_custom_command())
     out["custom_command_path"] = str(agents.custom_command_path())
@@ -181,23 +182,37 @@ def start_test_job(src: Dict[str, Any]) -> Dict[str, Any]:
     return snap
 
 
-def state(limit: int = DEFAULT_ITEMS_LIMIT, offset: int = 0) -> Dict[str, Any]:
+def state(limit: int = DEFAULT_ITEMS_LIMIT, offset: int = 0, hide_ineligible: bool = False) -> Dict[str, Any]:
     cnt = db.counts()
-    return {
+    settings = public_settings()
+    payload = {
         "counts": cnt,
-        "agenda_items": db.agenda_items(),
+        "agenda_items": _public_items(db.agenda_items()),
         "scans": db.scans(),
         "discoveries": db.discoveries(),
         "watches": db.watches(),
         "sources": db.sources(include_code=False),
         "filters": db.filters(),
         "progress": scanner.get_progress(),
-        "settings": public_settings(),
+        "settings": settings,
         "discovery": dict(discovery),
         "test_job": get_test_job(),
         "notify_errors": db.recent_notify_errors(),
         "schedule": _cached_schedule_status(),
     }
+    if hide_ineligible and settings["eligibility_profile"]:
+        payload["eligibility_counts"] = db.counts(hide_ineligible=True)
+    return payload
+
+
+def _public_items(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    for row in rows:
+        row.pop("eligibility_hash", None)
+        try:
+            row["eligibility"] = json.loads(row.get("eligibility") or "null")
+        except ValueError:
+            row["eligibility"] = None
+    return rows
 
 
 def cancel_discovery(async_browser: bool = False) -> None:
@@ -837,7 +852,8 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/state":
             lim = max(1, min(MAX_ITEMS_LIMIT, _parse_int(qs["limit"][0], "limit"))) if "limit" in qs else DEFAULT_ITEMS_LIMIT
             off = max(0, _parse_int(qs["offset"][0], "offset")) if "offset" in qs else 0
-            return self.send(200, state(limit=lim, offset=off))
+            return self.send(200, state(limit=lim, offset=off,
+                                        hide_ineligible=qs.get("eligibility") == ["hide_ineligible"]))
         if path == "/api/counts":
             return self.send(200, db.counts())
         if m := re.fullmatch(r"/api/sources/(\d+)/tracked-count", path):
@@ -847,12 +863,17 @@ class Handler(BaseHTTPRequestHandler):
             wid = int(m[1])
             return self.send(200, {"count": db.watch_tracked_item_count(wid)})
         if path == "/api/progress":
-            return self.send(200, {
+            payload = {
                 "progress": scanner.get_progress(),
                 "discovery": dict(discovery),
                 "test_job": get_test_job(),
                 "counts": db.counts(),
-            })
+            }
+            if qs.get("eligibility") == ["hide_ineligible"] and eligibility.read_profile(
+                db.get_settings()["eligibility_profile"]
+            ):
+                payload["eligibility_counts"] = db.counts(hide_ineligible=True)
+            return self.send(200, payload)
         if path == "/api/sources/test":
             return self.send(200, get_test_job())
         if m := re.fullmatch(r"/api/sources/(\d+)/code", path):
@@ -882,6 +903,9 @@ class Handler(BaseHTTPRequestHandler):
             src_name = qs["source"][0] if "source" in qs and qs["source"][0] else None
             src_id = _parse_int(qs["source_id"][0], "source_id") if "source_id" in qs and qs["source_id"][0] else None
             q_val = (qs.get("q") or qs.get("search") or [""])[0] or None
+            eligibility_filter = qs.get("eligibility", [""])[0]
+            if eligibility_filter and not eligibility.read_profile(db.get_settings()["eligibility_profile"]):
+                eligibility_filter = None
             sort_val = (qs.get("sort") or ["first_seen"])[0]
             if sort_val not in ("first_seen", "new", "deadline", "updated"):
                 sort_val = "first_seen"
@@ -898,11 +922,12 @@ class Handler(BaseHTTPRequestHandler):
                 source_name=src_name,
                 source_id=src_id,
                 search=q_val,
+                eligibility=eligibility_filter,
             )
             total = db.items_count(watch_id=wid_arg, **flt_kw)
             rows = db.items(limit=lim, offset=off, watch_id=wid_arg, sort=sort_val, **flt_kw)
             resp: Dict[str, Any] = {
-                "items": rows,
+                "items": _public_items(rows),
                 "total": total,
                 "limit": lim,
                 "offset": off,
@@ -917,6 +942,7 @@ class Handler(BaseHTTPRequestHandler):
                     exclude_applied=exc_applied,
                     exclude_expired=exc_expired,
                     snoozed="exclude" if snoozed_val == "exclude" else "include",
+                    eligibility=eligibility_filter,
                 )
             return self.send(200, resp)
         if m := re.fullmatch(r"/api/items/([\w-]+)/history", path):
@@ -1228,6 +1254,9 @@ class Handler(BaseHTTPRequestHandler):
                     "error": "custom_command cannot be changed over HTTP; use data/agent_command.txt or --custom-command"
                 })
             vals = {k: v for k, v in b.items() if k in db.DEFAULTS and not (k in SECRET_KEYS and not v)}
+            if "eligibility_profile" in vals:
+                profile = eligibility.normalize_profile(vals["eligibility_profile"])
+                vals["eligibility_profile"] = json.dumps(profile, sort_keys=True, ensure_ascii=True)
             if vals.get("agent") not in (None, "") and vals["agent"] != "custom" and vals["agent"] not in agents.AGENTS:
                 raise ValueError("unknown agent")
             for k, lo, hi in (("agent_timeout_min", 1, 120), ("parallel", 1, 8), ("smtp_port", 1, 65535)):

@@ -12,10 +12,12 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+from lookout import eligibility
+
 ROOT = Path(__file__).resolve().parent.parent
 DB_PATH = Path(os.environ.get("LOOKOUT_DATA_DIR") or ROOT / "data") / "lookout.db"
 TS = "%Y-%m-%d %H:%M:%S"
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 MAX_DELIVERY_ATTEMPTS = 4  # Initial delivery plus up to three retries.
 _lock = threading.RLock()
 _UNSET = object()
@@ -205,6 +207,7 @@ def connect() -> sqlite3.Connection:
     conn = sqlite3.connect(str(DB_PATH), timeout=30, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.create_function("norm_tr", 1, _tr_lower)
+    conn.create_function("eligibility_verdict", 1, _eligibility_verdict, deterministic=True)
     conn.execute("PRAGMA foreign_keys=ON")
     conn.execute("PRAGMA busy_timeout=30000")
     conn.execute("PRAGMA synchronous=NORMAL")
@@ -296,6 +299,10 @@ MIGRATIONS_V7 = {
               "sources_skipped": "INTEGER NOT NULL DEFAULT 0"},
 }
 
+MIGRATIONS_V8 = {
+    "items": {"eligibility": "TEXT", "eligibility_hash": "TEXT"},
+}
+
 
 def _migrate_scan_coverage(c: sqlite3.Connection) -> None:
     # Names can repeat across watches. Key source results by ID when available.
@@ -378,6 +385,9 @@ def init() -> None:
             if c.execute("PRAGMA user_version").fetchone()[0] < 7:
                 _add_columns(c, MIGRATIONS_V7)
                 _migrate_scan_coverage(c)
+            ver = 7
+        if ver < 8:
+            _add_columns(c, MIGRATIONS_V8)
         c.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         c.commit()
 
@@ -573,7 +583,7 @@ DEFAULTS = {
     "smtp_user": "", "smtp_password": "", "smtp_starttls": "auto", "language_hint": "", "verify_weekly": "1",
     "rss_public": "0", "webhook_url": "", "webhook_format": "auto", "webhook_allow_local": "0",
     "telegram_chat_id": "", "notify_errors_dismissed_id": "0", "expired_cleanup_v1": "0",
-    "expired_cleanup_v2": "0",
+    "expired_cleanup_v2": "0", "eligibility_profile": "{}",
 }
 
 
@@ -585,6 +595,11 @@ def get_settings() -> Dict[str, str]:
 
 def set_settings(values: Dict[str, Any]) -> None:
     with _lock, _conn() as c:
+        if "eligibility_profile" in values:
+            c.execute("BEGIN IMMEDIATE")
+            previous = c.execute("SELECT value FROM settings WHERE key='eligibility_profile'").fetchone()
+            if (previous["value"] if previous else "{}") != values["eligibility_profile"]:
+                c.execute("UPDATE items SET eligibility=NULL, eligibility_hash=NULL WHERE eligibility_hash IS NOT NULL")
         c.executemany("INSERT INTO settings(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                       [(k, str(v)) for k, v in values.items() if k in DEFAULTS])
         c.commit()
@@ -1280,14 +1295,17 @@ def save_item(scan_id: int, source: Dict[str, Any], it: Dict[str, Any], *,
                 new_match_key = ex.get("match_key") if match_key is _UNSET else match_key
             new_notified = ex.get("notified", 0) if notified is _UNSET else int(bool(notified))
             new_expired = int(bool(expired)) if expired is not _UNSET else int(ex.get("expired") or 0)
+            listing_changed = any(ex.get(field) != it.get(field) for field in eligibility.LISTING_FIELDS)
             c.execute(
                 """UPDATE items SET title=?, org=?, category=?, url=?, deadline=?, deadline_raw=?, start_date=?, location=?,
                    summary=?, extra=?, watch_id=?, status='open', last_scan=?, last_seen=?,
                    updated_at=?, change_summary=?, last_change_kind=?, match=?, match_key=?, notified=?,
-                   expired=? WHERE id=?""",
+                   expired=?, eligibility=CASE WHEN ? THEN NULL ELSE eligibility END,
+                   eligibility_hash=CASE WHEN ? THEN NULL ELSE eligibility_hash END WHERE id=?""",
                 (it["title"], it.get("org"), it.get("category"), it["url"], it.get("deadline"), deadline_raw,
                  it.get("start_date"), it.get("location"), it.get("summary"), it.get("extra"), wid, scan_id, t,
-                 updated_at, summary, change_kind, new_match, new_match_key, new_notified, new_expired, item_id),
+                 updated_at, summary, change_kind, new_match, new_match_key, new_notified, new_expired,
+                 listing_changed, listing_changed, item_id),
             )
             c.execute(
                 "INSERT OR REPLACE INTO scan_items(scan_id, item_id, is_new, is_updated) VALUES(?, ?, 0, ?)",
@@ -1363,6 +1381,7 @@ def _items_where(
     source_name: Optional[str] = None,
     source_id: Optional[int] = None,
     search: Optional[str] = None,
+    eligibility: Optional[str] = None,
 ) -> Tuple[str, List[Any]]:
     clauses: List[str] = []
     args: List[Any] = []
@@ -1379,6 +1398,11 @@ def _items_where(
         clauses.append("i.match=0")
     elif match == "1" or match_only:
         clauses.append("COALESCE(i.match, 1)=1")
+    if eligibility in ("eligible", "unclear", "ineligible"):
+        clauses.append("eligibility_verdict(i.eligibility)=?")
+        args.append(eligibility)
+    elif eligibility == "hide_ineligible":
+        clauses.append("COALESCE(eligibility_verdict(i.eligibility), '')!='ineligible'")
     if exclude_hidden:
         clauses.append("(i.action IS NULL OR i.action != 'hidden')")
     if exclude_applied:
@@ -1475,6 +1499,7 @@ def items_facets(
     exclude_applied: bool = True,
     exclude_expired: bool = True,
     snoozed: str = "exclude",
+    eligibility: Optional[str] = None,
 ) -> Dict[str, Any]:
     today = now()[:10]
     recent_cutoff = (datetime.now() - timedelta(hours=72)).strftime(TS)
@@ -1486,6 +1511,7 @@ def items_facets(
         exclude_applied=exclude_applied,
         exclude_expired=exclude_expired,
         snoozed=snoozed,
+        eligibility=eligibility,
     )
     where_scope, args_scope = _items_where(
         watch_id=watch_id,
@@ -1495,6 +1521,7 @@ def items_facets(
         exclude_applied=exclude_applied,
         exclude_expired=exclude_expired,
         snoozed="only",
+        eligibility=eligibility,
     )
     with _lock, _conn() as c:
         cat_rows = c.execute(
@@ -1527,7 +1554,7 @@ def items_facets(
     }
 
 
-def counts() -> Dict[str, Any]:
+def counts(hide_ineligible: bool = False) -> Dict[str, Any]:
     today = now()[:10]
     week_end = (date.today() + timedelta(days=7)).isoformat()
     recent_cutoff = (datetime.now() - timedelta(hours=72)).strftime(TS)
@@ -1538,6 +1565,8 @@ def counts() -> Dict[str, Any]:
             "AND (COALESCE(NULLIF(i.deadline,''), NULLIF(i.start_date,'')) IS NULL "
             "OR COALESCE(NULLIF(i.deadline,''), NULLIF(i.start_date,'')) >= ?)"
         )
+        if hide_ineligible:
+            base_where += " AND COALESCE(eligibility_verdict(i.eligibility), '')!='ineligible'"
         rows = c.execute(
             f"""SELECT COALESCE(s.watch_id, i.watch_id) AS wid,
                        i.first_seen, i.updated_at, i.last_change_kind,
@@ -1807,6 +1836,32 @@ def open_items_for_scope(watch_id: Optional[int]) -> List[Dict[str, Any]]:
 def open_items() -> List[Dict[str, Any]]:
     """Every stored OPEN item, for expiry re-evaluation."""
     return _rows("SELECT * FROM items WHERE status='open'")
+
+
+def _eligibility_verdict(raw: Optional[str]) -> Optional[str]:
+    try:
+        value = json.loads(raw) if raw else None
+    except ValueError:
+        return None
+    return value.get("verdict") if isinstance(value, dict) and value.get("verdict") in eligibility.VERDICTS else None
+
+
+def store_eligibility(profile_raw: str, rows: Iterable[tuple]) -> None:
+    """Commit only decisions for listing and profile snapshots that are still current."""
+    fields = " AND ".join(f"{field} IS ?" for field in eligibility.LISTING_FIELDS)
+    batch = [
+        (json.dumps(decision, ensure_ascii=False), digest, item["id"], profile_raw,
+         *(item.get(field) for field in eligibility.LISTING_FIELDS))
+        for item, digest, decision in rows
+    ]
+    if batch:
+        with _lock, _conn() as c:
+            c.executemany(
+                "UPDATE items SET eligibility=?, eligibility_hash=? WHERE id=? AND status='open' "
+                "AND (SELECT value FROM settings WHERE key='eligibility_profile') IS ? AND " + fields,
+                batch,
+            )
+            c.commit()
 
 
 def mark_items_expired(ids: Iterable[str]) -> int:

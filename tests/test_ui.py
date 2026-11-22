@@ -47,6 +47,7 @@ const context = {
   window: { addEventListener: ignore },
   location: { hash: "#/feed" },
   clearTimeout: ignore,
+  URLSearchParams,
   fetch: () => new Promise(() => {}),
 };
 vm.runInNewContext(fs.readFileSync("web/app.js", "utf8"), context);
@@ -56,6 +57,28 @@ vm.runInNewContext(fs.readFileSync("web/app.js", "utf8"), context);
             capture_output=True, text=True, encoding="utf-8", timeout=15,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    @unittest.skipUnless(shutil.which("node"), "Node.js is not installed")
+    def test_eligibility_badge_details_and_filter_require_a_profile(self):
+        self.run_render_assertions(r"""
+const item = {
+  id: "one", title: "Internship", url: "https://example.com/one", source_name: "Careers",
+  eligibility: {verdict: "ineligible", checks: [
+    {criterion: "Class year", result: "fail", quote: 'Only "fourth-year" students may apply.'},
+  ]},
+};
+assert.doesNotMatch(context.itemCard(item, {isNew: false}), /Not eligible|Eligibility checks/);
+vm.runInContext('S = {settings: {eligibility_profile: {class_year: "3"}}}; ui.hideIneligible = true;', context);
+const card = context.itemCard(item, {isNew: false});
+assert.match(card, />Not eligible<\/span>/);
+assert.match(card, /<summary>Eligibility checks<\/summary>/);
+assert.match(card, /<blockquote>Only &quot;fourth-year&quot; students may apply.<\/blockquote>/);
+assert.match(context.renderItemList(), /aria-pressed="true" data-act="toggle-ineligible">Hide not eligible/);
+vm.runInContext('route = {view: "watch", id: 1}', context);
+assert.match(context.renderItemList(), /Hide not eligible/);
+vm.runInContext('S.settings.eligibility_profile = {};', context);
+assert.doesNotMatch(context.renderItemList(), /Hide not eligible/);
+""")
 
     @unittest.skipUnless(shutil.which("node"), "Node.js is not installed")
     def test_shared_url_programmes_render_as_separate_cards(self):

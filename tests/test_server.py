@@ -591,6 +591,49 @@ class ServerTests(TempLookoutTestCase):
         self.assertTrue(db.item_history("backup-tracked"))
         self.assertEqual(restored["added"]["items"], 1)
 
+    def test_eligibility_profile_and_items_filter(self):
+        wid = db.add_watch("Internships")
+        source = {"id": db.add_source("Board", "https://example.com/jobs", watch_id=wid),
+                  "name": "Board", "watch_id": wid}
+        scan_id = db.start_scan("manual", "", "", [])
+        items = [(name, {"id": name, "title": name, "category": name, "url": f"https://example.com/{name}"})
+                 for name in ("eligible", "unclear", "ineligible", "pending")]
+        for _, item in items:
+            db.save_item(scan_id, source, item, match=1)
+        url = f"/api/items?watch_id={wid}&facets=1"
+        self.assertEqual(self.req("GET", url + "&eligibility=ineligible")[1]["total"], 4)
+        self.assertEqual(self.req("POST", "/api/settings", {"eligibility_profile": {"class_year": "n/a"}})[0], 400)
+        profile = {"class_year": "4", "remote_ok": "no", "other": "  Summer term  "}
+        self.assertEqual(self.req("POST", "/api/settings", {"eligibility_profile": profile})[0], 200)
+        self.assertEqual(self.req("GET", "/api/state")[1]["settings"]["eligibility_profile"],
+                         {**profile, "other": "Summer term"})
+        db.store_eligibility(db.get_settings()["eligibility_profile"], [
+            (item, f"hash-{name}", {"verdict": name, "checks": []}) for name, item in items if name != "pending"
+        ])
+        for path in ("/api/state", "/api/progress"):
+            _, state = self.req("GET", path + "?eligibility=hide_ineligible")
+            self.assertEqual(state["counts"]["feed_open"], 4)
+            self.assertEqual(state["eligibility_counts"]["feed_open"], 3)
+            self.assertEqual(state["eligibility_counts"]["watches"][str(wid)]["open"], 3)
+        db.set_item("ineligible", snoozed_until=(date.today() + timedelta(days=1)).isoformat())
+        for value in ("eligible", "unclear", "ineligible"):
+            code, body = self.req("GET", url + f"&eligibility={value}")
+            self.assertEqual(code, 200)
+            self.assertEqual(body["total"], 1)
+            self.assertEqual(body["facets"]["categories"], {value: 1})
+            self.assertEqual(body["items"][0]["eligibility"]["verdict"], value)
+        _, filtered = self.req("GET", url + "&eligibility=hide_ineligible&limit=2")
+        self.assertEqual(filtered["total"], 3)
+        self.assertEqual(filtered["facets"]["snoozed_count"], 0)
+        self.assertTrue(filtered["has_more"])
+        self.assertEqual(filtered["facets"]["categories"], {"eligible": 1, "unclear": 1, "pending": 1})
+        _, unpaged = self.req("GET", url + "&eligibility=hide_ineligible")
+        self.assertIsNone(next(i for i in unpaged["items"] if i["id"] == "pending")["eligibility"])
+        self.assertEqual(self.req("POST", "/api/settings", {"eligibility_profile": {}})[0], 200)
+        _, cleared = self.req("GET", url + "&eligibility=eligible")
+        self.assertEqual(cleared["total"], 4)
+        self.assertTrue(all(i["eligibility"] is None for i in cleared["items"]))
+
     def test_async_test_source_cancel_rss_webhook_schedule_counts_progress_and_items_api(self):
         wid = db.add_watch("AI Grants", "ai grants")
         sid = db.add_source("GrantBoard", "https://grants.example.com", watch_id=wid)

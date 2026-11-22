@@ -17,7 +17,7 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from lookout import agents, db, extractors, notify, tasks
+from lookout import agents, db, eligibility, extractors, notify, tasks
 
 PLUGIN_DIR = Path(os.environ.get("LOOKOUT_PLUGIN_DIR") or db.ROOT / "plugins")
 STRUCTURAL_FAIL_THRESHOLD = 2
@@ -951,7 +951,7 @@ def reevaluate_open_items(watch_id: Optional[int] = None) -> Dict[str, int]:
 def apply_semantic_filters(scan_id: int, global_fs: List[Dict[str, Any]],
                            watch_fs_map: Optional[Dict[int, List[Dict[str, Any]]]] = None,
                            watch_ids: Optional[List[Optional[int]]] = None) -> str:
-    """Asks the agent once per distinct filter scope for items not judged under those filters yet."""
+    """Classify pending filter matches and changed eligibility inputs by watch scope."""
     if progress["cancel"] or _cancel_event.is_set():
         return ""
     if watch_ids is None:
@@ -959,7 +959,10 @@ def apply_semantic_filters(scan_id: int, global_fs: List[Dict[str, Any]],
     else:
         ordered = ([None] if None in watch_ids else []) + sorted({w for w in watch_ids if w is not None})
         groups = [(wid, (watch_fs_map or {}).get(wid, []) if wid is not None else []) for wid in ordered]
-    has_agent = bool(db.get_settings().get("agent"))
+    settings = db.get_settings()
+    has_agent = bool(settings.get("agent"))
+    profile_raw = settings["eligibility_profile"]
+    profile = eligibility.read_profile(profile_raw)
     warnings: List[str] = []
     for wid, wfs in groups:
         if progress["cancel"] or _cancel_event.is_set():
@@ -973,32 +976,59 @@ def apply_semantic_filters(scan_id: int, global_fs: List[Dict[str, Any]],
                 if o["id"] not in seen_ids:
                     todo.append(o)
                     seen_ids.add(o["id"])
-        if not todo:
-            continue
-        if key == "none":
+        if todo and key == "none":
             db.set_matches({i["id"]: True for i in todo}, key)
-            continue
+            todo = []
         db.update_item_matches((None, None, i["id"]) for i in todo
                                if i["match"] is not None or i["match_key"] is not None)
-        if not has_agent:
-            continue
-        with _lock:
-            progress["current"] = ["applying filters"]
+        candidates = {i["id"]: i for i in todo} if has_agent else {}
+        pending = {}
+        if profile:
+            open_items = db.open_items() if wid is db._UNSET else db.open_items_for_scope(wid)
+            for item in open_items:
+                digest = eligibility.evaluation_hash(profile, item)
+                if digest != item["eligibility_hash"] or not item["eligibility"]:
+                    item["eligibility_hints"] = eligibility.precheck(profile, item)
+                    candidates[item["id"]] = item
+                    pending[item["id"]] = digest
+        match_ids = {i["id"] for i in todo}
         effective_fs = list(global_fs) + list(wfs)
-        try:
-            decisions: Dict[str, bool] = {}
-            for k in range(0, len(todo), 80):
-                if progress["cancel"] or _cancel_event.is_set():
+        batch = list(candidates.values())
+        can_classify = has_agent
+        matches = {}
+        for k in range(0, len(batch), 80):
+            if progress["cancel"] or _cancel_event.is_set():
+                return ""
+            part = batch[k:k + 80]
+            got = {}
+            if can_classify:
+                with _lock:
+                    progress["current"] = ["checking eligibility" if pending else "applying filters"]
+                options = {"profile": profile} if any(i["id"] in pending for i in part) else {}
+                try:
+                    got = tasks.classify(part, effective_fs, cancel_event=_cancel_event, **options)
+                except agents.CancelledError:
                     return ""
-                part = todo[k:k + 80]
-                got = tasks.classify(part, effective_fs, cancel_event=_cancel_event)
-                decisions.update({i["id"]: got[i["id"]] for i in part if i["id"] in got})
-            db.set_matches(decisions, key)
-        except agents.CancelledError:
-            return ""
-        except Exception as e:
-            warnings.append(str(e)[:120])
+                except Exception as e:
+                    can_classify = False
+                    warnings.append(str(e)[:120])
+            evaluations = []
+            for item in part:
+                item_id = item["id"]
+                decision = got.get(item_id)
+                match = decision.get("match") if isinstance(decision, dict) else decision
+                if item_id in match_ids and isinstance(match, bool):
+                    matches[item_id] = match
+                if item_id in pending:
+                    assessed = decision.get("eligibility") if isinstance(decision, dict) else None
+                    result = eligibility.combine(item["eligibility_hints"], assessed)
+                    evaluations.append((item, pending[item_id], result))
+            db.store_eligibility(profile_raw, evaluations)
+        if can_classify and matches:
+            db.set_matches(matches, key)
     if warnings:
+        if profile:
+            return f"Classification was incomplete ({warnings[0]})."
         return f"Filters could not be applied by the agent ({warnings[0]}); all items are shown."
     return ""
 

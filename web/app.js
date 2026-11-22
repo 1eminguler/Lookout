@@ -50,6 +50,7 @@ let feedState = {
 
 const ui = JSON.parse(localStorage.getItem("lookout-ui") || "{}");
 ui.sort ??= "deadline"; ui.cats ??= []; ui.src ??= ""; ui.q = ""; ui.calMonth ??= null; ui.showSnoozed ??= false; ui.onlyUpdated ??= false;
+ui.hideIneligible ??= false;
 const keep = () => localStorage.setItem("lookout-ui", JSON.stringify({ ...ui, q: "" }));
 document.body.classList.add("browser");
 window.addEventListener("pywebviewready", () => document.body.classList.remove("browser"));
@@ -174,6 +175,8 @@ function itemsScopeKey() {
     q: ui.q,
     sn: ui.showSnoozed,
     upd: ui.onlyUpdated,
+    eligibility: hideIneligible(),
+    profile: S?.settings?.eligibility_profile,
   });
 }
 
@@ -187,7 +190,7 @@ async function loadItems(append = false) {
   feedState.loading = true;
   const sameKeyReload = !append && feedState.key === key && feedState.initialized;
   if (!append) {
-    if (feedState.scope !== scope) {
+    if (feedState.key !== key) {
       feedState.items = [];
       feedState.total = 0;
       feedState.hasMore = false;
@@ -212,6 +215,7 @@ async function loadItems(append = false) {
   if (route.view === "feed" && ui.src) p.set("source", ui.src);
   if (ui.cats.length) p.set("category", ui.cats.join(","));
   if (ui.onlyUpdated) p.set("updated", "1");
+  if (hideIneligible()) p.set("eligibility", "hide_ineligible");
   if (ui.q) p.set("q", ui.q);
   if (!append) p.set("facets", "1");
   const run = (async () => {
@@ -364,7 +368,7 @@ function histRight(e, isScan) {
 }
 function renderSide() {
   document.querySelectorAll("[data-nav]").forEach((a) => a.classList.toggle("on", a.dataset.nav === route.view));
-  const c = S.counts || {};
+  const c = (hideIneligible() && S.eligibility_counts) || S.counts || {};
   const feedOpen = c.feed_open ?? 0, feedNew = c.feed_new ?? 0;
   $("#navFeed").textContent = feedOpen || ""; $("#navFeed").classList.toggle("hot", feedNew > 0);
   $("#navAgenda").textContent = (c.agenda_saved ?? agendaBase().filter((i) => i.action === "saved").length) || "";
@@ -424,6 +428,26 @@ function whenBox(i) {
   const big = d === 0 ? `<b class="s">today</b><span>${i.deadline ? "last day" : "starts"}</span>` : d === 1 ? `<b class="s">tomorrow</b><span>${i.deadline ? "last day" : "starts"}</span>` : `<b>${d}</b><span>${i.deadline ? "days left" : "days to go"}</span>`;
   return `<div class="when ${cls}"${tip}>${big}${dateLabel}</div>`;
 }
+const hasEligibilityProfile = () => Object.keys(S?.settings?.eligibility_profile || {}).length > 0;
+const hideIneligible = () => ui.hideIneligible && hasEligibilityProfile();
+
+function eligibilityBadge(i) {
+  if (!hasEligibilityProfile()) return "";
+  switch (i.eligibility?.verdict) {
+    case "eligible": return '<span class="tag ok">Eligible</span>';
+    case "ineligible": return '<span class="tag bad">Not eligible</span>';
+    default: return '<span class="tag warn">Check</span>';
+  }
+}
+
+function eligibilityDetails(i) {
+  const checks = i.eligibility?.checks;
+  if (!eligibilityBadge(i) || !checks?.length) return "";
+  const labels = { ok: "Meets requirement", unclear: "Check", fail: "Does not meet requirement" };
+  return `<details class="eligibility-details" data-key="eligibility-${esc(i.id)}"><summary>Eligibility checks</summary><ul>${checks.map((check) =>
+    `<li><b>${esc(check.criterion)}</b> <span class="muted">${labels[check.result]}</span>${check.quote ? `<blockquote>${esc(check.quote)}</blockquote>` : ""}</li>`).join("")}</ul></details>`;
+}
+
 function itemCard(i, opts = {}) {
   const a = i.action, sn = isSnoozed(i), w = opts.showWatch && i.watch_id ? watchById(i.watch_id) : null;
   const who = [i.org, i.location].filter(Boolean).map((x) => `<span>${esc(x)}</span>`).join("");
@@ -432,9 +456,9 @@ function itemCard(i, opts = {}) {
   const updLabel = i.last_change_kind === "deadline_moved" ? "Deadline moved" : i.last_change_kind === "reopened" ? "Reopened" : "Updated";
   const updTag = upd ? `<span class="tag updated">${updLabel}</span>` : "";
   return `<article class="item">${whenBox(i)}<div class="ibody">
-      <div class="meta">${(opts.isNew ?? isNew(i)) ? '<span class="tag new">New</span>' : ""}${updTag}${i.category ? `<span class="tag accent">${esc(i.category)}</span>` : ""}<span class="tag">${esc(i.source_name)}</span>${w ? `<a class="tag accent no-dec" href="#/watch/${w.id}">${esc(w.title)}</a>` : ""}${sn ? `<span class="tag warn">snoozed until ${short(i.snoozed_until)}</span>` : ""}${i.status === "gone" ? '<span class="tag bad">no longer listed</span>' : ""}</div>
+      <div class="meta">${(opts.isNew ?? isNew(i)) ? '<span class="tag new">New</span>' : ""}${updTag}${eligibilityBadge(i)}${i.category ? `<span class="tag accent">${esc(i.category)}</span>` : ""}<span class="tag">${esc(i.source_name)}</span>${w ? `<a class="tag accent no-dec" href="#/watch/${w.id}">${esc(w.title)}</a>` : ""}${sn ? `<span class="tag warn">snoozed until ${short(i.snoozed_until)}</span>` : ""}${i.status === "gone" ? '<span class="tag bad">no longer listed</span>' : ""}</div>
       <h3><a href="${esc(safeUrl(i.url))}" data-ext target="_blank" rel="noopener noreferrer">${esc(i.title)}</a></h3>
-      ${who ? `<div class="who">${who}</div>` : ""}${upd && i.change_summary ? `<div class="change-note">${esc(i.change_summary)}</div>` : ""}${i.summary ? `<p class="sum">${esc(i.summary)}</p>` : ""}${i.note ? `<div class="note">${esc(i.note)}</div>` : ""}</div>
+      ${who ? `<div class="who">${who}</div>` : ""}${upd && i.change_summary ? `<div class="change-note">${esc(i.change_summary)}</div>` : ""}${i.summary ? `<p class="sum">${esc(i.summary)}</p>` : ""}${eligibilityDetails(i)}${i.note ? `<div class="note">${esc(i.note)}</div>` : ""}</div>
     <div class="acts">${b("saved", a === "saved" ? "Remove from agenda" : "Add to agenda", a === "saved")}${b("applied", a === "applied" ? "Mark as not done" : "Mark as done", a === "applied", "green")}<button class="ib ${sn ? "on" : ""}" data-pick="snooze" data-sid="${esc(i.id)}" data-tip="${sn ? "Snoozed until " + short(i.snoozed_until) : "Snooze"}" aria-label="Snooze">${I.clock}</button>${b("hidden", a === "hidden" ? "Unhide" : "Hide", a === "hidden")}</div></article>`;
 }
 function progressBox() {
@@ -507,7 +531,7 @@ function renderHome() {
 function renderItemList(opts = {}) {
   const scope = itemsScopeOnly();
   const key = itemsScopeKey();
-  if (key && feedState.key !== key && !feedState.loading) {
+  if (key && feedState.key !== key) {
     Promise.resolve().then(() => loadItems(false));
   }
   const list = dedupeItems(feedState.scope === scope ? feedState.items : []);
@@ -516,14 +540,14 @@ function renderItemList(opts = {}) {
   const srcs = facets.sources || [];
   const updCount = facets.updated_count || 0;
   const snCount = facets.snoozed_count || 0;
-  const hasFilters = Boolean(ui.cats.length || (opts.showSourceSelect && ui.src) || ui.onlyUpdated || ui.q);
+  const hasFilters = Boolean(ui.cats.length || (opts.showSourceSelect && ui.src) || ui.onlyUpdated || ui.q || hideIneligible());
 
   let body = "";
   if (feedState.loading && !feedState.items.length) {
     body = `<div class="empty"><b>Loading items…</b></div>`;
   } else if (!list.length) {
     body = hasFilters
-      ? `<div class="empty"><b>Nothing matches</b>Try a different search or category.</div>`
+      ? `<div class="empty"><b>Nothing matches</b>Try changing your filters.</div>`
       : (opts.emptyHtml || `<div class="empty"><b>No open items yet</b>Run a scan to collect matching items.</div>`);
   } else if (ui.sort === "deadline") {
     let rest = list;
@@ -535,7 +559,8 @@ function renderItemList(opts = {}) {
 
   const pills = Object.entries(cats).sort((a, b) => b[1] - a[1]).map(([c, n]) => `<button class="pill ${ui.cats.includes(c) ? "on" : ""}" data-cat="${esc(c)}">${esc(c)} <em>${n}</em></button>`).join("")
     + (updCount || ui.onlyUpdated ? `<button class="pill ${ui.onlyUpdated ? "on" : ""}" data-act="toggle-updated">Updated <em>${updCount}</em></button>` : "")
-    + (snCount || ui.showSnoozed ? `<button class="pill ${ui.showSnoozed ? "on" : ""}" data-act="toggle-snoozed">Snoozed <em>${snCount}</em></button>` : "");
+    + (snCount || ui.showSnoozed ? `<button class="pill ${ui.showSnoozed ? "on" : ""}" data-act="toggle-snoozed">Snoozed <em>${snCount}</em></button>` : "")
+    + (hasEligibilityProfile() ? `<button type="button" class="pill ${hideIneligible() ? "on" : ""}" aria-pressed="${hideIneligible()}" data-act="toggle-ineligible">Hide not eligible</button>` : "");
   const srcSelect = opts.showSourceSelect ? `<select id="srcSel" aria-label="Source"><option value="">All sources</option>${srcs.map((s) => `<option ${s === ui.src ? "selected" : ""}>${esc(s)}</option>`).join("")}</select>` : "";
   const loadMore = feedState.hasMore ? `<div class="load-more"><span class="muted">Loaded ${feedState.items.length} of ${feedState.total} matching items</span><button type="button" class="btn sm" data-act="load-more" ${feedState.loading ? "disabled" : ""}>${feedState.loading ? "Loading…" : "Load more"}</button></div>` : "";
   return `<div class="toolbar"><div class="search">${I.search}<input type="search" id="q" placeholder="Search titles, organisations, places" value="${esc(ui.q)}"></div>
@@ -545,12 +570,12 @@ function renderItemList(opts = {}) {
 }
 
 function renderFeed() {
-  const openN = S.counts?.feed_open ?? feedState.total;
+  const openN = hideIneligible() ? (feedState.key === itemsScopeKey() && !feedState.loading ? feedState.total : null) : (S.counts?.feed_open ?? feedState.total);
   const lastScan = S.scans.find((s) => s.status !== "running");
   const emptyHtml = S.sources.length ? `<div class="empty"><b>Your feed is empty</b>Run a scan to fill it.<div class="row"><button class="btn sm primary" data-act="scan" ${S.progress.running ? "disabled" : ""}>${I.play} New scan</button></div></div>`
     : `<div class="empty"><b>Your feed is empty</b>Describe what you want to monitor on Home or add a website directly.<div class="row"><a class="btn sm primary" href="#/home">Describe on Home</a><a class="btn sm" href="#/sources">Add source</a></div></div>`;
   return `<div class="page">${renderNotifyErrorsBanner()}${progressBox()}
-    <div class="head"><div><h1>Feed</h1><p>${openN} open item${openN === 1 ? "" : "s"}${lastScan ? `, last scan ${ago(lastScan.started)}` : ""}</p></div>
+    <div class="head"><div><h1>Feed</h1><p>${openN === null ? "Loading items…" : `${openN} open item${openN === 1 ? "" : "s"}`}${lastScan ? `, last scan ${ago(lastScan.started)}` : ""}</p></div>
       <button type="button" class="btn sm ghost" data-dl="/api/export.csv" data-fn="lookout.csv">${I.dl} Export CSV</button></div>
     ${renderItemList({ showSourceSelect: true, showWatch: true, emptyHtml })}</div>`;
 }
@@ -683,13 +708,13 @@ function agRow(i) {
   return `<div class="ag-row ${open ? "open" : ""}">
     <div class="ag-date ${dt ? "" : "none"}">${dt ? `<b>${dt.getDate()}</b><span>${WD[dt.getDay()]} ${MON[dt.getMonth()]}</span>` : "<b>—</b><span>no date</span>"}</div>
     <button class="ag-main" data-ag-open="${esc(i.id)}" aria-expanded="${open}"><span class="t">${esc(i.title)}</span>
-      <span class="s">${i.org ? `<span>${esc(i.org)}</span>` : ""}<span>${esc(i.source_name)}</span>${deadline ? `<span>${deadline}</span>` : ""}${i.remind_on ? `<span class="rem">reminder ${short(i.remind_on)}</span>` : ""}${i.note && !open ? `<span>has notes</span>` : ""}</span></button>
+      <span class="s">${i.org ? `<span>${esc(i.org)}</span>` : ""}<span>${esc(i.source_name)}</span>${eligibilityBadge(i)}${deadline ? `<span>${deadline}</span>` : ""}${i.remind_on ? `<span class="rem">reminder ${short(i.remind_on)}</span>` : ""}${i.note && !open ? `<span>has notes</span>` : ""}</span></button>
     <div class="ag-left ${left.c}">${done ? "done" : left.t}</div>
     <div class="ag-acts"><button class="ib" data-pick="remind" data-rid="${esc(i.id)}" data-tip="Set a reminder" aria-label="Set a reminder"><svg viewBox="0 0 24 24"><path d="M6 8a6 6 0 1 1 12 0c0 7 3 8 3 8H3s3-1 3-8"/><path d="M10.5 20a1.5 1.5 0 0 0 3 0"/></svg></button>
       <button class="ib ${done ? "on green" : ""}" data-item="${esc(i.id)}" data-set="applied" data-tip="${done ? "Mark as not done" : "Mark as done"}" aria-label="${done ? "Mark as not done" : "Mark as done"}">${I.done}</button>
       <button class="ib" data-item="${esc(i.id)}" data-set="${done ? "applied" : "saved"}" data-unsave="1" data-tip="Remove from agenda" aria-label="Remove from agenda">${I.trash}</button></div>
     ${open ? `<div class="ag-detail">${i.deadline_raw ? `<div class="deadline-text">Deadline text: ${esc(i.deadline_raw)}</div>` : ""}<textarea data-note="${esc(i.id)}" placeholder="Notes: what to prepare, who to contact, links…">${esc(i.note || "")}</textarea>
-      <div class="links"><a class="btn sm" href="${esc(safeUrl(i.url))}" data-ext target="_blank" rel="noopener noreferrer">Open page</a>${i.summary ? `<span class="muted ag-sum">${esc(i.summary)}</span>` : ""}</div></div>` : ""}
+      <div class="links"><a class="btn sm" href="${esc(safeUrl(i.url))}" data-ext target="_blank" rel="noopener noreferrer">Open page</a>${i.summary ? `<span class="muted ag-sum">${esc(i.summary)}</span>` : ""}</div>${eligibilityDetails(i)}</div>` : ""}
   </div>`;
 }
 function renderUpcoming() {
@@ -837,8 +862,36 @@ function renderFilters() {
 }
 
 // ---------- settings ----------
+function eligibilityProfileForm(profile) {
+  const val = (name) => esc(profile[name] || "");
+  const select = (label, name, options) => `<label class="f">${label}<select name="${name}">
+    <option value="">Not specified</option>${options.map(([value, text]) =>
+    `<option value="${value}" ${profile[name] === value ? "selected" : ""}>${text}</option>`).join("")}</select></label>`;
+  const yesNo = [["yes", "Yes"], ["no", "No"]];
+  const years = ["1", "2", "3", "4", "5", "6"].map((n) => [n, `Year ${n}`]);
+  const levels = ["A1", "A2", "B1", "B2", "C1", "C2"].map((n) => [n, n]);
+  return `<div class="h2">Eligibility profile</div><div class="box pad">
+    <p class="muted fs-13">All fields are optional. Lookout checks listings during scans and shares this profile with your selected agent for those checks.</p>
+    <form id="eligibilityForm" class="grid2 mt-12">
+      ${select("Class year", "class_year", [...years, ["final", "Final year"], ["graduate", "Graduated"]])}
+      <label class="f">Graduation date (actual or expected)<input type="date" name="graduation_date" value="${val("graduation_date")}"></label>
+      ${select("Mandatory internship (zorunlu staj)", "mandatory_internship", yesNo)}
+      ${select("School covers insurance (SGK)", "school_insurance", yesNo)}
+      <label class="f">Available duration (weeks)<input type="number" min="0" max="9999" name="duration_weeks" value="${val("duration_weeks")}"></label>
+      <label class="f">Available period<input name="period" maxlength="1000" value="${val("period")}" placeholder="e.g. June to August"></label>
+      <label class="f">Cities you can work in<input name="cities" maxlength="1000" value="${val("cities")}" placeholder="e.g. Istanbul, Ankara"></label>
+      ${select("Can work remotely", "remote_ok", yesNo)}
+      ${select("English level (CEFR)", "english_level", [["none", "None"], ...levels])}
+      <label class="f">Field or department<input name="department" maxlength="1000" value="${val("department")}"></label>
+      <label class="f span-all">Citizenship or work permit<input name="work_permit" maxlength="1000" value="${val("work_permit")}"></label>
+      <label class="f span-all">Other<textarea name="other" class="ta-sm" maxlength="1000">${val("other")}</textarea></label>
+      <div class="row span-all"><span class="grow"></span><button type="submit" class="btn primary">Save profile</button></div>
+    </form></div>`;
+}
+
 function renderSettings() {
-  if (!AG) { ensureAgents().then(render); return `<div class="page"><div class="head"><div><h1>Settings</h1><p>Looking for AI agents on this computer…</p></div></div></div>`; }
+  const profileForm = eligibilityProfileForm(S.settings.eligibility_profile || {});
+  if (!AG) { ensureAgents().then(render); return `<div class="page"><div class="head"><div><h1>Settings</h1><p>Looking for AI agents on this computer…</p></div></div>${profileForm}</div>`; }
   const st = S.settings, cur = st.agent, sch = S.schedule;
   const usage = (u) => !u.length ? "Not used by Lookout yet" : u.slice(0, 3).map((m) => `${esc(m.model || "default model")}: ${m.today} today, ${m.calls} this week` + (m.blocked_until ? ` · <span class="bad">quota used up until ${m.blocked_until.slice(11, 16)}</span>` : "")).join("<br>");
   const agents = AG.agents.map((a) => `<label class="agent ${a.installed || a.configured ? "" : "off"} ${cur === a.id ? "on" : ""}">
@@ -853,7 +906,8 @@ function renderSettings() {
     <div><small class="muted">launchd (~/Library/LaunchAgents/com.lookout.dailyscan.plist)</small><pre>${esc(schedPreview.launchd_plist || "")}</pre></div>
     ${schedPreview.test_command ? `<div><small class="muted">Self-test command</small><pre>${esc(schedPreview.test_command)}</pre></div>` : ""}
   </div>` : "";
-  return `<div class="page">${renderNotifyErrorsBanner()}<div class="head"><div><h1>Settings</h1><p>Stored only on this computer.</p></div></div>
+  return `<div class="page">${renderNotifyErrorsBanner()}<div class="head"><div><h1>Settings</h1><p>Settings are saved on this computer.</p></div></div>
+    ${profileForm}
     ${AG.browser.installed ? "" : `<div class="banner">${I.warn}<div><b>agent-browser is missing</b><div class="muted fs-13 mt-8">Agents use it to drive a real browser. Install it once in a terminal:</div><div class="cmd mt-8">${esc(AG.browser.install)}</div></div></div>`}
     <div class="h2">AI agent</div><div class="box">${agents}</div>
     <div class="box pad mt-10"><div class="kv">
@@ -996,18 +1050,20 @@ function render() {
 }
 
 const isBusy = () => Boolean(S && (S.progress?.running || S.discovery?.running || S.test_job?.running));
+const eligibilityQuery = () => ui.hideIneligible ? "?eligibility=hide_ineligible" : "";
 let timer = null, wasBusy = false, lastScanDone = 0;
 
 async function pollProgress() {
   clearTimeout(timer);
   try {
-    const p = await api("/api/progress");
+    const p = await api("/api/progress" + eligibilityQuery());
     if (!S) return refresh(true);
     const prevDone = lastScanDone;
     S.progress = p.progress;
     S.discovery = p.discovery;
     S.test_job = p.test_job;
     S.counts = p.counts;
+    S.eligibility_counts = p.eligibility_counts;
     lastScanDone = p.progress?.done || 0;
     const nowBusy = isBusy();
     if (route.view === "scan" && (nowBusy || scanCache[route.id]?.status === "running")) loadScan(route.id);
@@ -1036,7 +1092,7 @@ async function pollProgress() {
 async function refresh(reloadItemsToo = false) {
   clearTimeout(timer);
   try {
-    S = await api("/api/state");
+    S = await api("/api/state" + eligibilityQuery());
     sessionStorage.removeItem("lookout-reauth-ts");
     lastScanDone = S.progress?.done || 0;
     if (S.settings.agent && !modelCache[S.settings.agent]) modelsFor(S.settings.agent).then(() => { render.force = true; render(); }).catch((err) => { if (err?.status === 401 || err?.status === 403) handleAuthFailure(); });
@@ -1044,7 +1100,7 @@ async function refresh(reloadItemsToo = false) {
     const busy = isBusy();
     if (route.view === "scan" && (wasBusy || busy || scanCache[route.id]?.status === "running")) loadScan(route.id);
     if (route.view === "search" && (wasBusy || busy || discCache[route.id]?.status === "running")) loadDiscovery(route.id);
-    if (reloadItemsToo || ((route.view === "feed" || route.view === "watch") && !feedState.loading && (!feedState.initialized || feedState.key !== itemsScopeKey()))) {
+    if (reloadItemsToo || ((route.view === "feed" || route.view === "watch") && feedState.key !== itemsScopeKey())) {
       loadItems(false);
     }
     const typing = document.activeElement && /INPUT|TEXTAREA|SELECT/.test(document.activeElement.tagName) && document.activeElement.id !== "q";
@@ -1100,6 +1156,7 @@ document.addEventListener("click", async (e) => {
     if (d.act === "cancel-disc") { await api("/api/discover/cancel", {}); toast("Stopping search…"); return pollProgress(); }
     if (d.act === "toggle-snoozed") { ui.showSnoozed = !ui.showSnoozed; keep(); reloadActiveItems(); return render(); }
     if (d.act === "toggle-updated") { ui.onlyUpdated = !ui.onlyUpdated; keep(); reloadActiveItems(); return render(); }
+    if (d.act === "toggle-ineligible") { ui.hideIneligible = !ui.hideIneligible; keep(); return refresh(true); }
     if (d.act === "load-more") { return loadItems(true); }
     if (d.act === "close-preview") { await api("/api/sources/test/clear", {}); S.test_job = { id: null, running: false, result: null }; return render(); }
     if (d.act === "cancel-test") { await api("/api/sources/test/cancel", {}); toast("Stopping test…"); return pollProgress(); }
@@ -1250,6 +1307,11 @@ document.addEventListener("input", (e) => {
 document.addEventListener("submit", async (e) => {
   e.preventDefault(); const f = e.target, data = Object.fromEntries(new FormData(f));
   try {
+    if (f.id === "eligibilityForm") {
+      await api("/api/settings", { eligibility_profile: data });
+      toast("Eligibility profile saved");
+      return refresh(true);
+    }
     if (f.id === "addSrc") { await api("/api/sources", data); toast(`Added ${data.name}`); f.reset(); return refresh(false); }
     if (f.id === "addWatchSrc") { await api("/api/sources", { ...data, watch_id: Number(f.dataset.watchId) }); toast(`Added ${data.name}`); f.reset(); return refresh(false); }
     if (f.id === "editSrcForm") {

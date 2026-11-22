@@ -147,6 +147,12 @@ label.f small { font-weight: 400; color: var(--muted); }
 .tag.warn { color: var(--amber); background: rgba(231, 195, 90, .12); }
 .tag.updated { color: var(--amber); background: rgba(231, 195, 90, .16); }
 .tag.muted { color: var(--muted); background: rgba(255, 255, 255, .06); }
+.eligibility-details { margin-top: 8px; font-size: 13px; overflow-wrap: anywhere; }
+.eligibility-details summary { cursor: pointer; }
+.eligibility-details ul { margin: 8px 0 0; padding-inline-start: 20px; }
+.eligibility-details li + li { margin-top: 6px; }
+.eligibility-details blockquote { margin: 3px 0 0; padding-inline-start: 8px; border-inline-start: 2px solid var(--muted); }
+.ag-detail .eligibility-details { grid-column: 1 / -1; }
 .change-note { margin-top: 5px; font-size: 12.5px; color: var(--amber); }
 .load-more { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 14px; padding: 10px 14px; border: 1px solid var(--line-soft); border-radius: var(--r); background: var(--raise); }
 .test-preview { margin-top: 14px; border-color: var(--line); }

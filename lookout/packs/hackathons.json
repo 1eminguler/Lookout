@@ -14,39 +14,29 @@
       "notes": "Open and upcoming hackathons."
     },
     {
-      "name": "Hackathon Finder",
-      "url": "https://hackathon-finder.shetty.me/",
-      "notes": "Aggregated hackathons; verify details with the organiser."
-    },
-    {
-      "name": "HackRadar",
-      "url": "https://www.hackradar.win/",
-      "notes": "Aggregated events with cash prizes; verify details with the organiser."
-    },
-    {
       "name": "OPC Community events",
       "url": "https://www.opc.community/events",
       "notes": "Events including hackathons and demo days."
     },
     {
-      "name": "DevSafar: Devpost",
-      "url": "https://www.devsafar.app/hackathons/on-devpost",
-      "notes": "Devpost events aggregated by DevSafar."
+      "name": "Devfolio",
+      "url": "https://devfolio.co/hackathons",
+      "notes": "Open and upcoming hackathons; each card links to its own page with dates."
     },
     {
-      "name": "DevSafar: Devfolio",
-      "url": "https://www.devsafar.app/hackathons/on-devfolio",
-      "notes": "Devfolio events aggregated by DevSafar."
+      "name": "Unstop hackathons",
+      "url": "https://unstop.com/hackathons",
+      "notes": "Hackathon listings with registration deadlines."
     },
     {
-      "name": "DevSafar: Unstop",
-      "url": "https://www.devsafar.app/hackathons/on-unstop",
-      "notes": "Unstop competitions aggregated by DevSafar."
+      "name": "HackerEarth hackathons",
+      "url": "https://www.hackerearth.com/challenges/hackathon/",
+      "notes": "Live and upcoming hackathons; skip the 'Previous' section."
     },
     {
-      "name": "DevSafar: HackerEarth",
-      "url": "https://www.devsafar.app/hackathons/on-hackerearth",
-      "notes": "HackerEarth events aggregated by DevSafar."
+      "name": "Coderspace events",
+      "url": "https://coderspace.io/etkinlikler",
+      "notes": "Turkish hackathons, bootcamps and tech events; application dates are on each event page."
     }
   ]
 }

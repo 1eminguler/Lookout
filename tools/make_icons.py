@@ -1,4 +1,4 @@
-﻿"""Build the application icons from web/icon.svg using Playwright Chromium."""
+"""Build the application icons from web/icon.svg using Playwright Chromium."""
 import struct
 from pathlib import Path
 

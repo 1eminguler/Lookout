@@ -1354,6 +1354,7 @@ def make_server(port: Optional[int] = None) -> ThreadingHTTPServer:
     global API_TOKEN
     db.init()
     db.mark_interrupted()
+    scanner.expire_stored_items_once()
     scanner.load_plugins()
     token = secrets.token_urlsafe(32)
     API_TOKEN = token

@@ -15,7 +15,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 ROOT = Path(__file__).resolve().parent.parent
 DB_PATH = Path(os.environ.get("LOOKOUT_DATA_DIR") or ROOT / "data") / "lookout.db"
 TS = "%Y-%m-%d %H:%M:%S"
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 _lock = threading.RLock()
 _UNSET = object()
 _TRACKING_EXACT = {"fbclid", "gclid", "mc_cid", "mc_eid"}
@@ -100,6 +100,7 @@ CREATE TABLE IF NOT EXISTS items (
     first_seen TEXT NOT NULL,
     last_seen TEXT NOT NULL,
     notified INTEGER DEFAULT 0,
+    expired INTEGER DEFAULT 0,            -- expiry decision: deadline passed, closed marker or stale year
     action TEXT,                          -- saved | applied | hidden
     note TEXT,
     remind_on TEXT                        -- agenda date chosen by the user
@@ -261,6 +262,10 @@ CREATE INDEX IF NOT EXISTS idx_items_status_match ON items(status, match, first_
 CREATE INDEX IF NOT EXISTS idx_notification_log_channel ON notification_log(channel, id DESC);
 """
 
+MIGRATIONS_V4 = {
+    "items": {"expired": "INTEGER DEFAULT 0"},
+}
+
 
 def _add_columns(c: sqlite3.Connection, spec: Dict[str, Dict[str, str]]) -> None:
     for table, cols in spec.items():
@@ -298,6 +303,9 @@ def init() -> None:
                    )"""
             )
             ver = 3
+        if ver < 4:
+            _add_columns(c, MIGRATIONS_V4)
+            ver = 4
         c.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         c.commit()
 
@@ -492,7 +500,8 @@ DEFAULTS = {
     "custom_command": "", "mail_to": "", "mail_from": "", "smtp_host": "smtp.gmail.com", "smtp_port": "587",
     "smtp_user": "", "smtp_password": "", "smtp_starttls": "auto", "language_hint": "", "verify_weekly": "1",
     "rss_public": "0", "webhook_url": "", "webhook_format": "auto", "webhook_allow_local": "0",
-    "telegram_chat_id": "", "notify_errors_dismissed_id": "0",
+    "telegram_chat_id": "", "notify_errors_dismissed_id": "0", "expired_cleanup_v1": "0",
+    "expired_cleanup_v2": "0",
 }
 
 
@@ -1109,8 +1118,13 @@ def _build_change_summary(reopened: bool, changes: List[Tuple[str, Optional[str]
 
 
 def save_item(scan_id: int, source: Dict[str, Any], it: Dict[str, Any], *,
-              match: Any = _UNSET, match_key: Any = _UNSET, notified: Any = _UNSET) -> bool:
-    """Insert or refresh an item, recording field history. Never resurrects closed items as new."""
+              match: Any = _UNSET, match_key: Any = _UNSET, notified: Any = _UNSET,
+              expired: Any = _UNSET) -> bool:
+    """Insert or refresh an item, recording field history. Never resurrects closed items as new.
+
+    `expired` stores the precomputed expiry decision (scanner._is_expired) for the SQL path; an explicit
+    0 on update clears the flag (e.g. the deadline moved to the future).
+    """
     t = now()
     wid = source.get("watch_id")
     src_id = source.get("id")
@@ -1167,13 +1181,15 @@ def save_item(scan_id: int, source: Dict[str, Any], it: Dict[str, Any], *,
                 new_match = ex.get("match")
                 new_match_key = ex.get("match_key") if match_key is _UNSET else match_key
             new_notified = ex.get("notified", 0) if notified is _UNSET else int(bool(notified))
+            new_expired = int(bool(expired)) if expired is not _UNSET else int(ex.get("expired") or 0)
             c.execute(
                 """UPDATE items SET title=?, org=?, category=?, url=?, deadline=?, start_date=?, location=?,
                    summary=?, extra=?, watch_id=?, status='open', last_scan=?, last_seen=?,
-                   updated_at=?, change_summary=?, last_change_kind=?, match=?, match_key=?, notified=? WHERE id=?""",
+                   updated_at=?, change_summary=?, last_change_kind=?, match=?, match_key=?, notified=?,
+                   expired=? WHERE id=?""",
                 (it["title"], it.get("org"), it.get("category"), it["url"], it.get("deadline"),
                  it.get("start_date"), it.get("location"), it.get("summary"), it.get("extra"), wid, scan_id, t,
-                 updated_at, summary, change_kind, new_match, new_match_key, new_notified, item_id),
+                 updated_at, summary, change_kind, new_match, new_match_key, new_notified, new_expired, item_id),
             )
             c.execute(
                 "INSERT OR REPLACE INTO scan_items(scan_id, item_id, is_new, is_updated) VALUES(?, ?, 0, ?)",
@@ -1186,14 +1202,15 @@ def save_item(scan_id: int, source: Dict[str, Any], it: Dict[str, Any], *,
         ins_match = None if match is _UNSET else match
         ins_match_key = None if match_key is _UNSET else match_key
         ins_notified = 0 if notified is _UNSET else int(bool(notified))
+        ins_expired = 0 if expired is _UNSET else int(bool(expired))
         c.execute(
             """INSERT INTO items(id, source_id, source_name, title, org, category, url, deadline, start_date,
                location, summary, extra, watch_id, first_scan, last_scan, first_seen, last_seen,
-               match, match_key, notified)
-               VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               match, match_key, notified, expired)
+               VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (item_id, src_id, source["name"], it["title"], it.get("org"), it.get("category"),
              it["url"], it.get("deadline"), it.get("start_date"), it.get("location"), it.get("summary"),
-             it.get("extra"), wid, scan_id, scan_id, t, t, ins_match, ins_match_key, ins_notified),
+             it.get("extra"), wid, scan_id, scan_id, t, t, ins_match, ins_match_key, ins_notified, ins_expired),
         )
         c.execute("INSERT OR REPLACE INTO scan_items(scan_id, item_id, is_new, is_updated) VALUES(?, ?, ?, 0)",
                   (scan_id, item_id, 0 if ins_match == 0 else 1))
@@ -1269,6 +1286,7 @@ def _items_where(
     if exclude_applied:
         clauses.append("(i.action IS NULL OR i.action != 'applied')")
     if exclude_expired:
+        clauses.append("COALESCE(i.expired, 0)=0")
         clauses.append(
             "(COALESCE(NULLIF(i.deadline,''), NULLIF(i.start_date,'')) IS NULL "
             "OR COALESCE(NULLIF(i.deadline,''), NULLIF(i.start_date,'')) >= ?)"
@@ -1417,7 +1435,7 @@ def counts() -> Dict[str, Any]:
     recent_cutoff = (datetime.now() - timedelta(hours=72)).strftime(TS)
     with _lock, _conn() as c:
         base_where = (
-            "i.status='open' AND COALESCE(i.match,1)=1 "
+            "i.status='open' AND COALESCE(i.match,1)=1 AND COALESCE(i.expired,0)=0 "
             "AND (i.action IS NULL OR i.action NOT IN ('hidden','applied')) "
             "AND (COALESCE(NULLIF(i.deadline,''), NULLIF(i.start_date,'')) IS NULL "
             "OR COALESCE(NULLIF(i.deadline,''), NULLIF(i.start_date,'')) >= ?)"
@@ -1487,7 +1505,7 @@ def counts() -> Dict[str, Any]:
 def agenda_items() -> List[Dict[str, Any]]:
     return _rows("SELECT i.*, COALESCE(s.watch_id, i.watch_id) AS watch_id "
                  "FROM items i LEFT JOIN sources s ON s.id = i.source_id "
-                 "WHERE i.action IN ('saved', 'applied') ORDER BY i.first_seen DESC")
+                 "WHERE i.action IN ('saved', 'applied') AND COALESCE(i.expired,0)=0 ORDER BY i.first_seen DESC")
 
 
 def watch_feed_items(watch_id: int, limit: int = 100) -> List[Dict[str, Any]]:
@@ -1495,7 +1513,7 @@ def watch_feed_items(watch_id: int, limit: int = 100) -> List[Dict[str, Any]]:
         """SELECT i.*, COALESCE(s.watch_id, i.watch_id) AS watch_id
            FROM items i LEFT JOIN sources s ON s.id = i.source_id
            WHERE COALESCE(s.watch_id, i.watch_id)=?
-           AND i.status='open' AND COALESCE(i.match, 1)=1
+           AND i.status='open' AND COALESCE(i.match, 1)=1 AND COALESCE(i.expired,0)=0
            AND (i.action IS NULL OR i.action != 'hidden')
            ORDER BY COALESCE(i.updated_at, i.first_seen) DESC, i.first_seen DESC
            LIMIT ?""",
@@ -1516,7 +1534,7 @@ def scan_changes(scan_id: int) -> List[Dict[str, Any]]:
     return _rows(
         """SELECT i.*, si.is_new, COALESCE(si.is_updated, 0) AS is_updated
            FROM scan_items si JOIN items i ON i.id = si.item_id
-           WHERE si.scan_id=? AND COALESCE(i.match, 1)=1
+           WHERE si.scan_id=? AND COALESCE(i.match, 1)=1 AND COALESCE(i.expired,0)=0
            AND (si.is_new=1 OR COALESCE(si.is_updated, 0)=1)
            ORDER BY si.is_new DESC, i.first_seen DESC""",
         (scan_id,),
@@ -1533,7 +1551,7 @@ def set_item(item_id: str, **fields) -> bool:
 def unnotified() -> List[Dict[str, Any]]:
     today = now()[:10]
     return _rows("""SELECT * FROM items
-                    WHERE notified=0 AND status='open' AND COALESCE(match,1)=1
+                    WHERE notified=0 AND status='open' AND COALESCE(match,1)=1 AND COALESCE(expired,0)=0
                     AND (action IS NULL OR action!='hidden')
                     AND (snoozed_until IS NULL OR snoozed_until <= ?)""", (today,))
 
@@ -1651,6 +1669,20 @@ def open_items_for_scope(watch_id: Optional[int]) -> List[Dict[str, Any]]:
         "WHERE i.status='open' AND COALESCE(s.watch_id, i.watch_id)=?",
         (watch_id,),
     )
+
+
+def open_items() -> List[Dict[str, Any]]:
+    """Every stored OPEN item, for expiry re-evaluation."""
+    return _rows("SELECT * FROM items WHERE status='open'")
+
+
+def mark_items_expired(ids: Iterable[str]) -> int:
+    """Flags items as expired (keeps them stored and open; nothing is deleted)."""
+    batch = [i for i in ids]
+    if not batch:
+        return 0
+    placeholders = ",".join("?" for _ in batch)
+    return _exec(f"UPDATE items SET expired=1 WHERE id IN ({placeholders})", batch)
 
 
 def open_items_needing_match(key: str, watch_id: Optional[int]) -> List[Dict[str, Any]]:

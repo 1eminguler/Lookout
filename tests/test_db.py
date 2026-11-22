@@ -1005,7 +1005,7 @@ class TestDatabase(LookoutTestCase):
         ])
 
     def test_schema_v3_and_v1_v2_to_v3_baseline_done_migration(self):
-        self.assertEqual(db.SCHEMA_VERSION, 3)
+        self.assertEqual(db.SCHEMA_VERSION, 4)
 
         # v2 -> v3 migration sets baseline_done=1 for sources with prior ok=1 scans or items
         db.DB_PATH.unlink()
@@ -1030,7 +1030,7 @@ class TestDatabase(LookoutTestCase):
 
         db.init()
         with contextlib.closing(db.connect()) as c:
-            self.assertEqual(c.execute("PRAGMA user_version").fetchone()[0], 3)
+            self.assertEqual(c.execute("PRAGMA user_version").fetchone()[0], 4)
             ur_cols = {r[1] for r in c.execute("PRAGMA table_info(url_readers)")}
             self.assertIn("context_hash", ur_cols)
         by_name = {s["name"]: s for s in db.sources()}
@@ -1061,7 +1061,7 @@ class TestDatabase(LookoutTestCase):
 
         db.init()
         with contextlib.closing(db.connect()) as c:
-            self.assertEqual(c.execute("PRAGMA user_version").fetchone()[0], 3)
+            self.assertEqual(c.execute("PRAGMA user_version").fetchone()[0], 4)
         v1_by_name = {s["name"]: s for s in db.sources()}
         self.assertEqual(v1_by_name["V1 Scanned"]["baseline_done"], 1)
         self.assertEqual(v1_by_name["V1 Scanned"]["last_good_extractor"], "def fetch(): return []")

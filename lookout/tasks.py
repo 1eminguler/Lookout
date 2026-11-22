@@ -67,7 +67,13 @@ to every agent-browser command. If you are unsure how it works, run `agent-brows
 Close the browser at the end with `agent-browser --session {session} close`.
 """
 
-LEARN = """# Task: learn how to read one website, and write a small program that reads it
+DEADLINE_GUIDANCE = """When a listing shows a deadline without a year (e.g. "7 Mayıs" or "Nov 13"),
+open that listing's own detail page and take the full deadline date with the year from there.
+Make at most 40 detail requests per run. Return the original yearless deadline text only if no full
+deadline date is available anywhere in the source for that listing. If the detail page cannot be checked, leave
+the deadline null unless you already have the full deadline date."""
+
+LEARN = ("""# Task: learn how to read one website, and write a small program that reads it
 
 {browser}
 Source name: {name}
@@ -86,8 +92,15 @@ site search/filters). Use `agent-browser --session {session} snapshot -i -c`, `r
 
 Write `results.json` early and keep it updated: a JSON array of the listings you can see (up to 200):
 {{"title": str, "org": str or null, "category": short label, "url": absolute link to the item,
-  "deadline": "YYYY-MM-DD" or null, "start_date": "YYYY-MM-DD" or null, "location": str or null,
+  "deadline": "YYYY-MM-DD", original yearless deadline text as a fallback, or null,
+  "start_date": "YYYY-MM-DD" or null, "location": str or null,
   "summary": one short sentence or null}}
+
+Return ONLY listings that are currently open: skip cards marked closed, completed or expired (e.g.
+"Tamamlandı", "Kapandı", "Başvurular sona erdi", "Süresi doldu", "Closed", "Expired",
+"Applications closed").
+
+""" + DEADLINE_GUIDANCE + """
 
 ## Part 2 — write `extractor.py`
 A Python file with a function `fetch()` that returns the same kind of list for ALL current listings in that section
@@ -101,17 +114,21 @@ A Python file with a function `fetch()` that returns the same kind of list for A
   page in a real browser, scrolls, evaluates the JavaScript EXPRESSION `js` (e.g.
   `[...document.querySelectorAll('.job')].map(e => ({{title: e.querySelector('h3').innerText, url: e.querySelector('a').href}}))`)
   and returns its JSON value. Prefer a JSON API with get_json (fastest); use browser_eval for pages that need
-  JavaScript. Fetching detail pages is allowed but keep it under ~40 requests.
+  JavaScript.
+- Follow the deadline detail-page rule above in `fetch()`. Reuse the throttled `get` helper for detail requests
+  and cap them at 40 per run of `fetch()`.
 - Convert dates to YYYY-MM-DD when you can; otherwise leave the raw date string.
+- Only currently open listings go in the output: skip cards marked closed/completed/expired (e.g. "Tamamlandı",
+  "Kapandı", "Closed").
 - If the expected listing section, container, or API structure is missing or changed, raise `RuntimeError("page/API shape changed: ...")` instead of silently returning `[]`. Return `[]` only when the page/API loaded cleanly with zero active listings.
 - If you can run shell commands, test it with `python test_extractor.py` (prints what fetch() returns) and fix it
   until it returns the listings. Make sure the titles and links match what you saw in Part 1.
 
 When done, close the browser: `agent-browser --session {session} close`.
 
-{safety}"""
+{safety}""")
 
-QUICK_READ = """# Task: preview listings on one website (quick check)
+QUICK_READ = ("""# Task: preview listings on one website (quick check)
 
 {browser}
 Source name: {name}
@@ -123,12 +140,18 @@ What the user is interested in (pick the right section/tab if relevant):
 Open the start URL quickly (finish within {minutes} minutes), inspect the visible listings, and write `results.json`
 as a JSON array of up to 40 listings:
 {{"title": str, "org": str or null, "category": short label, "url": absolute link to the item,
-  "deadline": "YYYY-MM-DD" or null, "start_date": "YYYY-MM-DD" or null, "location": str or null,
+  "deadline": "YYYY-MM-DD", original yearless deadline text as a fallback, or null,
+  "start_date": "YYYY-MM-DD" or null, "location": str or null,
   "summary": one short sentence or null}}
+
+Return ONLY listings that are currently open: skip cards marked closed, completed or expired (e.g.
+"Tamamlandı", "Kapandı", "Süresi doldu", "Closed", "Expired").
+
+""" + DEADLINE_GUIDANCE + """
 
 Do NOT write extractor.py. Close the browser when done: `agent-browser --session {session} close`.
 
-{safety}"""
+{safety}""")
 
 CLASSIFY = """# Task: decide which items match the user's filters
 

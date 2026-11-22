@@ -193,33 +193,86 @@ def _clean_url(url: str) -> str:
     return urllib.parse.urlunsplit((parts.scheme, parts.netloc, parts.path, urllib.parse.urlencode(kept), parts.fragment))
 
 
-def parse_date(v: Any) -> Optional[str]:
+YEARLESS_FUTURE_DAYS = 60
+
+
+def _closest_iso_date(year: int, month: int, day: int, today: date) -> Optional[str]:
+    """Year for a yearless date: the most recent occurrence on or before today, unless the next
+    occurrence is within YEARLESS_FUTURE_DAYS days. Picking "closest to today" would push any date
+    more than ~6 months back into next year, resurfacing long-closed listings as open."""
+    latest: Optional[date] = None
+    nxt: Optional[date] = None
+    for y in (year - 1, year, year + 1):
+        try:
+            cand = date(y, month, day)
+        except ValueError:
+            continue
+        if cand <= today:
+            if latest is None or cand > latest:
+                latest = cand
+        elif nxt is None or cand < nxt:
+            nxt = cand
+    if nxt is not None and (nxt - today).days <= YEARLESS_FUTURE_DAYS:
+        return nxt.isoformat()
+    if latest is not None:
+        return latest.isoformat()
+    return nxt.isoformat() if nxt else None
+
+
+def _parse_date_value(v: Any, today: Optional[date]) -> Tuple[Optional[str], bool]:
+    """Parses a raw date text into (ISO date, year_was_inferred). The year counts as inferred when
+    the text only had a day + month ("13 Kasım", "Nov 13", "13.11") and the year was picked for it."""
     if not v:
-        return None
+        return None, False
     s = str(v).strip().replace("İ", "i").lower()
     try:
         if m := re.search(r"(\d{4})-(\d{1,2})-(\d{1,2})", s):
-            return date(int(m[1]), int(m[2]), int(m[3])).isoformat()
+            return date(int(m[1]), int(m[2]), int(m[3])).isoformat(), False
         if m := re.search(r"(\d{1,2})[./](\d{1,2})[./](\d{4})", s):
-            return date(int(m[3]), int(m[2]), int(m[1])).isoformat()
+            return date(int(m[3]), int(m[2]), int(m[1])).isoformat(), False
         if m := re.search(r"(\d{1,2})\s+([a-zçğıöşü]{3})[a-zçğıöşü]*\.?,?\s+(\d{4})", s):
             if m[2] in MONTHS:
-                return date(int(m[3]), MONTHS[m[2]], int(m[1])).isoformat()
+                return date(int(m[3]), MONTHS[m[2]], int(m[1])).isoformat(), False
         if m := re.search(r"([a-zçğıöşü]{3})[a-zçğıöşü]*\.?\s+(\d{1,2}),?\s+(\d{4})", s):
             if m[1] in MONTHS:
-                return date(int(m[3]), MONTHS[m[1]], int(m[2])).isoformat()
+                return date(int(m[3]), MONTHS[m[1]], int(m[2])).isoformat(), False
+        # Day + month without a year ("13 Kasım", "Nov 13", "13.11"): pick the year with the
+        # past-biased rule (see _closest_iso_date).
+        today = today or date.today()
+        if m := re.search(r"(?<!\d)(\d{1,2})\s+([a-zçğıöşü]{3})[a-zçğıöşü]*\.?", s):
+            if m[2] in MONTHS:
+                return _closest_iso_date(today.year, MONTHS[m[2]], int(m[1]), today), True
+        if m := re.search(r"([a-zçğıöşü]{3})[a-zçğıöşü]*\.?\s+(\d{1,2})(?!\d)", s):
+            if m[1] in MONTHS:
+                return _closest_iso_date(today.year, MONTHS[m[1]], int(m[2]), today), True
+        if m := re.search(r"(?<!\d)(\d{1,2})[./](\d{1,2})(?!\d)", s):
+            a, b = int(m[1]), int(m[2])
+            if 1 <= b <= 12 and 1 <= a <= 31:
+                return _closest_iso_date(today.year, b, a, today), True
+            if 1 <= a <= 12 and 1 <= b <= 31:
+                return _closest_iso_date(today.year, a, b, today), True
     except ValueError:
-        return None
-    return None
+        return None, False
+    return None, False
 
 
-def normalise(raw: Dict[str, Any], source: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+def parse_date(v: Any, today: Optional[date] = None) -> Optional[str]:
+    return _parse_date_value(v, today)[0]
+
+
+def normalise(raw: Dict[str, Any], source: Dict[str, Any], today: Optional[date] = None) -> Optional[Dict[str, Any]]:
     title = clean(raw.get("title"), 160)
     url = str(raw.get("url") or "").strip()
     if not title or not re.match(r"^https?://", url, re.I):
         return None
     url = _clean_url(url)
     extra = raw.get("extra")
+    deadline, deadline_inferred = _parse_date_value(raw.get("deadline"), today)
+    start_date, _ = _parse_date_value(raw.get("start_date"), today)
+    if deadline_inferred:
+        # Remember that the deadline year was guessed from a yearless date.
+        extra = dict(extra) if isinstance(extra, dict) else {}
+        extra["deadline_inferred"] = True
     src_key = f"src:{source['id']}" if source.get("id") is not None else source["name"]
     item_key = db.canonical_reader_url(url)
     list_key = db.canonical_reader_url(source.get("url") or "")
@@ -235,11 +288,12 @@ def normalise(raw: Dict[str, Any], source: Dict[str, Any]) -> Optional[Dict[str,
         "org": blank_to_none(clean(raw.get("org") or raw.get("company"), 100)),
         "category": blank_to_none(clean(raw.get("category") or raw.get("type"), 40)),
         "url": url,
-        "deadline": parse_date(raw.get("deadline")),
-        "start_date": parse_date(raw.get("start_date")),
+        "deadline": deadline,
+        "start_date": start_date,
         "location": blank_to_none(clean(raw.get("location"), 80)),
         "summary": blank_to_none(clean(raw.get("summary") or raw.get("description"), 400)),
         "extra": json.dumps(extra, ensure_ascii=False)[:2000] if isinstance(extra, dict) and extra else None,
+        "closed": bool(raw.get("closed")) or _tr_lower(raw.get("status")) == "closed",
     }
 
 
@@ -247,9 +301,53 @@ def _tr_lower(v: Any) -> str:
     return str(v or "").replace("İ", "i").replace("I\u0307", "i").lower()
 
 
-def _is_expired(item: Dict[str, Any]) -> bool:
+_CLOSED_MARKER_RE = re.compile(
+    r"(?<!\w)(?:tamamlandı|tamamlandi|kapandı|kapandi|başvurular sona erdi|başvuru süresi doldu|süresi doldu|"
+    r"closed|expired|no longer accepting|applications closed)(?!\w)",
+)
+_STALE_YEAR_RE = re.compile(r"(?<!\d)(20\d{2})(?!\d)")
+
+
+def _deadline_was_inferred(item: Dict[str, Any]) -> bool:
+    """True when the deadline year was guessed from a yearless date (flag stored in the extra JSON)."""
+    raw = item.get("extra")
+    if isinstance(raw, dict):
+        return bool(raw.get("deadline_inferred"))
+    if isinstance(raw, str) and raw.strip():
+        try:
+            data = json.loads(raw)
+        except ValueError:
+            return False
+        return isinstance(data, dict) and bool(data.get("deadline_inferred"))
+    return False
+
+
+def _stale_years(item: Dict[str, Any], today: date) -> bool:
+    """Every year mentioned in the title or URL (2000-2099) is before the current year. Trusted for
+    items with no deadline at all, and for items whose deadline year was only guessed from a
+    yearless date: old years in the text beat a guessed deadline, but not one written out in full."""
+    if item.get("deadline"):
+        if not _deadline_was_inferred(item):
+            return False
+    elif item.get("start_date"):
+        return False
+    years = [int(m) for m in _STALE_YEAR_RE.findall(f"{item.get('title') or ''} {item.get('url') or ''}")]
+    return bool(years) and max(years) < today.year
+
+
+def _is_expired(item: Dict[str, Any], today: Optional[date] = None) -> bool:
+    """Deadline passed, reader-reported closed state, a closed marker in the text, or stale years
+    (for items with no deadline at all or only a guessed deadline year)."""
+    today = today or date.today()
     dl = item.get("deadline")
-    return bool(dl and dl < date.today().isoformat())
+    if dl and dl < today.isoformat():
+        return True
+    if item.get("closed") or _tr_lower(item.get("status")) == "closed":
+        return True
+    text = _tr_lower(" ".join(str(item.get(k) or "") for k in ("title", "summary", "category", "extra")))
+    if _CLOSED_MARKER_RE.search(text):
+        return True
+    return _stale_years(item, today)
 
 
 def passes(item: Dict[str, Any], fs: List[Dict[str, Any]]) -> bool:
@@ -271,6 +369,25 @@ def passes(item: Dict[str, Any], fs: List[Dict[str, Any]]) -> bool:
             if dl > (date.today() + timedelta(days=int(v))).isoformat():
                 return False
     return True
+
+
+def expire_stored_items() -> int:
+    """Re-evaluates every stored OPEN item with the current expiry rules; marks expired ones, deletes nothing."""
+    today = date.today()
+    ids = [r["id"] for r in db.open_items() if _is_expired(r, today=today)]
+    db.mark_items_expired(ids)
+    return len(ids)
+
+
+def expire_stored_items_once() -> int:
+    """One-time startup pass (guarded by a settings flag) so an existing feed is cleaned without a new scan.
+    Guarded by expired_cleanup_v2: v1 already ran on machines with the old year rule, so those items
+    must be re-evaluated with the current rules once."""
+    if db.get_settings().get("expired_cleanup_v2") == "1":
+        return 0
+    n = expire_stored_items()
+    db.set_settings({"expired_cleanup_v2": "1"})
+    return n
 
 
 # ---------- failure classification, anomaly detection & verification ----------
@@ -367,8 +484,22 @@ def detect_anomaly(items: List[Dict[str, Any]], prev_stats: Optional[Dict[str, A
     return None
 
 
+def reader_expired_share(raw_items: List[Any], source: Optional[Dict[str, Any]] = None,
+                         today: Optional[date] = None) -> float:
+    """Share of a reader's raw items that come out expired after normalisation (0 when nothing is checkable)."""
+    checked = expired = 0
+    for r in raw_items or []:
+        it = normalise(r, source or {"name": "reader"}, today=today) if isinstance(r, dict) else None
+        if not it:
+            continue
+        checked += 1
+        expired += int(_is_expired(it, today=today))
+    return expired / checked if checked else 0.0
+
+
 def verify_reader_output(agent_items: List[Dict[str, Any]], code_items: List[Dict[str, Any]],
-                       prev_stats: Optional[Dict[str, Any]] = None) -> Tuple[bool, str]:
+                       prev_stats: Optional[Dict[str, Any]] = None, source: Optional[Dict[str, Any]] = None,
+                       today: Optional[date] = None) -> Tuple[bool, str]:
     """Stronger verification of learned extractor output beyond simple title/URL overlap."""
     if not agent_items:
         return False, "agent returned 0 items (unverified)"
@@ -395,6 +526,8 @@ def verify_reader_output(agent_items: List[Dict[str, Any]], code_items: List[Dic
     if prev_stats and int(prev_stats.get("count") or 0) >= 8 and len(agent_items) >= 5:
         if len(code_items) < int(prev_stats["count"]) * 0.25:
             return False, f"code dropped severely vs history ({len(code_items)} vs {prev_stats['count']})"
+    if reader_expired_share(code_items, source=source, today=today) > 0.5:
+        return False, "returns closed listings"
     return True, ""
 
 
@@ -727,7 +860,7 @@ def read_agent_source(source: Dict[str, Any], fs: List[Dict[str, Any]], force_le
         if code:
             try:
                 got = extractors.run(code, tag="scan", cancel_event=_cancel_event)
-                ok, reason = verify_reader_output(seen, got, prev_stats=prev_stats)
+                ok, reason = verify_reader_output(seen, got, prev_stats=prev_stats, source=source)
                 if ok:
                     ts = db.now()
                     stats_json = json.dumps(compute_item_stats(got), ensure_ascii=False)
@@ -951,13 +1084,15 @@ def _scan_one(scan_id: int, source: Dict[str, Any], fs: List[Dict[str, Any]], pl
             if not it or it["id"] in seen:
                 continue
             seen.add(it["id"])
+            expired = int(_is_expired(it))
             if passes(it, fs):
                 count += 1
-                new += int(db.save_item(scan_id, source, it, notified=1 if is_baseline else db._UNSET))
-            elif not _is_expired(it):
+                new += int(db.save_item(scan_id, source, it, expired=expired,
+                                        notified=1 if is_baseline else db._UNSET))
+            elif not expired:
                 db.save_item(
                     scan_id, source, it,
-                    match=0, match_key="det_excluded",
+                    match=0, match_key="det_excluded", expired=expired,
                     notified=1 if is_baseline else db._UNSET,
                 )
         db.mark_gone(source, scan_id)
@@ -1287,6 +1422,7 @@ def _run_scan_body(trigger: str, only: Optional[List[int]], watch_id: Optional[i
         note = "" if all_srcs else "No active sources" + ("" if settings["agent"] else " (no agent selected)")
         cancelled = progress["cancel"] or _cancel_event.is_set()
         if not cancelled:
+            expire_stored_items()
             watch_ids = [s.get("watch_id") for s in all_srcs] if all_srcs else []
             note = apply_semantic_filters(scan_id, global_fs, watch_fs_map, watch_ids) or note
         final_status = "cancelled" if (cancelled or progress["cancel"] or _cancel_event.is_set()) else "done"

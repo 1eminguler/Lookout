@@ -1,4 +1,4 @@
-<p align="center"><img src="docs/banner.png" alt="Lookout watches websites for opportunities, products, and events" width="100%"></p>
+<p align="center"><img src="docs/banner-2026.png" alt="Lookout watches websites for opportunities, products, and events" width="100%"></p>
 
 Lookout is a local web monitor that uses your coding-agent CLI to learn sites and collect matching updates.
 

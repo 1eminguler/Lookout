@@ -422,9 +422,17 @@ def _learn_backoff_until(learn_fail_count: int) -> str:
     return (datetime.now() + timedelta(minutes=minutes)).strftime(db.TS)
 
 
-def _confirmed_empty(items: List[Dict[str, Any]]) -> bool:
-    return (len(items) == 1 and isinstance(items[0], dict)
-            and items[0].keys() == {"empty"} and items[0]["empty"] is True)
+def _confirmed_empty(items: List[Dict[str, Any]], code: Optional[str] = None) -> bool:
+    if (
+        len(items) == 1
+        and isinstance(items[0], dict)
+        and items[0].get("empty") is True
+        and set(items[0].keys()) <= {"empty", "empty_reason", "reason"}
+    ):
+        return True
+    if not items and code and re.search(r"(?m)^\s*EMPTY_OK\s*=\s*True\b", code):
+        return True
+    return False
 
 
 def _url_pattern(url: str) -> str:
@@ -504,11 +512,19 @@ def reader_expired_share(raw_items: List[Any], source: Optional[Dict[str, Any]] 
 
 def verify_reader_output(agent_items: List[Dict[str, Any]], code_items: List[Dict[str, Any]],
                        prev_stats: Optional[Dict[str, Any]] = None, source: Optional[Dict[str, Any]] = None,
-                       today: Optional[date] = None) -> Tuple[bool, str]:
+                       today: Optional[date] = None, empty_reason: Optional[str] = None,
+                       code: Optional[str] = None) -> Tuple[bool, str]:
     """Stronger verification of learned extractor output beyond simple title/URL overlap."""
+    clean_reason = str(empty_reason or "").strip()
     if not agent_items:
+        if clean_reason:
+            if _confirmed_empty(code_items, code=code):
+                return True, ""
+            if not code_items:
+                return False, "reader returned [] without explicit empty marker"
+            return False, f"code found {len(code_items)} items, agent reported empty ({clean_reason[:120]})"
         return False, "agent returned 0 items (unverified)"
-    if not code_items:
+    if not code_items or _confirmed_empty(code_items, code=code):
         return False, f"code found 0 items, agent saw {len(agent_items)}"
     if extractors.agrees(agent_items, code_items) is not True:
         return False, f"code found {len(code_items)} items, agent saw {len(agent_items)}"
@@ -678,7 +694,7 @@ def read_agent_source(source: Dict[str, Any], fs: List[Dict[str, Any]], force_le
     if source.get("extractor") and source.get("extractor_ok") and not force_learn:
         try:
             items = _run_fast_reader(source, source["extractor"])
-            confirmed_empty = _confirmed_empty(items)
+            confirmed_empty = _confirmed_empty(items, code=source["extractor"])
             listings = [] if confirmed_empty else items
             _check_structural_sanity(listings)
             cur_stats = compute_item_stats(listings)
@@ -703,6 +719,8 @@ def read_agent_source(source: Dict[str, Any], fs: List[Dict[str, Any]], force_le
                             "learn_retry_after": None,
                             "paused": 0,
                         }
+                        if listings and source.get("empty_reason"):
+                            upd_kw["empty_reason"] = None
                         if not filters_stale:
                             upd_kw["filter_hash"] = f_hash
                             upd_kw["filters_changed"] = 0
@@ -731,6 +749,8 @@ def read_agent_source(source: Dict[str, Any], fs: List[Dict[str, Any]], force_le
                         "learn_retry_after": None,
                         "paused": 0,
                     }
+                    if listings and source.get("empty_reason"):
+                        upd_kw["empty_reason"] = None
                     if not filters_stale:
                         upd_kw["filter_hash"] = f_hash
                         upd_kw["filters_changed"] = 0
@@ -859,13 +879,20 @@ def read_agent_source(source: Dict[str, Any], fs: List[Dict[str, Any]], force_le
                 progress["learning_done"] = int(progress.get("learning_done") or 0) + 1
 
         seen, code = learned["items"], learned["code"]
+        empty_reason = str(learned.get("empty_reason") or "").strip() or None
         if code:
             try:
                 got = extractors.run(code, tag="scan", cancel_event=_cancel_event)
-                ok, reason = verify_reader_output(seen, got, prev_stats=prev_stats, source=source)
+                ok, reason = verify_reader_output(
+                    seen, got, prev_stats=prev_stats, source=source,
+                    empty_reason=empty_reason, code=code,
+                )
                 if ok:
                     ts = db.now()
-                    stats_json = json.dumps(compute_item_stats(got), ensure_ascii=False)
+                    confirmed_empty = _confirmed_empty(got, code=code)
+                    listings = [] if confirmed_empty else got
+                    stored_reason = empty_reason[:300] if (confirmed_empty and empty_reason) else None
+                    stats_json = json.dumps(compute_item_stats(listings), ensure_ascii=False)
                     if sid is not None:
                         db.update_source(
                             sid,
@@ -885,12 +912,17 @@ def read_agent_source(source: Dict[str, Any], fs: List[Dict[str, Any]], force_le
                             paused=0,
                             filter_hash=f_hash,
                             filters_changed=0,
+                            empty_reason=stored_reason,
+                            empty_read_count=0,
                         )
                     db.save_shared_reader(
                         source["url"], code, ok=True, stats=stats_json, updated=ts,
-                        propagate=True, notes=notes, fs=fs,
+                        propagate=True, notes=notes, fs=fs, empty_reason=stored_reason,
                     )
                     _bump_url_gen(source["url"], notes=notes, fs=fs)
+                    if confirmed_empty:
+                        db.close_source_items(source, scan_id=progress.get("scan_id"))
+                        return got if got else [{"empty": True}]
                     return got
                 err_msg = f"{reason}; keeping previous reader" if prev_good else reason
                 _record_learn_failure(sid, source, err_msg, prev_good, weekly_fallback_items, candidate_code=code)

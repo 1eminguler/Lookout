@@ -98,6 +98,22 @@ assert.match(context.itemCard(unparsed, {isNew: false}), /title="To be announced
 assert.match(context.agRow(unparsed), /Deadline text: To be announced/);
 """)
 
+    @unittest.skipUnless(shutil.which("node"), "Node.js is not installed")
+    def test_empty_reason_renders_in_sources_and_watch(self):
+        self.run_render_assertions(r"""
+const src = {
+  id: 7, name: "Grants Portal", url: "https://grants.example.com", method: "agent",
+  active: 1, extractor_ok: 1, has_extractor: true,
+  empty_reason: "all 181 cards show 'Başvurular Tamamlandı' <closed>",
+  last: {ok: 1, count: 0, error: "", scan_id: 3},
+};
+context.src = src;
+vm.runInContext("S = {progress: {running: false}, watches: [], sources: [src], test_job: null}", context);
+const rowHtml = context.sourceRow(src);
+assert.match(rowHtml, /Empty listing: all 181 cards show &#39;Başvurular Tamamlandı&#39; &lt;closed&gt;/);
+assert.match(context.renderSources(), /Empty listing: all 181 cards show &#39;Başvurular Tamamlandı&#39; &lt;closed&gt;/);
+""")
+
 
 class UiSmokeTests(TempLookoutTestCase):
     def test_auth_views_pagination_inline_edits_csp_and_401_reload(self):

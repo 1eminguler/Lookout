@@ -30,6 +30,7 @@ CLAUDE_TASK_TOOLS: Dict[str, List[str]] = {
     "quick_read": ["Bash(agent-browser:*)", "Bash(agent-browser *)", "Read", "Write"],
     "learn": [
         "Bash(agent-browser:*)", "Bash(agent-browser *)",
+        "Bash(python check_reader.py)", "Bash(python3 check_reader.py)",
         "Bash(python test_extractor.py)", "Bash(python3 test_extractor.py)",
         "Read", "Write", "Edit", "WebFetch",
     ],
@@ -39,6 +40,7 @@ CLAUDE_TASK_TOOLS: Dict[str, List[str]] = {
     ],
     "default": [
         "Bash(agent-browser:*)", "Bash(agent-browser *)",
+        "Bash(python check_reader.py)", "Bash(python3 check_reader.py)",
         "Bash(python test_extractor.py)", "Bash(python3 test_extractor.py)",
         "Read", "Write", "Edit", "WebSearch", "WebFetch",
     ],

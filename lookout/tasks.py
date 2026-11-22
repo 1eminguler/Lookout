@@ -1,13 +1,13 @@
-"""Agent jobs: scan one source with the user's filters, or discover new sources from a description."""
+"""Agent jobs: learn a source reader, classify items against filters, and discover sources + watch filters."""
 import json
 import re
 import shutil
 import tempfile
 import threading
+import urllib.parse
 import uuid
-from datetime import date
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from lookout import agents, db
 
@@ -81,22 +81,22 @@ or false (does not). Judge from title, organisation, category, location, dates a
 not enough to rule an item out, prefer true. Do not browse the web. Do not create any other file.
 """
 
-DISCOVER = """# Task: find good sources (websites) to monitor
+DISCOVER = """# Task: find good sources (websites) and watch filters for a request
 
 {browser}
 The user wants to monitor the web for the following, in their own words:
 \"\"\"{request}\"\"\"
 
-Their standing filters, for context:
+Their global standing filters, for context:
 {filters}
 
 Sources they already have (do not suggest these again):
 {existing}
 
 ## Time
-You have about {minutes} minutes in total. Spend at most 2 minutes on any one candidate. Write `title.txt` and an
-initial `sources.json` (even `[]`) in the first minute, then REWRITE `sources.json` every time you confirm a new
-source, so nothing is lost if you run out of time.
+You have about {minutes} minutes in total. Spend at most 2 minutes on any one candidate. Write `title.txt`,
+`filters.json`, and an initial `sources.json` (even `[]`) in the first minute, then REWRITE `sources.json` every time
+you confirm a new source, so nothing is lost if you run out of time.
 
 ## Steps
 1. Find candidates. If your own tools include a web search, use it first (several different queries, in the user's
@@ -110,9 +110,13 @@ source, so nothing is lost if you run out of time.
 4. `sources.json` is a JSON array of 3 to 12 objects:
    {{"name": short name, "url": the listing page itself (not the home page), "why": one sentence,
      "notes": tips for scanning it later (which filter/tab to use, where dates are), "sample": one item title you saw}}
-5. `title.txt` holds a 2-5 word title for the request, in the same language the user wrote in, no quotes, no trailing
+5. `filters.json` is a JSON array of 2 to 6 filter objects turning the user's request into concrete watch filters so
+   unrelated items (such as panels, summits, or unrelated roles) are excluded. Allowed `kind` values:
+   `include`, `exclude`, `type`, `location`, `deadline_within` (positive integer string), `instruction`.
+   Example: `[{{"kind": "type", "value": "internships"}}, {{"kind": "include", "value": "computer engineering, software"}}, {{"kind": "location", "value": "Türkiye or remote"}}, {{"kind": "exclude", "value": "panel, summit, senior"}}]`
+6. `title.txt` holds a 2-5 word title for the request, in the same language the user wrote in, no quotes, no trailing
    period (for example: Bilgisayar mühendisliği staj).
-6. Stop when you have about 8 good sources or when time is nearly up.
+7. Stop when you have about 8 good sources or when time is nearly up.
 
 {safety}"""
 
@@ -130,38 +134,68 @@ def _session(name: str) -> str:
     return "lookout-" + (re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")[:28] or "src")
 
 
+def _parse_json_output(txt: str, name: str) -> Any:
+    if not txt:
+        return None
+    try:
+        parsed = json.loads(txt)
+    except json.JSONDecodeError:
+        a, b = txt.find("["), txt.rfind("]")
+        oa, ob = txt.find("{"), txt.rfind("}")
+        if oa >= 0 and (a < 0 or oa < a):
+            try:
+                parsed = json.loads(txt[oa:ob + 1])
+            except json.JSONDecodeError:
+                parsed = None
+        else:
+            parsed = None
+        if parsed is None and a >= 0 and b > a:
+            try:
+                parsed = json.loads(txt[a:b + 1])
+            except json.JSONDecodeError:
+                parsed = None
+    stem = Path(name).stem
+    if isinstance(parsed, dict) and isinstance(parsed.get(stem), list):
+        return parsed[stem]
+    return parsed
+
+
 def _run_agent(task_text: str, outputs: List[str], timeout: int, settings: Dict[str, str],
-               extras: Dict[str, str] = None, raw: List[str] = ()) -> Dict[str, Any]:
+               extras: Optional[Dict[str, str]] = None, raw: List[str] = (), tag: Optional[str] = None,
+               session: Optional[str] = None, cancel_event: Optional[threading.Event] = None) -> Dict[str, Any]:
     agent_id, model = settings["agent"], settings["model"]
     if not agent_id:
         raise RuntimeError("No AI agent selected (Settings → Agent)")
     work = WORK / uuid.uuid4().hex[:10]
     work.mkdir(parents=True, exist_ok=True)
     try:
-        header = f"Working folder: {work}" + chr(10) + "Read and write every file named below inside this folder." + chr(10) * 2
+        header = f"Working folder: {work}\nRead and write every file named below inside this folder.\n\n"
         (work / "TASK.md").write_text(header + task_text, encoding="utf-8")
         for name, content in (extras or {}).items():
             (work / name).write_text(content, encoding="utf-8")
-        with _slots:
-            log = agents.run_task(agent_id, model, work, timeout)
+        acquired = False
+        while not acquired:
+            if cancel_event and cancel_event.is_set():
+                raise agents.CancelledError("cancelled")
+            acquired = _slots.acquire(timeout=0.2)
+        try:
+            log = agents.run_task(agent_id, model, work, timeout, tag=tag, session=session, cancel_event=cancel_event)
+        finally:
+            _slots.release()
         files = {}
         for name in outputs:
             p = work / name
             if p.exists():
                 txt = p.read_text(encoding="utf-8", errors="replace").strip()
-                start = txt.find("[" if name != "recipe.json" else "{")
-                end = txt.rfind("]" if name != "recipe.json" else "}")
-                try:
-                    files[name] = json.loads(txt[start:end + 1]) if start >= 0 else None
-                except json.JSONDecodeError:
-                    files[name] = None
+                files[name] = _parse_json_output(txt, name)
         texts = {n: (work / n).read_text(encoding="utf-8", errors="replace") for n in raw if (work / n).exists()}
         return {"files": files, "raw": texts, "log": log[-1500:]}
     finally:
         shutil.rmtree(work, ignore_errors=True)
 
 
-def learn_source(source: Dict[str, Any], fs: List[Dict[str, Any]]) -> Dict[str, Any]:
+def learn_source(source: Dict[str, Any], fs: List[Dict[str, Any]],
+                 cancel_event: Optional[threading.Event] = None) -> Dict[str, Any]:
     """Agent browses the site, returns what it saw and the extractor code it wrote."""
     from lookout import extractors
     s = db.get_settings()
@@ -178,24 +212,34 @@ def learn_source(source: Dict[str, Any], fs: List[Dict[str, Any]]) -> Dict[str, 
         filters=describe_filters(fs), minutes=minutes - 1, session=session, safety=SAFETY)
     extras = {"test_extractor.py": extractors.RUNNER.replace("sys.argv[1]", "'.'"),
               "lookout_extract.py": Path(extractors.__file__).with_name("lookout_extract.py").read_text(encoding="utf-8")}
-    out = _run_agent(text, ["results.json"], minutes * 60, s, extras=extras, raw=["extractor.py"])
-    items = out["files"].get("results.json") or []
+    out = _run_agent(text, ["results.json"], minutes * 60, s, extras=extras, raw=["extractor.py"],
+                     tag="scan", session=session, cancel_event=cancel_event)
+    items = out["files"].get("results.json")
+    if not isinstance(items, list):
+        items = []
     return {"items": [i for i in items if isinstance(i, dict)], "code": out["raw"].get("extractor.py"),
             "log": out["log"]}
 
 
-def classify(items: List[Dict[str, Any]], fs: List[Dict[str, Any]]) -> Dict[str, bool]:
+def classify(items: List[Dict[str, Any]], fs: List[Dict[str, Any]],
+             cancel_event: Optional[threading.Event] = None) -> Dict[str, bool]:
     """One agent call (no browsing) that applies the user's filters to new items."""
     s = db.get_settings()
     slim = [{k: i.get(k) for k in ("id", "title", "org", "category", "location", "deadline", "start_date", "summary")}
             for i in items]
     out = _run_agent(CLASSIFY.format(filters=describe_filters(fs)), [], 300, s,
-                     extras={"items.json": json.dumps(slim, ensure_ascii=False)}, raw=["decisions.json"])
+                     extras={"items.json": json.dumps(slim, ensure_ascii=False)}, raw=["decisions.json"],
+                     tag="scan", cancel_event=cancel_event)
     txt = out["raw"].get("decisions.json") or ""
     a, b = txt.find("{"), txt.rfind("}")
-    if a < 0:
+    if a < 0 or b <= a:
         raise RuntimeError("The agent did not write decisions.json")
-    data = json.loads(txt[a:b + 1])
+    try:
+        data = json.loads(txt[a:b + 1])
+    except json.JSONDecodeError:
+        raise RuntimeError("The agent wrote invalid decisions.json") from None
+    if not isinstance(data, dict):
+        raise RuntimeError("The agent wrote invalid decisions.json")
     return {str(k): bool(v) for k, v in data.items()}
 
 
@@ -227,23 +271,66 @@ def quick_title(request: str) -> str:
     return title[0].upper() + title[1:]
 
 
-def discover_sources(request: str) -> Dict[str, Any]:
+def _clean_sources(found: Any) -> List[Dict[str, str]]:
+    if not isinstance(found, list):
+        return []
+    out: List[Dict[str, str]] = []
+    for x in found:
+        if not isinstance(x, dict):
+            continue
+        url = str(x.get("url") or "").strip()
+        if not re.match(r"^https?://", url, re.I):
+            continue
+        name = str(x.get("name") or "").strip() or (urllib.parse.urlparse(url).netloc or "Website")
+        out.append({
+            "name": name[:80],
+            "url": url[:500],
+            "why": str(x.get("why") or "").strip()[:300],
+            "notes": str(x.get("notes") or "").strip()[:1000],
+            "sample": str(x.get("sample") or "").strip()[:200],
+        })
+    return out
+
+
+def _clean_filters(raw_filters: Any) -> List[Dict[str, str]]:
+    if not isinstance(raw_filters, list):
+        return []
+    out: List[Dict[str, str]] = []
+    for f in raw_filters:
+        if not isinstance(f, dict):
+            continue
+        kind = str(f.get("kind") or "").strip()
+        val = str(f.get("value") or "").strip()[:500]
+        if kind not in db.FILTER_KINDS or not val:
+            continue
+        if kind == "deadline_within" and (not val.isdigit() or int(val) <= 0):
+            continue
+        out.append({"kind": kind, "value": val})
+    return out
+
+
+def discover_sources(request: str, existing: Optional[List[Dict[str, Any]]] = None,
+                     cancel_event: Optional[threading.Event] = None,
+                     session: Optional[str] = None) -> Dict[str, Any]:
     s = db.get_settings()
     # Searching and checking several sites takes longer than reading one.
     minutes = max(8, int(s.get("agent_timeout_min") or 12) + 4)
-    existing = "\n".join(f"- {x['name']}: {x['url']}" for x in db.sources()) or "- none"
-    text = DISCOVER.format(browser=BROWSER.format(session="lookout-discover", headed=" --headed" if s.get("headed") == "1"
-                                                  else ""),
-                           request=request.strip()[:2000], filters=describe_filters(db.filters(True)),
-                           existing=existing, safety=SAFETY, minutes=minutes - 1)
-    out = _run_agent(text, ["sources.json"], minutes * 60, s, raw=["title.txt"])
+    cur_sources = db.sources() if existing is None else existing
+    existing_txt = "\n".join(f"- {x['name']}: {x['url']}" for x in cur_sources) or "- none"
+    sess = session or "lookout-discover"
+    text = DISCOVER.format(browser=BROWSER.format(session=sess, headed=" --headed" if s.get("headed") == "1" else ""),
+                           request=request.strip()[:2000], filters=describe_filters(db.filters(True, watch_id=None)),
+                           existing=existing_txt, safety=SAFETY, minutes=minutes - 1)
+    out = _run_agent(text, ["sources.json", "filters.json"], minutes * 60, s, raw=["title.txt"],
+                     tag="discover", session=sess, cancel_event=cancel_event)
     found = out["files"].get("sources.json")
-    if found is None:
+    if not isinstance(found, list):
         raise RuntimeError("The agent did not return any sources. " + out["log"][-200:].strip())
     lines = (out["raw"].get("title.txt") or "").strip().splitlines()
     raw_title = lines[0].strip().strip("\"'`«»“”‘’").rstrip(".!?;:") if lines else ""
     title = re.sub(r"\s+", " ", raw_title).strip()[:60] or None
     return {
-        "sources": [x for x in found if isinstance(x, dict) and str(x.get("url", "")).startswith("http")],
+        "sources": _clean_sources(found),
+        "filters": _clean_filters(out["files"].get("filters.json")),
         "title": title,
     }

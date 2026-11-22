@@ -3,15 +3,18 @@
 Every agent gets the same one-line prompt; the real task is written to TASK.md in a scratch
 directory (passing long multi-line prompts through Windows .cmd shims is unreliable).
 """
+import os
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from lookout import db
 
@@ -20,9 +23,12 @@ PROMPT = ("Read the file {dir}{sep}TASK.md and carry out exactly what it says. A
           "folder {dir}. Do not ask questions.")
 
 
+class CancelledError(RuntimeError):
+    """Raised when an in-flight agent or extractor process is cancelled."""
+
+
 def prompt_for(workdir: str) -> str:
     # The absolute path matters: some CLIs (e.g. opencode) work in their own project folder, not the process cwd.
-    import os
     return PROMPT.format(dir=workdir, sep=os.sep)
 
 
@@ -65,23 +71,160 @@ AGENTS: Dict[str, Dict] = {
 _model_cache: Dict[str, Tuple[float, List[Tuple[str, str]]]] = {}
 QUOTA = re.compile(r"quota|rate.?limit|usage limit|resource_exhausted|\b429\b|limit reached|too many requests", re.I)
 
+_proc_lock = threading.Lock()
+_running: Dict[int, Dict[str, Any]] = {}
+
+
+def _kill_tree(proc: subprocess.Popen) -> None:
+    if proc.poll() is not None:
+        return
+    if sys.platform == "win32":
+        try:
+            subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)], capture_output=True, timeout=10,
+                           creationflags=NO_WINDOW, stdin=subprocess.DEVNULL)
+        except Exception:
+            pass
+        if proc.poll() is None:
+            try:
+                proc.kill()
+            except OSError:
+                pass
+        return
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+        try:
+            proc.wait(timeout=0.3)
+        except subprocess.TimeoutExpired:
+            os.killpg(proc.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        try:
+            proc.kill()
+        except OSError:
+            pass
+
+
+def close_browser_session(session: Optional[str]) -> None:
+    if not session:
+        return
+    exe = shutil.which("agent-browser")
+    if not exe:
+        return
+    try:
+        subprocess.run([exe, "--session", session, "close"], capture_output=True, timeout=15,
+                       creationflags=NO_WINDOW, stdin=subprocess.DEVNULL)
+    except Exception:
+        pass
+
+
+def cancel(tag: Optional[str] = None, async_browser: bool = False) -> int:
+    """Terminates tracked subprocess trees matching tag (or all) and closes their browser sessions."""
+    with _proc_lock:
+        matched = [e for e in _running.values() if tag is None or e["tag"] == tag]
+        procs = []
+        sessions = []
+        for e in matched:
+            e["cancelled"] = True
+            procs.append(e["proc"])
+            s = e.get("session")
+            if s and not e["browser_closed"]:
+                e["browser_closed"] = True
+                if s not in sessions:
+                    sessions.append(s)
+    for proc in procs:
+        _kill_tree(proc)
+    if sessions:
+        def _close_all():
+            for s in sessions:
+                close_browser_session(s)
+        if async_browser:
+            threading.Thread(target=_close_all, daemon=True).start()
+        else:
+            _close_all()
+    return len(procs)
+
+
+def _run_proc(cmd: List[str], timeout: int, cwd: Optional[str] = None, tag: Optional[str] = None,
+              session: Optional[str] = None, cancel_event: Optional[threading.Event] = None) -> Tuple[int, str, str]:
+    if cancel_event and cancel_event.is_set():
+        raise CancelledError("cancelled")
+    kwargs: Dict[str, Any] = dict(
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace",
+        cwd=cwd, stdin=subprocess.DEVNULL,
+    )
+    if sys.platform == "win32":
+        kwargs["creationflags"] = NO_WINDOW | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    else:
+        kwargs["start_new_session"] = True
+    try:
+        proc = subprocess.Popen(cmd, **kwargs)
+    except OSError as e:
+        return -1, "", str(e)
+    entry: Dict[str, Any] = {"proc": proc, "tag": tag, "session": session, "cancelled": False, "browser_closed": False}
+    with _proc_lock:
+        _running[proc.pid] = entry
+        if cancel_event and cancel_event.is_set():
+            entry["cancelled"] = True
+    if entry["cancelled"]:
+        _kill_tree(proc)
+    try:
+        out, err = proc.communicate(timeout=timeout)
+        if entry["cancelled"] or (cancel_event and cancel_event.is_set()):
+            raise CancelledError("cancelled")
+        return proc.returncode, out or "", err or ""
+    except subprocess.TimeoutExpired:
+        _kill_tree(proc)
+        try:
+            out, err = proc.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            out, err = "", ""
+        if entry["cancelled"] or (cancel_event and cancel_event.is_set()):
+            raise CancelledError("cancelled")
+        if session and not entry["browser_closed"]:
+            with _proc_lock:
+                entry["browser_closed"] = True
+            close_browser_session(session)
+        return -9, out or "", (err or "") + "\n[timed out]"
+    finally:
+        close_now = False
+        with _proc_lock:
+            _running.pop(proc.pid, None)
+            if entry["cancelled"] and session and not entry["browser_closed"]:
+                entry["browser_closed"] = True
+                close_now = True
+        if close_now:
+            close_browser_session(session)
+
+
+def run_tracked(cmd: List[str], timeout: int, cwd: Optional[str] = None, tag: Optional[str] = None,
+                session: Optional[str] = None, cancel_event: Optional[threading.Event] = None) -> Tuple[int, str]:
+    code, out, err = _run_proc(cmd, timeout, cwd=cwd, tag=tag, session=session, cancel_event=cancel_event)
+    return code, out + err
+
 
 def _run(cmd: List[str], timeout: int, cwd: Optional[str] = None) -> Tuple[int, str]:
-    try:
-        r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout,
-                           cwd=cwd, creationflags=NO_WINDOW, stdin=subprocess.DEVNULL)
-        return r.returncode, (r.stdout or "") + (r.stderr or "")
-    except subprocess.TimeoutExpired as e:
-        out = e.stdout.decode("utf-8", "replace") if isinstance(e.stdout, bytes) else (e.stdout or "")
-        return -9, out + "\n[timed out]"
-    except OSError as e:
-        return -1, str(e)
+    return run_tracked(cmd, timeout, cwd)
+
+
+def _split_custom(cmd: str) -> List[str]:
+    posix = sys.platform != "win32"
+    parts = shlex.split(cmd, posix=posix)
+    if not posix:
+        parts = [p[1:-1] if len(p) >= 2 and p[0] == p[-1] and p[0] in ('"', "'") else p for p in parts]
+    return parts
 
 
 def which(agent_id: str) -> Optional[str]:
     if agent_id == "custom":
         cmd = db.get_settings().get("custom_command", "")
-        return shutil.which(shlex.split(cmd, posix=sys.platform != "win32")[0]) if cmd.strip() else None
+        if not cmd.strip():
+            return None
+        try:
+            parts = _split_custom(cmd)
+        except ValueError:
+            return None
+        return shutil.which(parts[0]) if parts else None
+    if agent_id not in AGENTS:
+        return None
     return shutil.which(AGENTS[agent_id]["exe"])
 
 
@@ -144,23 +287,37 @@ def _resets_at(text: str) -> Optional[str]:
 def build_command(agent_id: str, model: str, workdir: str, timeout: int) -> List[str]:
     if agent_id == "custom":
         tpl = db.get_settings().get("custom_command", "")
-        parts = shlex.split(tpl, posix=sys.platform != "win32")
+        if not tpl.strip():
+            raise RuntimeError("Custom command is empty")
+        try:
+            parts = _split_custom(tpl)
+        except ValueError as e:
+            raise RuntimeError(f"Invalid custom command: {e}") from None
+        if not parts:
+            raise RuntimeError("Custom command is empty")
         parts = [p.replace("{prompt}", prompt_for(workdir)).replace("{model}", model or "").replace("{dir}", workdir) for p in parts]
         if "{prompt}" not in tpl:
             parts.append(prompt_for(workdir))
         exe = shutil.which(parts[0])
         return [exe or parts[0], *parts[1:]]
-    return AGENTS[agent_id]["build"](which(agent_id), model, workdir, timeout)
+    if agent_id not in AGENTS:
+        raise ValueError(f"Unknown agent: {agent_id}")
+    exe = which(agent_id) or AGENTS[agent_id]["exe"]
+    return AGENTS[agent_id]["build"](exe, model, workdir, timeout)
 
 
-def run_task(agent_id: str, model: str, workdir: Path, timeout: int) -> str:
-    """Runs the agent inside workdir. Raises when it is missing or out of quota."""
+def run_task(agent_id: str, model: str, workdir: Path, timeout: int, tag: Optional[str] = None,
+             session: Optional[str] = None, cancel_event: Optional[threading.Event] = None) -> str:
+    """Runs the agent inside workdir. Raises when missing, out of quota, or cancelled."""
+    if cancel_event and cancel_event.is_set():
+        raise CancelledError("cancelled")
     if not which(agent_id):
         raise RuntimeError(f"{agent_id} is not installed on this computer")
     blocked = db.agent_blocked_until(agent_id, model)
     if blocked:
         raise RuntimeError(f"{agent_id} quota is used up until {blocked[11:16]}")
-    code, out = _run(build_command(agent_id, model, str(workdir), timeout), timeout + 60, str(workdir))
+    code, out = run_tracked(build_command(agent_id, model, str(workdir), timeout), timeout + 60, str(workdir),
+                            tag=tag, session=session, cancel_event=cancel_event)
     quota_hit = code != 0 and bool(QUOTA.search(out))
     db.log_agent_call(agent_id, model, ok=code == 0 and not quota_hit, error=out[-400:] if code else "",
                       resets_at=_resets_at(out) if quota_hit else None)

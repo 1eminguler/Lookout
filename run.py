@@ -54,6 +54,8 @@ def start_ui_in_background() -> None:
 
 def cmd_scan(scheduled: bool) -> None:
     db.init()
+    if not port_busy():
+        db.mark_interrupted()
     if not wait_for_internet():
         print("No internet connection; scan skipped.")
         return

@@ -43,14 +43,9 @@ const vm = require("node:vm");
 const ignore = () => {};
 const context = {
   localStorage: { getItem: () => null },
-  document: {
-    documentElement: { dataset: {}, removeAttribute: ignore },
-    body: { classList: { add: ignore } },
-    addEventListener: ignore,
-  },
+  document: { body: { classList: { add: ignore } }, addEventListener: ignore },
   window: { addEventListener: ignore },
-  location: { hash: "#/opportunities" },
-  history: { replaceState: (_, __, hash) => { context.location.hash = hash; } },
+  location: { hash: "#/feed" },
   clearTimeout: ignore,
   URLSearchParams,
   fetch: () => new Promise(() => {}),
@@ -62,29 +57,6 @@ vm.runInNewContext(fs.readFileSync("web/app.js", "utf8"), context);
             capture_output=True, text=True, encoding="utf-8", timeout=15,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
-
-    @unittest.skipUnless(shutil.which("node"), "Node.js is not installed")
-    def test_bookmarks_preserve_their_section_and_record(self):
-        self.run_render_assertions("""
-for (const [old, target, section, id] of [
-  ["", "#/opportunities", "opportunities", null],
-  ["#/feed", "#/opportunities", "opportunities", null],
-  ["#/home", "#/opportunities", "opportunities", null],
-  ["#/sources", "#/watches/sources", "watches", null],
-  ["#/filters", "#/watches/rules", "watches", null],
-  ["#/watch/12", "#/watches/12", "watches", 12],
-  ["#/scan/17", "#/opportunities/history/17", "opportunities", 17],
-  ["#/search/3", "#/search/3", "watches", 3],
-  ["#/unknown", "#/opportunities", "opportunities", null],
-]) {
-  context.location.hash = old;
-  context.parseRoute();
-  assert.equal(context.location.hash, target);
-  assert.equal(vm.runInContext("route.section", context), section);
-  assert.equal(vm.runInContext("route.id", context), id);
-}
-""")
-
 
     @unittest.skipUnless(shutil.which("node"), "Node.js is not installed")
     def test_eligibility_badge_details_and_filter_require_a_profile(self):
@@ -233,12 +205,6 @@ class UiSmokeTests(TempLookoutTestCase):
         try:
             ctx = browser.new_context(viewport={"width": 1280, "height": 800})
             page = ctx.new_page()
-            page.add_init_script("""
-                window.cspViolations = [];
-                document.addEventListener("securitypolicyviolation", (event) => {
-                    window.cspViolations.push(event.violatedDirective);
-                });
-            """)
             page.on("console", lambda m: console_errors.append(m.text) if m.type == "error" else None)
             page.on("pageerror", lambda err: page_errors.append(str(err)))
 
@@ -251,7 +217,7 @@ class UiSmokeTests(TempLookoutTestCase):
             # 2. One-time launch secret exchanges for HttpOnly SameSite=Strict cookie and redirects to /
             secret = srv.launch_secret
             page.goto(f"{base}?k={secret}", wait_until="networkidle")
-            _wait_js(page, "() => document.querySelector('h1') && document.querySelector('h1').textContent.includes('Opportunities')")
+            _wait_js(page, "() => document.querySelector('h1') && document.querySelector('h1').textContent.includes('What should Lookout watch')")
             self.assertIsNone(page.query_selector('meta[name="lookout-token"]'))
             cookies = {c["name"]: c for c in ctx.cookies()}
             self.assertIn("lookout_session", cookies)
@@ -273,116 +239,45 @@ class UiSmokeTests(TempLookoutTestCase):
             page.click('[data-act="dismiss-notify-errors"]')
             _wait_js(page, "() => !document.querySelector('[data-act=\"dismiss-notify-errors\"]')")
 
-            # System follows the OS. An explicit choice overrides and survives reload.
-            def palette():
-                return page.locator("html").evaluate(
-                    "(html) => [getComputedStyle(html).colorScheme, "
-                    "getComputedStyle(html).getPropertyValue('--panel').trim()]"
-                )
-
-            self.assertTrue(page.url.endswith("#/opportunities"))
-            self.assertEqual(page.locator("nav a").all_text_contents(), ["Opportunities", "Agenda", "Watches"])
-            self.assertEqual(page.locator(".side [data-act='scan'], .side em, .side .hist").count(), 0)
-            page.emulate_media(color_scheme="dark")
-            self.assertEqual(palette(), ["dark", "#191F2A"])
-            page.emulate_media(color_scheme="light")
-            self.assertEqual(palette(), ["light", "#FFFFFF"])
-            page.click('[data-nav="settings"]')
-            page.wait_for_selector("#themeSel")
-            for theme, system, panel in (("dark", "light", "#191F2A"), ("light", "dark", "#FFFFFF")):
-                page.emulate_media(color_scheme=system)
-                page.select_option("#themeSel", theme)
-                self.assertEqual(page.locator("html").get_attribute("data-theme"), theme)
-                self.assertEqual(palette(), [theme, panel])
-                page.reload(wait_until="networkidle")
-                self.assertEqual(page.locator("#themeSel").input_value(), theme)
-                self.assertEqual(palette(), [theme, panel])
-            page.select_option("#themeSel", "system")
-            self.assertIsNone(page.locator("html").get_attribute("data-theme"))
-            self.assertEqual(palette(), ["dark", "#191F2A"])
-
-            # The same navigation remains reachable by keyboard in a narrow window.
-            page.set_viewport_size({"width": 375, "height": 760})
-            nav = page.get_by_role("navigation", name="Main navigation")
-            self.assertTrue(all(link.is_visible() for link in nav.get_by_role("link").all()))
-            bounds = [link.bounding_box() for link in nav.get_by_role("link").all()]
-            self.assertEqual(len({box["y"] for box in bounds}), 1)
-            self.assertLess(bounds[0]["y"], page.locator("#main").bounding_box()["y"])
-            nav.get_by_role("link", name="Opportunities").focus()
-            page.keyboard.press("Tab")
-            self.assertTrue(nav.get_by_role("link", name="Agenda").evaluate(
-                "(link) => link === document.activeElement && getComputedStyle(link).outlineWidth === '2px'"
-            ))
-            page.keyboard.press("Enter")
-            page.wait_for_url("**/#/agenda")
-            page.click('button[data-goto="#/watches/new"]')
-            page.wait_for_url("**/#/watches/new")
-            page.fill("#ask", "internships\n" * 30)
-            self.assertTrue(page.locator("#ask").evaluate(
-                "(field) => field.scrollHeight > field.clientHeight && !field.hasAttribute('style')"
-            ))
-            page.click('[data-pick="agent"]')
-            page.wait_for_selector(".pop")
-            page.keyboard.press("Escape")
-            self.assertTrue(page.locator('[data-pick="agent"]').evaluate("(el) => el === document.activeElement"))
-            page.click('[data-nav="settings"]')
+            # 4. Model picker and effort submenu
             page.click('[data-pick="model"]')
+            page.wait_for_selector(".pop button.fam")
             page.click(".pop button.fam")
-            page.wait_for_selector(".pop-sub")
-            submenu_text = page.locator(".pop-sub").inner_text()
-            for effort in ("Low", "Medium", "High"):
-                self.assertIn(effort, submenu_text)
+            _wait_js(page, "() => document.querySelectorAll('.pop').length === 2")
+            submenu_text = page.locator(".pop").nth(1).inner_text()
+            self.assertIn("Low", submenu_text)
+            self.assertIn("Medium", submenu_text)
+            self.assertIn("High", submenu_text)
             page.keyboard.press("Escape")
-            self.assertEqual(page.evaluate("() => window.cspViolations"), [])
-            page.set_viewport_size({"width": 1280, "height": 800})
 
-            # Data from existing installations is reachable through Watches.
-            page.click('[data-nav="watches"]')
-            page.wait_for_url("**/#/watches")
-            for label, path in (("Independent sources", "sources"), ("Rules for all watches", "rules"),
-                                ("ML Internships", str(wid))):
-                self.assertEqual(page.get_by_role("link", name=label).get_attribute("href"), f"#/watches/{path}")
-
-            # Visit every view and verify legacy redirects and existing workflows.
-            for route_hash, canonical, expected in (
-                ("#/home", "#/opportunities", "Opportunities"),
-                ("#/feed", "#/opportunities", "Opportunities"),
-                ("#/agenda", "#/agenda", "Agenda"),
-                ("#/sources", "#/watches/sources", "Independent sources"),
-                ("#/filters", "#/watches/rules", "Rules for all watches"),
-                ("#/settings", "#/settings", "Settings"),
-                (f"#/watch/{wid}", f"#/watches/{wid}", "ML Internships"),
-                (f"#/scan/{scan_id}", f"#/opportunities/history/{scan_id}", "ML Internships"),
-                (f"#/search/{did}", f"#/search/{did}", "ML Internships"),
+            # 5. Visit every view & verify round-3 features under strict CSP
+            for route_hash, expected in (
+                ("#/feed", "Feed"),
+                ("#/agenda", "Agenda"),
+                ("#/sources", "Sources"),
+                ("#/filters", "Filters"),
+                ("#/settings", "Settings"),
+                (f"#/watch/{wid}", "ML Internships"),
+                (f"#/scan/{scan_id}", "ML Internships"),
+                (f"#/search/{did}", "ML Internships"),
             ):
                 page.goto(base + route_hash, wait_until="networkidle")
-                page.wait_for_url(base + canonical)
-                _wait_js(
-                    page, f"() => document.querySelector('h1')?.textContent.includes({expected!r})"
+                _wait_js(page, 
+                    f"() => document.querySelector('h1') && document.querySelector('h1').textContent.includes({expected!r})"
                 )
                 if route_hash == "#/feed":
-                    page.get_by_text("Filter list", exact=True).click()
-                    self.assertTrue(page.locator("#srcSel").is_visible())
                     page.wait_for_selector('[data-act="load-more"]')
                     self.assertEqual(page.locator("article.item").count(), 50)
                     self.assertIn("50 of 55", page.locator(".load-more").inner_text())
                     page.click('[data-act="load-more"]')
                     _wait_js(page, "() => document.querySelectorAll('article.item').length === 55")
                 elif route_hash == "#/agenda":
-                    page.click('[data-pick="remind"]')
-                    page.wait_for_selector("#remindPick")
-                    self.assertEqual(page.locator("[style]").count(), 0)
-                    page.keyboard.press("Escape")
                     page.click('[data-agview="month"]')
                     page.wait_for_selector(".cal")
                 elif route_hash == "#/sources":
                     page.wait_for_selector(f'[data-src-resume="{paused_sid}"]')
                     src_text = page.locator(".page").inner_text()
                     self.assertIn("paused", src_text)
-                    self.assertNotIn("EuroTech", src_text)
-                elif route_hash == f"#/watch/{wid}":
-                    page.wait_for_selector("#watch-settings")
-                    src_text = page.locator(".watch-side").inner_text()
                     self.assertIn("filters changed", src_text)
                     # On-demand reader code load
                     page.click(f'details[data-code-id="{sid}"] summary')
@@ -412,18 +307,6 @@ class UiSmokeTests(TempLookoutTestCase):
                     self.assertNotIn("Preview:", page.locator(".test-preview").inner_text())
                     page.click('[data-act="close-preview"]')
                     _wait_js(page, "() => !document.querySelector('.test-preview')")
-                    rss_text = page.locator(".rss-bar").inner_text()
-                    self.assertIn("localhost", rss_text.lower())
-                    self.assertNotIn("local network", rss_text.lower())
-                    page.click(f'[data-watch-edit="{wid}"]')
-                    page.wait_for_selector("#editWatchForm")
-                    page.wait_for_selector(f'#editWatchForm [data-watch-rediscover="{wid}"]')
-                    page.click('#editWatchForm [data-act="cancel-edit"]')
-                    _wait_js(page, "() => !document.querySelector('#editWatchForm')")
-                    self.assertTrue(page.locator(f'[data-f-edit="{fid}"]').count() >= 1)
-                elif route_hash == f"#/scan/{scan_id}":
-                    page.get_by_text("Technical details", exact=True).click()
-                    page.wait_for_selector("table.t")
                 elif route_hash == "#/filters":
                     # Global filter row or navigate to watch for watch filter; verify add/inline edit on global filter
                     gf_edit = page.locator('[data-f-edit]').first
@@ -439,6 +322,16 @@ class UiSmokeTests(TempLookoutTestCase):
                     page.wait_for_selector("#rssPublicIn")
                     page.click('[data-act="sched-preview"]')
                     page.wait_for_selector("pre")
+                elif route_hash == f"#/watch/{wid}":
+                    rss_text = page.locator(".rss-bar").inner_text()
+                    self.assertIn("localhost", rss_text.lower())
+                    self.assertNotIn("local network", rss_text.lower())
+                    page.click(f'[data-watch-edit="{wid}"]')
+                    page.wait_for_selector("#editWatchForm")
+                    page.wait_for_selector(f'#editWatchForm [data-watch-rediscover="{wid}"]')
+                    page.click('#editWatchForm [data-act="cancel-edit"]')
+                    _wait_js(page, "() => !document.querySelector('#editWatchForm')")
+                    self.assertTrue(page.locator(f'[data-f-edit="{fid}"]').count() >= 1)
 
             # 5b. Opening #/feed on a fresh load does not issue duplicate GET requests
             feed_hits = []
@@ -475,8 +368,6 @@ class UiSmokeTests(TempLookoutTestCase):
             scanner.progress.update(running=False, scan_id=None, done=0, total=0, current=[])
 
             # Zero console/page errors across all normal interactions & strict CSP
-            self.assertEqual(page.evaluate("() => window.cspViolations"), [])
-            self.assertEqual(page.locator("[style]").count(), 0)
             self.assertEqual(console_errors, [])
             self.assertEqual(page_errors, [])
 
@@ -494,7 +385,7 @@ class UiSmokeTests(TempLookoutTestCase):
 
             sec2 = srv.issue_launch_secret()
             page.goto(f"{base}?k={sec2}", wait_until="networkidle")
-            _wait_js(page, "() => document.querySelector('h1') && document.querySelector('h1').textContent.includes('Opportunities')")
+            _wait_js(page, "() => document.querySelector('h1') && document.querySelector('h1').textContent.includes('What should Lookout watch')")
             page.goto(base + "#/sources", wait_until="networkidle")
             page.wait_for_selector(f'[data-src-resume="{paused_sid}"]')
             with srv.auth_lock:

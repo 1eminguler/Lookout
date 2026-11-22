@@ -15,7 +15,8 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 ROOT = Path(__file__).resolve().parent.parent
 DB_PATH = Path(os.environ.get("LOOKOUT_DATA_DIR") or ROOT / "data") / "lookout.db"
 TS = "%Y-%m-%d %H:%M:%S"
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
+MAX_DELIVERY_ATTEMPTS = 4  # Initial delivery plus up to three retries.
 _lock = threading.RLock()
 _UNSET = object()
 _TRACKING_EXACT = {"fbclid", "gclid", "mc_cid", "mc_eid"}
@@ -178,6 +179,20 @@ CREATE TABLE IF NOT EXISTS notification_log (
     message TEXT,
     created TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS deliveries (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    item_id TEXT NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+    event TEXT NOT NULL CHECK (event IN ('new', 'updated', 'reminder')),
+    event_key TEXT NOT NULL,
+    channel TEXT NOT NULL,
+    delivered_at TEXT,
+    error TEXT,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    snapshot TEXT,
+    UNIQUE (item_id, event, event_key, channel)
+);
+CREATE INDEX IF NOT EXISTS idx_deliveries_pending ON deliveries(channel, event, id) WHERE delivered_at IS NULL;
 """
 
 
@@ -274,6 +289,45 @@ MIGRATIONS_V6 = {
     "items": {"deadline_raw": "TEXT"},
 }
 
+MIGRATIONS_V7 = {
+    "items": {"reminded_at": "TEXT"},
+    "sources": {"last_successful_read": "TEXT"},
+    "scans": {"sources_ok": "INTEGER NOT NULL DEFAULT 0", "sources_failed": "INTEGER NOT NULL DEFAULT 0",
+              "sources_skipped": "INTEGER NOT NULL DEFAULT 0"},
+}
+
+
+def _migrate_scan_coverage(c: sqlite3.Connection) -> None:
+    # Names can repeat across watches. Key source results by ID when available.
+    c.execute("ALTER TABLE scan_sources RENAME TO scan_sources_v6")
+    c.execute("""CREATE TABLE scan_sources (
+        scan_id INTEGER NOT NULL, source_id INTEGER, source_name TEXT NOT NULL, ok INTEGER,
+        count INTEGER DEFAULT 0, new INTEGER DEFAULT 0, error TEXT, ms INTEGER DEFAULT 0,
+        skipped INTEGER NOT NULL DEFAULT 0, error_kind TEXT, last_successful_read TEXT
+    )""")
+    c.execute("""INSERT INTO scan_sources(scan_id, source_id, source_name, ok, count, new, error, ms, skipped)
+                 SELECT scan_id, source_id, source_name, ok, count, new, error, ms,
+                        CASE WHEN error='cancelled' OR error LIKE '%cooldown%' OR error LIKE '%retry backoff%'
+                             THEN 1 ELSE 0 END
+                 FROM scan_sources_v6""")
+    c.execute("DROP TABLE scan_sources_v6")
+    c.execute("CREATE UNIQUE INDEX idx_scan_sources_identity ON scan_sources"
+              "(scan_id, COALESCE(source_id, 0), CASE WHEN source_id IS NULL THEN source_name ELSE '' END)")
+    c.execute("CREATE INDEX idx_scan_sources_source_id ON scan_sources(source_id, scan_id DESC)")
+    c.execute("""UPDATE scan_sources AS result SET last_successful_read=(
+                   SELECT COALESCE(s.finished, s.started) FROM scan_sources prev JOIN scans s ON s.id=prev.scan_id
+                   WHERE prev.source_id=result.source_id AND prev.ok=1 AND prev.scan_id<=result.scan_id
+                   ORDER BY prev.scan_id DESC LIMIT 1
+                 )""")
+    c.execute("""UPDATE sources SET last_successful_read=(
+                   SELECT r.last_successful_read FROM scan_sources r WHERE r.source_id=sources.id AND r.ok=1
+                   ORDER BY r.scan_id DESC LIMIT 1
+                 )""")
+    c.execute("""UPDATE scans SET (sources_ok, sources_failed, sources_skipped)=(
+                   SELECT COUNT(CASE WHEN ok=1 THEN 1 END), COUNT(CASE WHEN ok=0 AND skipped=0 THEN 1 END),
+                          COUNT(CASE WHEN skipped=1 THEN 1 END) FROM scan_sources WHERE scan_id=scans.id
+                 )""")
+
 
 def _add_columns(c: sqlite3.Connection, spec: Dict[str, Dict[str, str]]) -> None:
     for table, cols in spec.items():
@@ -318,6 +372,12 @@ def init() -> None:
             _add_columns(c, MIGRATIONS_V5)
         if ver < 6:
             _add_columns(c, MIGRATIONS_V6)
+        if ver < 7:
+            if not c.in_transaction:
+                c.execute("BEGIN IMMEDIATE")
+            if c.execute("PRAGMA user_version").fetchone()[0] < 7:
+                _add_columns(c, MIGRATIONS_V7)
+                _migrate_scan_coverage(c)
         c.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         c.commit()
 
@@ -1010,17 +1070,24 @@ def finish_scan(scan_id: int, status: str, note: str = "") -> None:
     q = "SELECT COUNT(*) n FROM scan_items si JOIN items i ON i.id=si.item_id WHERE si.scan_id=? AND COALESCE(i.match,1)=1"
     found = _one(q, (scan_id,))["n"]
     new = _one(q + " AND si.is_new=1", (scan_id,))["n"]
-    _exec("UPDATE scans SET finished=?, status=?, found=?, new=?, note=? WHERE id=?",
-          (now(), status, found, new, note, scan_id))
+    cov = _one("SELECT COUNT(CASE WHEN ok=1 THEN 1 END) ok, COUNT(CASE WHEN ok=0 AND skipped=0 THEN 1 END) failed, COUNT(CASE WHEN skipped=1 THEN 1 END) skipped FROM scan_sources WHERE scan_id=?", (scan_id,))
+    if cov["failed"] and not cov["ok"] and status == "done":
+        status = "failed"
+    _exec("UPDATE scans SET finished=?, status=?, found=?, new=?, note=?, sources_ok=?, sources_failed=?, sources_skipped=? WHERE id=?",
+          (now(), status, found, new, note, cov["ok"], cov["failed"], cov["skipped"], scan_id))
 
 
-def record_source_result(scan_id: int, source: Dict[str, Any], ok: bool, count: int, new: int, error: str, ms: int):
-    _exec("INSERT OR REPLACE INTO scan_sources(scan_id, source_id, source_name, ok, count, new, error, ms) "
-          "VALUES(?, ?, ?, ?, ?, ?, ?, ?)", (scan_id, source.get("id"), source["name"], int(ok), count, new, error, ms))
+def record_source_result(scan_id: int, source: Dict[str, Any], ok: bool, count: int, new: int, error: str, ms: int, skipped: bool = False, error_kind: str = ""):
+    sid = source.get("id")
+    last_ok = now() if ok else source.get("last_successful_read")
+    if ok and sid is not None:
+        _exec("UPDATE sources SET last_successful_read=? WHERE id=?", (last_ok, sid))
+    _exec("INSERT OR REPLACE INTO scan_sources(scan_id, source_id, source_name, ok, count, new, error, ms, skipped, error_kind, last_successful_read) "
+          "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", (scan_id, sid, source["name"], int(ok), count, new, error, ms, int(skipped), error_kind, last_ok))
 
 
 def scans(limit: int = 60) -> List[Dict[str, Any]]:
-    return _rows("SELECT id, started, finished, trigger, agent, model, status, found, new, note, label, watch_id "
+    return _rows("SELECT id, started, finished, trigger, agent, model, status, found, new, note, label, watch_id, sources_ok, sources_failed, sources_skipped "
                  "FROM scans ORDER BY id DESC LIMIT ?", (limit,))
 
 
@@ -1525,7 +1592,8 @@ def counts() -> Dict[str, Any]:
 def agenda_items() -> List[Dict[str, Any]]:
     return _rows("SELECT i.*, COALESCE(s.watch_id, i.watch_id) AS watch_id "
                  "FROM items i LEFT JOIN sources s ON s.id = i.source_id "
-                 "WHERE i.action IN ('saved', 'applied') AND COALESCE(i.expired,0)=0 ORDER BY i.first_seen DESC")
+                 "WHERE i.action IN ('saved', 'applied') AND (i.action='applied' OR COALESCE(i.expired,0)=0) "
+                 "ORDER BY CASE WHEN i.action='applied' THEN 1 ELSE 0 END, i.first_seen DESC")
 
 
 def watch_feed_items(watch_id: int, limit: int = 100) -> List[Dict[str, Any]]:
@@ -1579,6 +1647,40 @@ def unnotified() -> List[Dict[str, Any]]:
 def mark_notified(ids: Iterable[str]) -> None:
     with _lock, _conn() as c:
         c.executemany("UPDATE items SET notified=1 WHERE id=?", [(i,) for i in ids])
+        c.commit()
+
+
+def due_reminders(today: Optional[str] = None) -> List[Dict[str, Any]]:
+    day = today or now()[:10]
+    return _rows("SELECT * FROM items WHERE action IN ('saved','applied') AND remind_on IS NOT NULL AND remind_on<=? AND reminded_at IS NULL ORDER BY remind_on, first_seen", (day,))
+
+
+def queue_delivery(item_id: str, event: str, event_key: str, channel: str, snapshot: Dict[str, Any]) -> None:
+    _exec("INSERT OR IGNORE INTO deliveries(item_id,event,event_key,channel,snapshot) VALUES(?,?,?,?,?)",
+          (item_id, event, str(event_key), channel, json.dumps(snapshot, ensure_ascii=False)))
+
+
+def pending_deliveries(channel: str) -> List[Dict[str, Any]]:
+    rows = _rows("SELECT * FROM deliveries WHERE channel=? AND delivered_at IS NULL AND attempts<? ORDER BY id", (channel, MAX_DELIVERY_ATTEMPTS))
+    for row in rows:
+        try:
+            row["item"] = json.loads(row.pop("snapshot") or "{}")
+        except (TypeError, ValueError):
+            row["item"] = {}
+    return rows
+
+
+def finish_deliveries(ids: Iterable[int], ok: bool, error: str = "") -> None:
+    with _lock, _conn() as c:
+        for did in ids:
+            c.execute("UPDATE deliveries SET attempts=attempts+1, delivered_at=CASE WHEN ? THEN ? ELSE delivered_at END, error=? WHERE id=?",
+                      (int(ok), now(), str(error)[:500], did))
+        c.commit()
+
+
+def mark_reminded(item_ids: Iterable[str]) -> None:
+    with _lock, _conn() as c:
+        c.executemany("UPDATE items SET reminded_at=? WHERE id=? AND reminded_at IS NULL", [(now(), i) for i in item_ids])
         c.commit()
 
 

@@ -165,6 +165,8 @@ def start_ui_in_background() -> None:
 def cmd_scan(scheduled: bool) -> None:
     db.init()
     db.mark_interrupted()
+    if db.due_reminders() and db.get_settings().get("notify") == "1":
+        start_ui_in_background()
     if not wait_for_internet():
         print("Internet check was inconclusive. Continuing with the scan.")
     print("Scanning…")
@@ -179,13 +181,6 @@ def cmd_scan(scheduled: bool) -> None:
     d = db.scan_detail(scan_id)
     print(f"{d['found']} items, {d['new']} new. "
           f"{sum(1 for s in d['sources'] if s['ok'])}/{len(d['sources'])} sources read.")
-    # Agenda reminders the user set for today
-    due = [i for i in db.items() if i["remind_on"] == time.strftime("%Y-%m-%d") and i["action"] == "saved"]
-    if due and db.get_settings().get("notify") == "1":
-        start_ui_in_background()
-        notify.desktop(f"Reminder: {due[0]['title']}" if len(due) == 1 else f"{len(due)} reminders today",
-                       [i["title"] for i in due[:2]] if len(due) > 1 else [due[0].get("org") or due[0]["source_name"]],
-                       notify.desktop_launch_url(URL))
 
 
 def main() -> None:
@@ -208,6 +203,8 @@ def main() -> None:
         if not a.background and (a.browser or not open_window(start_server=False)):
             webbrowser.open(_launch_url())
         return
+    db.init()
+    scanner.deliver_due_reminders(URL)
     if a.background:
         return server.serve(idle_minutes=12 * 60)
     if a.browser or not open_window():

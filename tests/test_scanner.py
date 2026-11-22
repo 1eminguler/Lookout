@@ -879,6 +879,19 @@ class ScannerTests(TempLookoutTestCase):
         self.assertEqual(by_title["A"]["status"], "open")
         self.assertEqual(by_title["B"]["status"], "gone")
 
+    def test_due_reminders_catch_up_and_mark_delivered(self):
+        scan = db.start_scan("manual", "", "", [])
+        db.save_item(scan, {"id": None, "name": "Source"},
+                     {"id": "reminder-1", "title": "Application", "url": "https://example.com/job"})
+        db.set_item("reminder-1", action="saved", remind_on="2020-01-01")
+        db.set_settings({"notify": "1"})
+        with patch.object(notify, "desktop", return_value=(True, "sent")) as fake:
+            result = scanner.deliver_due_reminders("http://127.0.0.1/")
+        self.assertTrue(result["sent"])
+        self.assertEqual(result["count"], 1)
+        fake.assert_called_once()
+        self.assertEqual(db.due_reminders(), [])
+
     def test_cancel_mid_scan_kills_subprocess_skips_filter_and_preserves_state(self):
         db.set_settings({"agent": "claude"})
         sid = db.add_source("SlowSite", "https://slow.example.com")

@@ -480,6 +480,7 @@ function renderHome() {
   const cands = !d.running ? (d.results || []).map((cand, k) => candCard(cand, k, null, d.watch_id)).join("") : "";
   const globalFCount = c.filters_global_active ?? S.filters.filter((f) => !f.watch_id && f.active).length;
   const srcActiveCount = c.sources_active ?? S.sources.filter((s) => s.active).length;
+  const latestScan = S.scans?.[0];
   return `<div class="home">${S.progress.running ? `<div class="home-prog">${progressBox()}</div>` : ""}
     ${(S.notify_errors || []).length ? `<div class="home-prog">${renderNotifyErrorsBanner()}</div>` : ""}
     <div class="scope">${SCOPE}</div>
@@ -498,6 +499,7 @@ function renderHome() {
     ${d.running && d.id ? `<div class="disc-bar"><a href="#/search/${d.id}"><i class="live"></i><span>Searching for <b>${esc(d.title || d.request)}</b></span><span class="grow"></span><span class="muted">View search →</span></a><button type="button" class="btn sm ghost" data-act="cancel-disc">${I.stop} Stop</button></div>` : ""}
     ${!d.running && d.error ? `<p class="err-note">${esc(cleanErr(d.error))}</p>` : ""}
     ${cands ? `<div class="found"><div class="h2">Suggested sources <span>${d.results.length}</span><span class="grow"></span><button class="btn sm ghost" data-act="clear-disc">Clear</button></div><div class="list">${cands}</div></div>` : ""}
+    ${latestScan ? `<a class="chip" href="#/scan/${latestScan.id}">Read ${latestScan.sources_ok || 0} of ${(latestScan.sources_ok || 0) + (latestScan.sources_failed || 0) + (latestScan.sources_skipped || 0)} sources</a>` : ""}
     <div class="glance">${S.scans.length ? `<a href="#/feed"><b class="${fresh ? "hot" : ""}">${fresh}</b> new in the last 3 days</a><a href="#/feed"><b class="${week ? "warn" : ""}">${week}</b> closing this week</a><a href="#/agenda"><b>${savedN}</b> in your agenda</a>` : !st.agent ? `<a href="#/settings">Start by choosing your agent</a>` : `<a href="#/sources">Add a website to watch</a>`}</div></div>`;
 }
 
@@ -700,7 +702,7 @@ function renderUpcoming() {
     if (part.length) html += `<section class="ag-group ${cls || ""}"><h3>${name} <span>${part.length}</span></h3><div class="ag-rows">${part.map(agRow).join("")}</div></section>`;
   }
   if (!saved.length) html = `<div class="empty mt-22"><b>Nothing in your agenda</b>Use the bookmark on any item in your feed to keep track of it here.<div class="row"><a class="btn sm" href="#/feed">Browse feed</a></div></div>`;
-  if (done.length) html += `<details class="ag-done" data-key="ag-done"><summary>Done (${done.length})</summary><div class="ag-rows mt-8">${done.map(agRow).join("")}</div></details>`;
+  if (done.length) html += `<details class="ag-done" data-key="ag-done"><summary>Applied (${done.length})</summary><div class="ag-rows mt-8">${done.map(agRow).join("")}</div></details>`;
   return html;
 }
 function renderMonth() {
@@ -921,12 +923,12 @@ function renderScan() {
   const running = d.status === "running", w = d.watch_id ? watchById(d.watch_id) : null;
   const ok = d.sources.filter((s) => s.ok).length, shown = d.items.filter((i) => i.match !== 0), hidden = d.items.length - shown.length;
   const statusStr = running ? "running" : d.status === "interrupted" ? "interrupted" : d.status === "cancelled" ? "cancelled" : d.finished ? `took ${duration(d.started, d.finished)}` : d.status;
-  const srows = d.sources.map((s) => `<tr><td><span class="dot ${s.ok ? "" : "bad"}"></span>${esc(s.source_name)}</td><td>${s.ok ? `${s.count} items${s.new ? `, <b>${s.new} new</b>` : ""}` : s.error === "cancelled" ? '<span class="muted">cancelled</span>' : `<span class="err">${esc(cleanErr(s.error))}</span>`}</td><td class="muted num-col">${(s.ms / 1000).toFixed(1)} s</td></tr>`).join("");
+  const srows = d.sources.map((s) => `<tr><td><span class="dot ${s.ok ? "" : "bad"}"></span>${s.source_id ? `<a href="#/sources">${esc(s.source_name)}</a>` : esc(s.source_name)}</td><td>${s.ok ? `${s.count} items${s.new ? `, <b>${s.new} new</b>` : ""}` : s.skipped ? '<span class="muted">skipped</span>' : `<span class="err">${esc(cleanErr(s.error))}</span> <span class="muted">${esc(s.error_kind || "")}</span><div class="muted">Last successful read: ${esc(s.last_successful_read || "Never")}</div>`}</td><td class="muted num-col">${(s.ms / 1000).toFixed(1)} s</td></tr>`).join("");
   return `<div class="page">${S.progress.running && S.progress.scan_id === d.id ? progressBox() : ""}
     <div class="head"><div><h1>${esc(d.label || (d.trigger === "scheduled" ? "Daily scan" : "Scan"))}, ${short(d.started.slice(0, 10))} at ${d.started.slice(11, 16)}</h1>
       <p>${d.agent ? `${esc(agentName(d.agent))}${d.model ? ", " + esc(d.model) : ""}` : "Plugins only"}, ${statusStr}${d.note ? ". " + esc(d.note) : ""}</p></div>
       <div class="row">${w ? `<a class="btn sm ghost" href="#/watch/${w.id}">${I.watch} Open watch</a>` : ""}<button class="btn sm ghost danger" data-scan-del="${d.id}" ${running ? "disabled" : ""}>${I.trash} Delete</button></div></div>
-    <div class="stats"><div class="stat"><b>${d.found}</b><span>matching items</span></div><div class="stat"><b>${d.new}</b><span>new</span></div><div class="stat"><b>${ok} of ${d.sources.length}</b><span>sources read</span></div><div class="stat"><b>${hidden}</b><span>filtered out</span></div></div>
+    <div class="stats"><div class="stat"><b>${d.found}</b><span>matching items</span></div><div class="stat"><b>${d.new}</b><span>new</span></div><div class="stat"><b>Read ${ok} of ${d.sources.length} sources</b><span>${d.sources_failed || 0} failed · ${d.sources_skipped || 0} skipped</span></div><div class="stat"><b>${hidden}</b><span>filtered out</span></div></div>
     ${d.filters.length ? `<div class="h2">Filters used</div><div class="preview">${esc(filterText(d.filters))}</div>` : ""}
     <div class="h2">Sources</div><div class="box"><table class="t"><tbody>${srows || '<tr><td class="muted">No sources were scanned.</td></tr>'}</tbody></table></div>
     <div class="h2">Matching items <span>${shown.length}</span></div>

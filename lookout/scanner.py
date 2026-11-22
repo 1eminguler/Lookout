@@ -1131,7 +1131,9 @@ def _scan_one(scan_id: int, source: Dict[str, Any], fs: List[Dict[str, Any]], pl
         if not isinstance(e, RuntimeError):
             traceback.print_exc()
     finally:
-        db.record_source_result(scan_id, source, ok, count, new, error, int((time.time() - t0) * 1000))
+        skipped = bool(error and ("cooldown" in error.lower() or "retry backoff" in error.lower() or error == "cancelled"))
+        kind = "" if not error else classify_error(error)
+        db.record_source_result(scan_id, source, ok, count, new, error, int((time.time() - t0) * 1000), skipped, kind)
         db.refresh_scan_counts(scan_id)
         with _lock:
             progress["done"] += 1
@@ -1309,6 +1311,26 @@ def notify_after_scan(
     return {"sent": delivered, "channels": channels, "new": len(new_items), "updated": len(changed_items)}
 
 
+def deliver_due_reminders(panel_url: Optional[str] = None) -> Dict[str, Any]:
+    """Deliver overdue agenda reminders once the user next runs Lookout."""
+    due = db.due_reminders()
+    if not due or db.get_settings().get("notify") != "1":
+        return {"sent": False, "count": 0}
+    settings = db.get_settings()
+    url = notify.bare_panel_url(panel_url or f"http://127.0.0.1:{int(os.environ.get('LOOKOUT_PORT') or 8780)}/")
+    lines = [f"{i['title']} — {i.get('org') or i['source_name']}" for i in due[:8]]
+    title = f"Reminder: {due[0]['title']}" if len(due) == 1 else f"{len(due)} agenda reminders"
+    delivered = False
+    try:
+        result = notify.desktop(title, lines, notify.desktop_launch_url(url))
+        delivered = bool(result[0]) if isinstance(result, tuple) else True
+    except Exception:
+        delivered = False
+    if delivered:
+        db.mark_reminded(i["id"] for i in due)
+    return {"sent": delivered, "count": len(due)}
+
+
 def enqueue_scan_sources(source_ids: List[int], watch_id: Optional[int] = None) -> bool:
     """Appends newly discovered sources to a currently running scan for the same watch."""
     if not source_ids:
@@ -1452,6 +1474,7 @@ def _run_scan_body(trigger: str, only: Optional[List[int]], watch_id: Optional[i
             notify_after_scan(
                 scan_id, baseline_source_ids=baseline_ids, panel_url=panel_url, before_desktop=before_desktop
             )
+        deliver_due_reminders(panel_url=panel_url)
         return scan_id
     finally:
         hb_stop.set()

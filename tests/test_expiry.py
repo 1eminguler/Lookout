@@ -249,11 +249,13 @@ class StoredExpiryTests(TempLookoutTestCase):
                                  "deadline": "2027-01-01"}, match=1, match_key="k")
         db.set_item("ag1", action="saved")
         db.set_item("ag2", action="saved")
+        db.set_item("ag2", action="applied", note="Interview scheduled")
         db.mark_items_expired(["ex1", "ag2"])
 
         self.assertEqual(db.counts()["feed_open"], 2)  # ok1 + ag1
         self.assertEqual({i["id"] for i in db.watch_feed_items(wid)}, {"ok1", "ag1"})
-        self.assertEqual([i["id"] for i in db.agenda_items()], ["ag1"])
+        self.assertEqual({i["id"] for i in db.agenda_items()}, {"ag1", "ag2"})
+        self.assertEqual(next(i for i in db.agenda_items() if i["id"] == "ag2")["note"], "Interview scheduled")
         self.assertEqual({i["id"] for i in db.unnotified()}, {"ok1", "ag1"})
         self.assertEqual({i["id"] for i in db.scan_changes(scan)}, {"ok1", "ag1"})
 

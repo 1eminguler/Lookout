@@ -21,10 +21,10 @@ What constrains tool execution at the CLI layer is the command-line permission m
 | Agent | Exact flags passed by Lookout | CLI `--help` checked | Permission model | Risk profile |
 |---|---|---|---|---|
 | **Claude Code** (`claude`) | `-p <prompt> --add-dir <workdir> --permission-mode acceptEdits --allowedTools <task-tools>` (+ `--model <model>`) | Yes | **Tool-restricted per task** | Lowest risk among built-in adapters: tools are restricted per task kind (`CLAUDE_TASK_TOOLS`), and `classify` only gets `Read` and `Write`. See residual note below. |
-| **Gemini CLI** (`gemini`) | `-p <prompt> --yolo` (+ `-m <model>`) | Yes | **Auto-approve** | `--yolo` approves all tool calls without asking. |
+| **Gemini CLI** (`gemini`) | `-p <prompt> --yolo [--sandbox]` (+ `-m <model>`) | Yes | **Conditional CLI sandbox** | Lookout adds `--sandbox` only when `gemini --help` advertises it; otherwise `--yolo` approves tools without a sandbox. |
 | **Antigravity CLI** (`agy`) | `-p <prompt> --add-dir <workdir> --dangerously-skip-permissions --print-timeout <timeout>s` (+ `--model <model>`) | Yes | **Auto-approve** | `--dangerously-skip-permissions` bypasses interactive confirmation prompts. |
 | **opencode** (`opencode`) | `run <prompt> --auto` (+ `-m <model>`) | Yes | **Auto-approve** | `--auto` executes tool calls non-interactively without confirmation. |
-| **Codex CLI** (`codex`) | `exec <prompt> --full-auto` (+ `-m <model>`) | No (experimental) | **Auto-approve** | `--full-auto` enables unattended tool execution (flags unverified on a real install). |
+| **Codex CLI** (`codex`) | `exec <prompt> -C <workdir> --skip-git-repo-check --ephemeral -s workspace-write -c sandbox_workspace_write.network_access=true` (+ `-m <model>`) | Not checked in this batch | **Workspace-write sandbox** | Codex confines file writes to the task workspace; network access is explicitly enabled. This is a CLI sandbox, not an OS or network sandbox. |
 | **Cursor Agent** (`cursor-agent`) | `-p <prompt> --force` (+ `--model <model>`) | No (experimental) | **Auto-approve** | `--force` skips confirmation prompts (flags unverified on a real install). |
 | **Qwen Code** (`qwen`) | `-p <prompt> --yolo` (+ `-m <model>`) | No (experimental) | **Auto-approve** | `--yolo` auto-approves tool execution (flags unverified on a real install). |
 | **GitHub Copilot CLI** (`copilot`) | `-p <prompt> --allow-all-tools` (+ `--model <model>`) | No (experimental) | **Auto-approve** | `--allow-all-tools` permits all tools without prompting (flags unverified on a real install). |
@@ -49,6 +49,8 @@ What constrains tool execution at the CLI layer is the command-line permission m
 - Prefer **Claude Code** when available.
 - Run Lookout inside the official rootless **[`Dockerfile`](Dockerfile) container**, a **throwaway VM**, or a **dedicated low-privilege OS user** whenever scanning untrusted public websites.
 - Keep `agent-browser` and your chosen agent CLI updated.
+
+Every agent task runs with its working directory set to its temporary task folder. The child environment drops variables whose names contain `TOKEN`, `SECRET`, `PASSWORD`, or `API_KEY`, except known login variables needed by the selected Claude, Codex, Gemini, or opencode CLI. Other adapters receive no such exception. This reduces accidental exposure but does not prevent the CLI from reading files available to the OS account, using its own credential store, or sending task content to its provider.
 
 ## Local HTTP API, session authentication, and export protections
 
@@ -120,7 +122,7 @@ Agent-written readers (`extractor.py`) go through static and runtime checks in [
   - **E-mail digest** (`notify.mail_digest`) connects to your configured SMTP server using TLS certificate verification (`ssl.create_default_context()` via STARTTLS or SMTPS port 465).
   - **Webhooks** (`notify.webhook`) send item summaries to your configured webhook URL (JSON, Slack, Discord, Telegram, or ntfy).
 - **Credential storage:** `smtp_password` is stored in the local `settings` table inside `data/lookout.db` (it is omitted from `/api/state` and `/api/backup.json`, which expose only `smtp_password_set`, but is not stored in an OS keyring). `data/.launch_secret` is created with `0o600` permissions on POSIX and deleted as soon as the launch URL is consumed. Protect filesystem permissions on `data/` accordingly.
-- **Backups:** `/api/backup.json` exports watches, non-plugin sources, and filters only — it deliberately excludes `smtp_password`, learned readers, collected items, and scan history.
+- **Backups:** `/api/backup.json` exports watches, non-plugin sources, filters, and tracked items (saved/applied actions, notes, or reminders) with their item history. Restore adds missing tracked items without overwriting existing item IDs. It excludes `smtp_password`, learned readers, and scan history.
 
 ## Reporting a security issue
 

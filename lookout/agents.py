@@ -73,6 +73,17 @@ def _agy(exe, model, workdir, timeout):
     return cmd + (["--model", model] if model else [])
 
 
+def _gemini(exe, model, workdir, timeout):
+    cmd = [exe, "-p", prompt_for(workdir), "--yolo"]
+    try:
+        _, help_text = _run([exe, "--help"], 15)
+        if "--sandbox" in help_text:
+            cmd.append("--sandbox")
+    except Exception:
+        pass
+    return cmd + (["-m", model] if model else [])
+
+
 # verified: flags checked against the CLI's --help on a real install
 AGENTS: Dict[str, Dict] = {
     "claude": {"name": "Claude Code", "exe": "claude", "verified": True, "build": _claude,
@@ -80,7 +91,7 @@ AGENTS: Dict[str, Dict] = {
     "codex": {"name": "Codex CLI", "exe": "codex", "verified": True, "build": _codex,
               "models": [("gpt-6.2-sol", "GPT-6.2-Sol"), ("gpt-6.2-astra", "GPT-6.2-Astra")]},
     "gemini": {"name": "Gemini CLI", "exe": "gemini", "verified": True,
-               "build": lambda e, m, w, t: [e, "-p", prompt_for(w), "--yolo"] + (["-m", m] if m else []),
+               "build": _gemini,
                "models": [("gemini-2.5-flash", "Gemini 2.5 Flash"), ("gemini-2.5-pro", "Gemini 2.5 Pro")]},
     "agy": {"name": "Antigravity CLI", "exe": "agy", "verified": True, "build": _agy, "list_models": ["models"]},
     "opencode": {"name": "opencode", "exe": "opencode", "verified": True, "list_models": ["models"],
@@ -171,13 +182,28 @@ def cancel(tag: Optional[str] = None, async_browser: bool = False) -> int:
     return len(procs)
 
 
+_LOGIN_ENV = {
+    "claude": {"ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"},
+    "codex": {"OPENAI_API_KEY"},
+    "gemini": {"GEMINI_API_KEY", "GOOGLE_API_KEY"},
+    "opencode": {"OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GOOGLE_API_KEY", "GEMINI_API_KEY", "OPENROUTER_API_KEY", "DEEPSEEK_API_KEY", "GROQ_API_KEY", "MISTRAL_API_KEY"},
+}
+_SECRET_ENV_RE = re.compile(r"TOKEN|SECRET|PASSWORD|API_KEY", re.I)
+
+
+def _task_environment(agent_id: str) -> Dict[str, str]:
+    allowed = _LOGIN_ENV.get(agent_id, set())
+    return {k: v for k, v in os.environ.items() if not _SECRET_ENV_RE.search(k) or k in allowed}
+
+
 def _run_proc(cmd: List[str], timeout: int, cwd: Optional[str] = None, tag: Optional[str] = None,
-              session: Optional[str] = None, cancel_event: Optional[threading.Event] = None) -> Tuple[int, str, str]:
+              session: Optional[str] = None, cancel_event: Optional[threading.Event] = None,
+              env: Optional[Dict[str, str]] = None) -> Tuple[int, str, str]:
     if cancel_event and cancel_event.is_set():
         raise CancelledError("cancelled")
     kwargs: Dict[str, Any] = dict(
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace",
-        cwd=cwd, stdin=subprocess.DEVNULL,
+        cwd=cwd, stdin=subprocess.DEVNULL, env=env,
     )
     if sys.platform == "win32":
         kwargs["creationflags"] = NO_WINDOW | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
@@ -224,8 +250,9 @@ def _run_proc(cmd: List[str], timeout: int, cwd: Optional[str] = None, tag: Opti
 
 
 def run_tracked(cmd: List[str], timeout: int, cwd: Optional[str] = None, tag: Optional[str] = None,
-                session: Optional[str] = None, cancel_event: Optional[threading.Event] = None) -> Tuple[int, str]:
-    code, out, err = _run_proc(cmd, timeout, cwd=cwd, tag=tag, session=session, cancel_event=cancel_event)
+                session: Optional[str] = None, cancel_event: Optional[threading.Event] = None,
+                env: Optional[Dict[str, str]] = None) -> Tuple[int, str]:
+    code, out, err = _run_proc(cmd, timeout, cwd=cwd, tag=tag, session=session, cancel_event=cancel_event, env=env)
     return code, out + err
 
 
@@ -479,11 +506,13 @@ def run_task(agent_id: str, model: str, workdir: Path, timeout: int, tag: Option
         raise RuntimeError(f"{agent_id} quota is used up until {blocked[11:16]}")
     cmd = build_command(agent_id, model, str(workdir), timeout, task_kind=task_kind)
     if run_tracked is _DEFAULT_RUN_TRACKED:
-        code, stdout, stderr = _run_proc(cmd, timeout + 60, str(workdir), tag=tag, session=session, cancel_event=cancel_event)
+        code, stdout, stderr = _run_proc(cmd, timeout + 60, str(workdir), tag=tag, session=session, cancel_event=cancel_event,
+                                         env=_task_environment(agent_id))
         out = stdout + stderr
         tail = _quota_tail(stdout, stderr)
     else:
-        code, out = run_tracked(cmd, timeout + 60, str(workdir), tag=tag, session=session, cancel_event=cancel_event)
+        code, out = run_tracked(cmd, timeout + 60, str(workdir), tag=tag, session=session, cancel_event=cancel_event,
+                                env=_task_environment(agent_id))
         tail = _quota_tail(out, "")
     quota_hit = code != 0 and bool(QUOTA.search(tail))
     reset = None

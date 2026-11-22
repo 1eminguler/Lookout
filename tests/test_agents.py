@@ -1,6 +1,7 @@
 """Unit tests for agent detection, command building, model cache, cancellation and quota handling."""
 from datetime import datetime, timedelta, timezone
 import sys
+import os
 import threading
 import time
 import unittest
@@ -44,6 +45,20 @@ class AgentTests(TempLookoutTestCase):
                 agents.build_command("codex", "my-model", workdir, 60),
                 expected + ["-m", "my-model"],
             )
+
+    def test_gemini_sandbox_flag_only_when_cli_help_advertises_it(self):
+        with patch("shutil.which", return_value="/bin/gemini"), patch.object(agents, "_run", return_value=(0, "Options: --sandbox")):
+            self.assertIn("--sandbox", agents.build_command("gemini", "", "/tmp/work", 60))
+        with patch("shutil.which", return_value="/bin/gemini"), patch.object(agents, "_run", return_value=(0, "Options: --yolo")):
+            self.assertNotIn("--sandbox", agents.build_command("gemini", "", "/tmp/work", 60))
+
+    def test_task_environment_drops_secret_like_variables_except_agent_login(self):
+        with patch.dict(os.environ, {
+            "LOOKOUT_TEST_TOKEN": "drop", "SOME_SECRET": "drop", "DB_PASSWORD": "drop",
+            "SERVICE_API_KEY": "drop", "ANTHROPIC_API_KEY": "login", "PATH": "path",
+        }, clear=True):
+            env = agents._task_environment("claude")
+        self.assertEqual(env, {"ANTHROPIC_API_KEY": "login", "PATH": "path"})
 
     def test_custom_command_template_and_errors(self):
         db.set_settings({"custom_command": "mycli run -m {model} --dir {dir} {prompt}"})

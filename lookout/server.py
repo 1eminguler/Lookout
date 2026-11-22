@@ -492,13 +492,17 @@ def _parse_date_field(v: Any, name: str) -> Optional[str]:
 
 
 def _backup_payload() -> Dict[str, Any]:
+    tracked = [i for i in db._rows("SELECT * FROM items WHERE action IN ('saved','applied') OR COALESCE(note,'')!='' OR remind_on IS NOT NULL")]
+    item_ids = {i["id"] for i in tracked}
     return {
         "version": 1,
         "exported": db.now(),
         "watches": [{k: w[k] for k in ("id", "title", "request", "active")} for w in db.watches()],
-        "sources": [{k: s[k] for k in ("name", "url", "notes", "active", "watch_id")}
+        "sources": [{k: s[k] for k in ("id", "name", "url", "notes", "active", "watch_id")}
                     for s in db.sources() if s.get("method") != "plugin"],
         "filters": [{k: f[k] for k in ("kind", "value", "active", "watch_id")} for f in db.filters()],
+        "items": tracked,
+        "item_history": [h for item_id in item_ids for h in db.item_history(item_id, limit=10000)],
     }
 
 
@@ -506,10 +510,13 @@ def _import_payload(b: Dict[str, Any]) -> Dict[str, int]:
     in_watches = b.get("watches") or []
     in_sources = b.get("sources") or []
     in_filters = b.get("filters") or []
-    if not all(isinstance(x, list) for x in (in_watches, in_sources, in_filters)):
-        raise ValueError("watches, sources and filters must be lists")
+    in_items = b.get("items") or []
+    in_history = b.get("item_history") or []
+    if not all(isinstance(x, list) for x in (in_watches, in_sources, in_filters, in_items, in_history)):
+        raise ValueError("watches, sources, filters, items and item_history must be lists")
     added = {"watches": 0, "sources": 0, "filters": 0}
     watch_map: Dict[int, int] = {}
+    source_map: Dict[int, int] = {}
     existing_w = {(w["title"].strip().lower(), (w.get("request") or "").strip().lower()): w["id"] for w in db.watches()}
     for w in in_watches:
         if not isinstance(w, dict):
@@ -553,6 +560,10 @@ def _import_payload(b: Dict[str, Any]) -> Dict[str, int]:
                 db.update_source(sid, active=0)
             existing_s.add(key)
             added["sources"] += 1
+        else:
+            sid = next((x["id"] for x in db.sources() if (x["url"].rstrip("/").lower(), x.get("watch_id")) == key), None)
+        if isinstance(s.get("id"), int) and sid:
+            source_map[s["id"]] = sid
 
     existing_f = {(f["kind"], f["value"].strip().lower(), f.get("watch_id")) for f in db.filters()}
     for f in in_filters:
@@ -568,6 +579,34 @@ def _import_payload(b: Dict[str, Any]) -> Dict[str, int]:
                 db.update_filter(fid, False)
             existing_f.add(key)
             added["filters"] += 1
+    item_columns = {"id", "source_id", "source_name", "title", "org", "category", "url", "deadline", "start_date", "location", "summary", "extra", "status", "first_scan", "last_scan", "first_seen", "last_seen", "notified", "expired", "action", "note", "remind_on", "match", "match_key", "watch_id", "snoozed_until", "deadline_raw", "reminded_at", "updated_at", "change_summary"}
+    for item in in_items:
+        if not isinstance(item, dict) or not item.get("id"):
+            raise ValueError("invalid item entry")
+        row = {k: v for k, v in item.items() if k in item_columns}
+        if row.get("source_id") is not None:
+            row["source_id"] = source_map.get(row["source_id"])
+        if row.get("watch_id") is not None:
+            row["watch_id"] = watch_map.get(row["watch_id"])
+        row["first_scan"] = None
+        row["last_scan"] = None
+        if not row.get("source_name") or not row.get("title") or not row.get("url") or not row.get("first_seen") or not row.get("last_seen"):
+            raise ValueError("item is missing required fields")
+        if db._one("SELECT id FROM items WHERE id=?", (row["id"],)):
+            continue
+        keys = list(row)
+        db._exec(f"INSERT INTO items({','.join(keys)}) VALUES({','.join('?' for _ in keys)})", [row[k] for k in keys])
+        added["items"] = added.get("items", 0) + 1
+    for h in in_history:
+        if not isinstance(h, dict) or h.get("item_id") not in {x.get("id") for x in in_items if isinstance(x, dict)}:
+            continue
+        exists = db._one("SELECT id FROM item_history WHERE item_id=? AND changed_at=? AND kind=? AND field IS ? AND old_value IS ? AND new_value IS ?",
+                         (h["item_id"], h.get("changed_at"), h.get("kind"), h.get("field"), h.get("old_value"), h.get("new_value")))
+        if exists:
+            continue
+        db._exec("INSERT INTO item_history(item_id,scan_id,changed_at,kind,field,old_value,new_value) VALUES(?,?,?,?,?,?,?)",
+                 (h["item_id"], None, str(h.get("changed_at") or db.now()), str(h.get("kind") or "updated"), h.get("field"), h.get("old_value"), h.get("new_value")))
+        added["item_history"] = added.get("item_history", 0) + 1
     return added
 
 
@@ -801,6 +840,12 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(200, state(limit=lim, offset=off))
         if path == "/api/counts":
             return self.send(200, db.counts())
+        if m := re.fullmatch(r"/api/sources/(\d+)/tracked-count", path):
+            sid = int(m[1])
+            return self.send(200, {"count": db.source_tracked_item_count(sid)})
+        if m := re.fullmatch(r"/api/watches/(\d+)/tracked-count", path):
+            wid = int(m[1])
+            return self.send(200, {"count": db.watch_tracked_item_count(wid)})
         if path == "/api/progress":
             return self.send(200, {
                 "progress": scanner.get_progress(),

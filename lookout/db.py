@@ -639,18 +639,18 @@ def update_watch(wid: int, **fields) -> bool:
 
 def delete_watch(wid: int) -> bool:
     with _lock, _conn() as c:
+        item_scope = "(watch_id=? OR source_id IN (SELECT id FROM sources WHERE watch_id=?))"
+        tracked_scope = f"{item_scope} AND (COALESCE(action,'') IN ('saved','applied') OR COALESCE(note,'')!='' OR remind_on IS NOT NULL)"
+        c.execute(f"DELETE FROM scan_items WHERE item_id IN (SELECT id FROM items WHERE {item_scope})", (wid, wid))
+        c.execute(f"UPDATE items SET source_id=NULL, watch_id=NULL, action=CASE WHEN action IN ('saved','applied') THEN action ELSE 'saved' END WHERE {tracked_scope}", (wid, wid))
         c.execute(
             "DELETE FROM item_history WHERE item_id IN ("
-            "SELECT id FROM items WHERE watch_id=? OR source_id IN (SELECT id FROM sources WHERE watch_id=?))",
+            f"SELECT id FROM items WHERE {item_scope} AND NOT (COALESCE(action,'') IN ('saved','applied') OR COALESCE(note,'')!='' OR remind_on IS NOT NULL))",
             (wid, wid),
         )
+        c.execute("DELETE FROM scan_items WHERE scan_id IN (SELECT id FROM scans WHERE watch_id=?)", (wid,))
         c.execute(
-            "DELETE FROM scan_items WHERE scan_id IN (SELECT id FROM scans WHERE watch_id=?) "
-            "OR item_id IN (SELECT id FROM items WHERE watch_id=? OR source_id IN (SELECT id FROM sources WHERE watch_id=?))",
-            (wid, wid, wid),
-        )
-        c.execute(
-            "DELETE FROM items WHERE watch_id=? OR source_id IN (SELECT id FROM sources WHERE watch_id=?)",
+            f"DELETE FROM items WHERE {item_scope}",
             (wid, wid),
         )
         c.execute(
@@ -911,6 +911,16 @@ def source_open_item_count(sid: int) -> int:
     return int(r["n"]) if r else 0
 
 
+def source_tracked_item_count(sid: int) -> int:
+    r = _one("SELECT COUNT(*) n FROM items WHERE source_id=? AND (action IN ('saved','applied') OR COALESCE(note,'')!='' OR remind_on IS NOT NULL)", (sid,))
+    return int(r["n"]) if r else 0
+
+
+def watch_tracked_item_count(wid: int) -> int:
+    r = _one("SELECT COUNT(*) n FROM items WHERE (watch_id=? OR source_id IN (SELECT id FROM sources WHERE watch_id=?)) AND (action IN ('saved','applied') OR COALESCE(note,'')!='' OR remind_on IS NOT NULL)", (wid, wid))
+    return int(r["n"]) if r else 0
+
+
 def add_source(name: str, url: str, notes: str = "", method: str = "agent", plugin: Optional[str] = None,
                watch_id: Optional[int] = None) -> int:
     clean_url = url.strip()[:500]
@@ -955,8 +965,9 @@ def update_source(sid: int, **fields) -> bool:
 
 def delete_source(sid: int) -> bool:
     with _lock, _conn() as c:
-        c.execute("DELETE FROM item_history WHERE item_id IN (SELECT id FROM items WHERE source_id=?)", (sid,))
         c.execute("DELETE FROM scan_items WHERE item_id IN (SELECT id FROM items WHERE source_id=?)", (sid,))
+        c.execute("UPDATE items SET source_id=NULL, watch_id=NULL, action=CASE WHEN action IN ('saved','applied') THEN action ELSE 'saved' END WHERE source_id=? AND (COALESCE(action,'') IN ('saved','applied') OR COALESCE(note,'')!='' OR remind_on IS NOT NULL)", (sid,))
+        c.execute("DELETE FROM item_history WHERE item_id IN (SELECT id FROM items WHERE source_id=? AND NOT (COALESCE(action,'') IN ('saved','applied') OR COALESCE(note,'')!='' OR remind_on IS NOT NULL))", (sid,))
         c.execute("DELETE FROM items WHERE source_id=?", (sid,))
         c.execute("DELETE FROM scan_sources WHERE source_id=?", (sid,))
         cur = c.execute("DELETE FROM sources WHERE id=?", (sid,))

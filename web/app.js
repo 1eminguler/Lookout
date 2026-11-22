@@ -862,7 +862,8 @@ function renderSettings() {
       <label class="check"><input type="checkbox" id="headedIn" ${st.headed === "1" ? "checked" : ""}> Show the browser while your agent works</label>
       <label class="f">Sites your agent works on at once<input type="number" id="parallelIn" min="1" max="8" value="${esc(st.parallel)}"></label>
       <label class="check span-all"><input type="checkbox" id="verifyIn" ${st.verify_weekly === "1" ? "checked" : ""}> Once a week, check learned sites and relearn only if results look anomalous</label>
-    </div><p class="muted fs-125 mt-12">Agent tools don't report how much quota is left. Lookout counts the calls it makes, remembers the last quota error and skips an agent until its quota resets.</p>
+    </div><p class="muted fs-125 mt-12">Isolation: Codex runs with its workspace-write sandbox; Gemini uses its CLI sandbox only when <code>--help</code> advertises it. Claude restricts tools per task but has no OS sandbox. Antigravity, opencode, Cursor Agent, Qwen, Copilot and custom commands are not sandboxed by Lookout. Agent tasks run from a temporary folder with secret-like environment variables removed, except known login variables for the selected CLI.</p>
+    <p class="muted fs-125 mt-12">Agent tools don't report how much quota is left. Lookout counts the calls it makes, remembers the last quota error and skips an agent until its quota resets.</p>
     <div class="row mt-12"><span class="grow"></span><button class="btn primary" data-act="save-agent">Save</button></div></div>
     <div class="h2">Schedule and notifications</div><div class="box pad">
       <div class="setrow"><div><b>Daily scan</b><small>${sch.supported ? `Runs in the background even when Lookout is closed${sch.backend ? ` (${esc(sch.backend)})` : ""}.` : esc(sch.hint || "Manual cron/systemd/launchd setup available below.")}</small></div>
@@ -895,7 +896,7 @@ function renderSettings() {
         <option value="0" ${st.smtp_starttls === "0" ? "selected" : ""}>Never (plain / SSL on 465)</option>
       </select></label>
     </div><div class="row mt-12"><span class="grow"></span><button class="btn" data-act="mail-test">Send test e-mail</button><button class="btn primary" data-act="save-mail">Save</button></div></div>
-    <div class="h2">Backup and restore</div><div class="box pad"><div class="setrow"><div><b>Watches, sources and filters</b><small>Export or restore your setup as JSON (passwords are never included).</small></div>
+    <div class="h2">Backup and restore</div><div class="box pad"><div class="setrow"><div><b>Setup and tracked items</b><small>Export or restore watches, sources, filters, saved/applied items and item history (passwords are never included).</small></div>
       <div class="row"><button type="button" class="btn sm" data-dl="/api/backup.json" data-fn="lookout-backup.json">${I.dl} Export JSON</button>
         <button type="button" class="btn sm" data-act="import-btn">Import JSON</button>
         <input type="file" id="importFile" accept="application/json" class="hidden"></div></div></div></div>`;
@@ -1125,7 +1126,7 @@ document.addEventListener("click", async (e) => {
     if (d.srcResume) { await api(`/api/sources/${d.srcResume}/resume`, {}); toast("Source resumed"); return refresh(false); }
     if (d.srcScan) { const r = await api("/api/scan", { only: [Number(d.srcScan)] }); toast(r.started ? "Scanning this source" : "A scan is already running"); return pollProgress(); }
     if (d.srcRelearn) { await api(`/api/sources/${d.srcRelearn}`, { relearn: true }); toast("Your agent will relearn this site on the next scan"); return refresh(false); }
-    if (d.srcDel) { if (!confirm("Delete this source and its collected items?")) return; await api(`/api/sources/${d.srcDel}/delete`, {}); return refresh(true); }
+    if (d.srcDel) { const { count } = await api(`/api/sources/${d.srcDel}/tracked-count`); const detail = count ? ` ${count} tracked item${count === 1 ? "" : "s"} with actions, notes, or reminders will be kept in Agenda/Applied.` : " No tracked items will be kept."; if (!confirm(`Delete this source?${detail} Other collected items will be deleted.`)) return; await api(`/api/sources/${d.srcDel}/delete`, {}); return refresh(true); }
     if (d.srcEdit) { const id = Number(d.srcEdit); editingSourceId = editingSourceId === id ? null : id; return render(); }
     if (d.cand !== undefined) { const c = S.discovery.results[Number(d.cand)]; await api("/api/sources", { name: c.name, url: c.url, notes: c.notes || "", watch_id: S.discovery.watch_id || null }); toast(`Added ${c.name}`); return refresh(false); }
     if (d.discCand !== undefined) { const dd = discCache[Number(d.discId)]; const c = dd?.results?.[Number(d.discCand)]; if (!c) return; await api("/api/sources", { name: c.name, url: c.url, notes: c.notes || "", watch_id: dd.watch_id || null }); toast(`Added ${c.name}`); return refresh(false); }
@@ -1150,7 +1151,7 @@ document.addEventListener("click", async (e) => {
       toast("A search is already running");
       return pollProgress();
     }
-    if (d.watchDel) { if (!confirm("Delete this watch along with its sources, filters, scans and items?")) return; await api(`/api/watches/${d.watchDel}/delete`, {}); location.hash = "#/feed"; return refresh(true); }
+    if (d.watchDel) { const { count } = await api(`/api/watches/${d.watchDel}/tracked-count`); const detail = count ? ` ${count} tracked item${count === 1 ? "" : "s"} with actions, notes, or reminders will be kept in Agenda/Applied.` : " No tracked items will be kept."; if (!confirm(`Delete this watch, its sources, filters and scans?${detail} Other collected items will be deleted.`)) return; await api(`/api/watches/${d.watchDel}/delete`, {}); location.hash = "#/feed"; return refresh(true); }
     if (d.act === "save-agent") {
       await api("/api/settings", {
         agent: $("input[name=agent]:checked")?.value || "",

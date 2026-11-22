@@ -570,6 +570,27 @@ class ServerTests(TempLookoutTestCase):
             time.sleep(0.05)
         self.fail("test_job did not finish in time")
 
+    def test_backup_restores_tracked_items_and_history(self):
+        sid = db.add_source("Tracked Backup", "https://backup-tracked.example.com")
+        scan = db.start_scan("manual", "claude", "", [])
+        db.save_item(scan, db.source_by_id(sid), {"id": "backup-tracked", "title": "Saved item", "url": "https://backup-tracked.example.com/1"})
+        db.save_item(scan, db.source_by_id(sid), {"id": "backup-tracked", "title": "Saved item updated", "url": "https://backup-tracked.example.com/1"})
+        db.set_item("backup-tracked", action="saved", note="Interview prep", remind_on="2027-02-03")
+        self.assertTrue(db.item_history("backup-tracked"))
+        code, backup = self.req("GET", "/api/backup.json")
+        self.assertEqual(code, 200)
+        self.assertEqual(len(backup["items"]), 1)
+        db._exec("DELETE FROM item_history WHERE item_id=?", ("backup-tracked",))
+        db._exec("DELETE FROM items WHERE id=?", ("backup-tracked",))
+        code, restored = self.req("POST", "/api/import", backup)
+        self.assertEqual(code, 200)
+        item = db.item_by_id("backup-tracked")
+        self.assertEqual(item["action"], "saved")
+        self.assertEqual(item["note"], "Interview prep")
+        self.assertEqual(item["remind_on"], "2027-02-03")
+        self.assertTrue(db.item_history("backup-tracked"))
+        self.assertEqual(restored["added"]["items"], 1)
+
     def test_async_test_source_cancel_rss_webhook_schedule_counts_progress_and_items_api(self):
         wid = db.add_watch("AI Grants", "ai grants")
         sid = db.add_source("GrantBoard", "https://grants.example.com", watch_id=wid)

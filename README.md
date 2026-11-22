@@ -36,6 +36,7 @@ breaks, the agent fixes it.
 
 - [Why Lookout](#why-lookout)
 - [How it works](#how-it-works)
+- [Watches](#watches)
 - [A tour](#a-tour)
 - [Quick start](#quick-start)
 - [Supported agents](#supported-agents)
@@ -44,6 +45,7 @@ breaks, the agent fixes it.
 - [Safety](#safety)
 - [How it compares](#how-it-compares)
 - [FAQ](#faq)
+- [Run the tests](#run-the-tests)
 - [Contributing](#contributing)
 
 ## Why Lookout
@@ -51,6 +53,9 @@ breaks, the agent fixes it.
 - **Bring your own agent.** Lookout detects which agent CLIs are installed on the machine it runs
   on and lets you pick one — and a model, with low / medium / high effort where the agent offers it.
   No API keys, no cloud account, nothing to pay for beyond the agent you already use.
+- **Watches from plain English.** Describe what you want to monitor on Home: Lookout creates a watch,
+  discovers matching sources, writes filters for that watch, adds confirmed sources, and starts its
+  first scan immediately.
 - **Learns each site once.** The first scan is a few minutes of the agent browsing. Every scan after
   that is seconds of plain Python, because the agent left a reader behind.
 - **Self-healing.** If a reader errors, returns nothing, suddenly returns far fewer items, or returns
@@ -58,14 +63,18 @@ breaks, the agent fixes it.
   week the agent re-checks each site anyway.
 - **Filters in plain words.** "Software or ML roles", "remote or Europe", "exclude unpaid",
   "deadline within 30 days", "I am a final-year student" — sent to the agent, and enforced again locally.
-- **Find sources by describing them.** Type what you want to follow; the agent searches the web,
-  checks the pages and suggests sources to add.
-- **Deadlines, agenda, reminders.** Save items to an agenda with a month calendar, reminder dates,
-  notes and an `.ics` export for Google Calendar, Outlook or Apple Calendar.
+  Global filters apply everywhere; each watch also keeps its own sources and filters.
+- **Stop means stop.** Cancelling a scan or web search immediately terminates running agent subprocesses
+  and closes any browser sessions they opened. Runs cut short by closing the app are marked
+  `interrupted` on the next start-up.
+- **Deadlines, agenda, reminders, snooze.** Save items to an agenda with a month calendar, reminder dates,
+  notes and an `.ics` export for Google Calendar, Outlook or Apple Calendar, or snooze items until later.
+  Cross-source duplicates are folded automatically into one card.
 - **Every scan is kept** — which sources were read, what failed and why, which filters were used,
   what was found — like the chat history in your agent's app.
 - **A real desktop app.** Native window, daily background scans (even when the app is closed),
-  desktop notifications and an optional e-mail digest. All data stays in a local SQLite file.
+  desktop notifications, an optional e-mail digest, and JSON backup/import (without secrets). All data
+  stays in a local SQLite file.
 
 ## How it works
 
@@ -99,6 +108,19 @@ flowchart LR
 4. **Filter.** New items go to the agent in one batch (no browsing) to be checked against your
    filters. Exclusions and deadlines are also enforced by Lookout itself.
 5. **Heal.** A broken or suspicious reader is sent back to the agent together with the error.
+
+## Watches
+
+Each request you submit on **Home** becomes a **watch** in the sidebar above **History**:
+
+1. The agent searches the web for relevant listing pages (`sources.json`) and converts your request
+   into scoped watch filters (`filters.json`).
+2. Confirmed sources are added to that watch automatically and a first scan of just those sources
+   starts immediately.
+3. Items are evaluated against your **global filters** plus the **filters of the watch** their source
+   belongs to. Click a watch in the sidebar to see its dedicated feed, sources, and filters, or browse
+   **Feed** to see everything together. Global sources and filters added directly keep working across
+   all watches.
 
 ## A tour
 
@@ -248,6 +270,20 @@ the pages your agent visits and whatever your agent CLI itself sends to its mode
 **Can it run on a server?** Yes: `python run.py scan` from cron or Task Scheduler, and
 `python run.py --browser` to open the UI. Set `LOOKOUT_DATA_DIR`, `LOOKOUT_PLUGIN_DIR` and
 `LOOKOUT_PORT` to run several instances.
+
+## Run the tests
+
+Tests use Python's built-in `unittest` module with temporary directories, free ports, and fakes — no
+network access and no real agent calls:
+
+```bash
+python -m unittest discover -s tests -v
+node --check web/app.js
+python -m compileall -q run.py lookout
+```
+
+The optional Playwright UI smoke test (`tests/test_ui.py`) runs automatically when `playwright` and
+Chromium are installed, and skips cleanly otherwise.
 
 ## Contributing
 

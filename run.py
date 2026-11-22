@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Lookout — monitor any website with the AI agent you already have installed.
 
-    python run.py            open the app in your browser
-    python run.py scan       run one scan now (used by the daily schedule)
+    python run.py              open the app in a window (or your browser)
+    python run.py --headless   serve without opening anything; print the sign-in link (servers, Docker)
+    python run.py --print-url  print the sign-in link of the instance that is already running
+    python run.py scan         run one scan now (used by the daily schedule)
 """
 import argparse
 import os
@@ -188,6 +190,37 @@ def cmd_scan(scheduled: bool) -> None:
                        notify.desktop_launch_url(URL))
 
 
+def _announce_link(secret: str) -> None:
+    print(f"Sign in to Lookout: http://127.0.0.1:{server.PORT}/?k={secret}  (one-time link)", flush=True)
+
+
+def cmd_headless() -> None:
+    """Serve without a window or browser; print each new one-time sign-in link."""
+    if port_busy():
+        print(f"Port {server.PORT} is already in use. If Lookout is running, use: python run.py --print-url",
+              file=sys.stderr)
+        sys.exit(1)
+
+    def on_start(srv) -> None:
+        srv.on_new_secret = _announce_link
+        print(f"Lookout is serving on port {server.PORT}.", flush=True)
+        if getattr(srv, "launch_secret", None):
+            _announce_link(srv.launch_secret)
+
+    server.serve(on_start=on_start)
+
+
+def cmd_print_url() -> None:
+    if not port_busy():
+        print(f"Lookout is not running on port {server.PORT}.", file=sys.stderr)
+        sys.exit(1)
+    url = _launch_url()
+    if "?k=" not in url:
+        print("No sign-in link is available. Restart Lookout to get a new one.", file=sys.stderr)
+        sys.exit(1)
+    print(url)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Lookout")
     ap.add_argument("command", nargs="?", default="ui", choices=["ui", "scan"])
@@ -195,7 +228,14 @@ def main() -> None:
     ap.add_argument("--background", action="store_true", help=argparse.SUPPRESS)
     ap.add_argument("--browser", action="store_true", help="open in your web browser instead of a window")
     ap.add_argument("--custom-command", default=None, help="custom agent command template (local CLI only)")
+    ap.add_argument("--headless", action="store_true",
+                    help="serve without opening a window or browser and print the sign-in link "
+                         "(also when LOOKOUT_HEADLESS=1)")
+    ap.add_argument("--print-url", action="store_true",
+                    help="print the sign-in link of the Lookout that is already running")
     a = ap.parse_args()
+    if a.print_url:
+        return cmd_print_url()
     if a.custom_command is not None:
         try:
             agents.set_cli_custom_command(a.custom_command)
@@ -204,6 +244,8 @@ def main() -> None:
             sys.exit(2)
     if a.command == "scan":
         return cmd_scan(a.scheduled)
+    if a.headless or os.environ.get("LOOKOUT_HEADLESS", "").strip().lower() in ("1", "true", "yes"):
+        return cmd_headless()
     if port_busy():
         if not a.background and (a.browser or not open_window(start_server=False)):
             webbrowser.open(_launch_url())

@@ -1296,3 +1296,39 @@ document.addEventListener("keydown", (e) => {
 });
 document.addEventListener("visibilitychange", () => { if (!document.hidden) refresh(false); });
 parseRoute(); refresh(true);
+
+// Render a self-contained pack picker for the settings and new-watch screens.
+async function renderStarterPacks(container) {
+  container.textContent = "Loading starter packs…";
+  try {
+    const packs = await api("/api/packs");
+    container.innerHTML = `<label>Starter pack <select data-pack>${packs.map(p => `<option value="${esc(p.id)}">${esc(p.name)}</option>`).join("")}</select></label><div data-preview></div>`;
+    const select = $("[data-pack]", container), preview = $("[data-preview]", container);
+    function show() {
+      const pack = packs.find(p => p.id === select.value);
+      if (!pack) { preview.textContent = "No starter packs available."; return; }
+      preview.innerHTML = `<p>${esc(pack.description)}</p><p>Suggested filters: ${pack.suggested_filters.map(f => esc(f.value)).join(", ")}</p>
+        <div>${pack.sources.map((s, i) => `<label><input type="checkbox" data-source="${i}" checked> <strong>${esc(s.name)}</strong> — <a href="${esc(safeUrl(s.url))}" target="_blank" rel="noopener noreferrer">${esc(s.url)}</a><br>${esc(s.notes)}</label><br>`).join("")}</div>
+        <label>Destination <select data-target><option value="watch">New watch</option><option value="global">Global sources</option></select></label>
+        <label data-title-label>Watch title <input data-title value="${esc(pack.name)}"></label>
+        <button type="button" data-add>Add selected sources</button><p data-result role="status"></p>`;
+      const target = $("[data-target]", preview);
+      target.addEventListener("change", () => { $("[data-title-label]", preview).hidden = target.value !== "watch"; });
+      $("[data-add]", preview).addEventListener("click", async (event) => {
+        const result = $("[data-result]", preview);
+        const sources = [...preview.querySelectorAll("[data-source]:checked")].map(el => pack.sources[Number(el.dataset.source)].url);
+        if (!sources.length) { result.textContent = "Select at least one source."; return; }
+        const button = event.currentTarget;
+        button.disabled = true;
+        try {
+          const added = await api(`/api/packs/${encodeURIComponent(pack.id)}/add`, { sources, target: target.value, title: $("[data-title]", preview).value });
+          result.textContent = `Added ${added.added} sources; skipped ${added.skipped} existing URLs.`;
+          await refresh();
+        } catch (err) { result.textContent = cleanErr(err.message); }
+        finally { button.disabled = false; }
+      });
+    }
+    select.addEventListener("change", show);
+    show();
+  } catch (err) { container.textContent = `Could not load starter packs: ${cleanErr(err.message)}`; }
+}

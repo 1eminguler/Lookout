@@ -28,6 +28,7 @@ py-modules = ["run"]
 packages = ["lookout", "web"]
 
 [tool.setuptools.package-data]
+lookout = ["packs/*.json"]
 web = ["*"]
 
 [tool.ruff]

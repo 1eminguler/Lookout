@@ -1023,6 +1023,28 @@ class ServerTests(TempLookoutTestCase):
                 time.sleep(0.05)
         self.assertEqual(db.scans()[0]["status"], "cancelled")
 
+    def test_starter_packs_and_duplicate_sources(self):
+        code, packs = self.req("GET", "/api/packs")
+        self.assertEqual(code, 200)
+        self.assertEqual(len(packs), 3)
+        for pack in packs:
+            self.assertTrue(pack["name"] and pack["description"] and pack["suggested_filters"])
+            for source in pack["sources"]:
+                self.assertTrue(source["name"] and source["notes"])
+                self.assertTrue(source["url"].startswith("https://"))
+        pack = packs[0]
+        urls = [s["url"] for s in pack["sources"][:2]]
+        db.add_source("Existing", urls[0])
+        code, result = self.req("POST", f"/api/packs/{pack['id']}/add", {"target": "watch", "sources": urls})
+        self.assertEqual(code, 200)
+        self.assertEqual((result["added"], result["skipped"]), (1, 1))
+        self.assertEqual(len(db.sources(watch_id=result["watch_id"])), 1)
+        self.assertTrue(db.filters(watch_id=result["watch_id"]))
+        code, result = self.req("POST", f"/api/packs/{pack['id']}/add", {"target": "global", "sources": urls})
+        self.assertEqual((code, result["added"], result["skipped"]), (200, 0, 2))
+        self.assertEqual(self.req("POST", f"/api/packs/{pack['id']}/add", {"target": "global", "sources": ["https://invalid.example"]})[0], 400)
+        self.assertEqual(self.req("POST", "/api/packs/missing/add", {"target": "global", "sources": urls})[0], 404)
+
     def test_discovery_streams_partial_sources_into_scan_early(self):
         wid = db.add_watch("Early Watch", "early grants")
         did = db.start_discovery("early grants", "Early Watch", "claude", "", watch_id=wid)

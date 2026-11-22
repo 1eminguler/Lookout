@@ -1,0 +1,25 @@
+name: check
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ["3.10", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Compile
+        run: python -m compileall -q run.py lookout plugins
+      - name: Smoke test
+        env:
+          LOOKOUT_DATA_DIR: ${{ runner.temp }}/lookout-ci
+        run: |
+          python -c "import sys; sys.path.insert(0, '.'); from lookout import db, scanner, extractors, agents; db.init(); print(scanner.parse_date('Jan 15, 2027'), scanner.parse_date('22.11.2026')); extractors.check('from lookout_extract import get_json\ndef fetch():\n    return []\n'); print(len(agents.detect()), 'agents known')"

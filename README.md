@@ -8,6 +8,7 @@
 </p>
 
 <p align="center">
+  <a href="https://github.com/1eminguler/lookout/actions/workflows/check.yml"><img alt="check" src="https://github.com/1eminguler/lookout/actions/workflows/check.yml/badge.svg"></a>
   <img alt="Python 3.10+" src="https://img.shields.io/badge/python-3.10%2B-3776AB?logo=python&logoColor=white">
   <img alt="Platforms" src="https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-555">
   <img alt="No API keys" src="https://img.shields.io/badge/API%20keys-none-7B9CFF">

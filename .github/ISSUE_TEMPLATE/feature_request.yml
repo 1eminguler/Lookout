@@ -1,0 +1,14 @@
+name: Feature or agent request
+description: Suggest an improvement, or support for another agent CLI
+labels: [enhancement]
+body:
+  - type: textarea
+    id: idea
+    attributes:
+      label: What would you like Lookout to do?
+    validations:
+      required: true
+  - type: textarea
+    id: why
+    attributes:
+      label: Why does it matter to you?

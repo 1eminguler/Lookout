@@ -1,0 +1,30 @@
+name: Bug report
+description: Something does not work as expected
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What did you do, what did you expect, and what happened instead?
+    validations:
+      required: true
+  - type: input
+    id: agent
+    attributes:
+      label: Agent and model
+      placeholder: e.g. Gemini CLI 0.61, gemini-2.5-flash
+  - type: input
+    id: site
+    attributes:
+      label: Source URL (if a site fails)
+  - type: input
+    id: os
+    attributes:
+      label: Operating system and Python version
+      placeholder: e.g. Windows 11, Python 3.12
+  - type: textarea
+    id: logs
+    attributes:
+      label: Error shown in the app or terminal
+      render: text

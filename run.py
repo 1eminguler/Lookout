@@ -360,7 +360,15 @@ def open_window(start_server: bool = True) -> bool:
         api._window = webview.create_window("Lookout", _launch_url(srv), js_api=api, width=1320, height=860,
                                             min_size=(960, 620), frameless=True, easy_drag=False,
                                             background_color="#0A0A0B")
-        webview.start()
+        if sys.platform == "win32":
+            # Group the window under Lookout's own taskbar entry instead of Python's.
+            try:
+                import ctypes
+                ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("Lookout.Desktop")
+            except Exception:
+                pass
+        icon = ROOT / "web" / ("icon.ico" if sys.platform == "win32" else "icon.svg")
+        webview.start(icon=str(icon) if icon.is_file() else None)
         return True
     except Exception as e:
         print(f"Could not start desktop window ({e}); opening in browser.")

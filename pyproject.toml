@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lookout"
+version = "0.3.0"
+description = "Local web monitor with self-healing readers powered by your coding-agent CLI"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+authors = [{ name = "Mehmet Emin Guler" }]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/1eminguler/lookout"
+Repository = "https://github.com/1eminguler/lookout"
+
+[project.optional-dependencies]
+desktop = ["pywebview>=5"]
+dev = ["ruff>=0.8", "playwright>=1.45"]
+
+[project.scripts]
+lookout = "run:main"
+
+[tool.setuptools]
+py-modules = ["run"]
+packages = ["lookout", "web"]
+
+[tool.setuptools.package-data]
+web = ["*"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 120
+exclude = ["data", ".dev", ".git", "__pycache__", ".venv", "venv"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W"]
+ignore = ["E501", "E701", "E731"]

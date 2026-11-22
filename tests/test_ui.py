@@ -1,8 +1,11 @@
 """Playwright UI smoke tests (enforced when LOOKOUT_REQUIRE_UI_TEST=1; skipped if unavailable otherwise)."""
 import os
+import shutil
+import subprocess
 import threading
 import unittest
 from datetime import date, timedelta
+from pathlib import Path
 from unittest.mock import patch
 
 from lookout import agents, db, scanner, server
@@ -29,6 +32,39 @@ def _wait_js(page, expression, timeout=10000):
             pass
         page.wait_for_timeout(100)
     raise AssertionError(f"timed out waiting for: {expression}; body={page.inner_text('body')[-400:]!r}; url={page.url}")
+
+
+class FeedUnitTests(unittest.TestCase):
+    @unittest.skipUnless(shutil.which("node"), "Node.js is not installed")
+    def test_shared_url_programmes_render_as_separate_cards(self):
+        script = """
+const assert = require("node:assert/strict");
+const fs = require("node:fs");
+const vm = require("node:vm");
+const ignore = () => {};
+const context = {
+  localStorage: { getItem: () => null },
+  document: { body: { classList: { add: ignore } }, addEventListener: ignore },
+  window: { addEventListener: ignore },
+  location: { hash: "#/feed" },
+  clearTimeout: ignore,
+  fetch: () => new Promise(() => {}),
+};
+vm.runInNewContext(fs.readFileSync("web/app.js", "utf8"), context);
+const url = "https://example.com/careers";
+const summer = {id: "one", title: "Summer Internship", url, source_name: "Careers"};
+const talent = {id: "two", title: "Young Talent", url, source_name: "Careers"};
+const cards = context.dedupeItems([summer, talent, {...summer}])
+  .map((item) => context.itemCard(item, {isNew: false}));
+assert.equal(cards.length, 2);
+assert.match(cards[0], /Summer Internship/);
+assert.match(cards[1], /Young Talent/);
+"""
+        result = subprocess.run(
+            ["node", "-e", script], cwd=Path(__file__).resolve().parents[1],
+            capture_output=True, text=True, encoding="utf-8", timeout=15,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
 
 
 class UiSmokeTests(TempLookoutTestCase):

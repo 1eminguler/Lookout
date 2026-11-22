@@ -135,30 +135,13 @@ function ago(ts) {
 function duration(a, b) { if (!b) return ""; const s = Math.round((new Date(b.replace(" ", "T")) - new Date(a.replace(" ", "T"))) / 1000); return s < 60 ? `${s} s` : `${Math.floor(s / 60)} min ${s % 60} s`; }
 const watchById = (id) => (S?.watches || []).find((w) => w.id === id) || null;
 
-function canonUrl(u) {
-  try {
-    const p = new URL(u);
-    return (p.origin + p.pathname.replace(/\/+$/, "") + p.search).toLowerCase();
-  } catch {
-    return String(u || "").replace(/\/+$/, "").toLowerCase();
-  }
-}
 function dedupeItems(list) {
-  const byUrl = new Map(), byTitleOrg = new Map(), out = [];
-  for (const it of list) {
-    const u = canonUrl(it.url), t = (it.title || "").trim().toLowerCase(), o = (it.org || "").trim().toLowerCase();
-    const toKey = t && o ? `${t}|${o}` : "";
-    const hit = byUrl.get(u) || (toKey ? byTitleOrg.get(toKey) : null);
-    if (hit) {
-      if (hit.source_name !== it.source_name && !hit._alsoOn.includes(it.source_name)) hit._alsoOn.push(it.source_name);
-      continue;
-    }
-    const copy = { ...it, _alsoOn: [] };
-    byUrl.set(u, copy);
-    if (toKey) byTitleOrg.set(toKey, copy);
-    out.push(copy);
-  }
-  return out;
+  const seen = new Set();
+  return list.filter((item) => {
+    if (seen.has(item.id)) return false;
+    seen.add(item.id);
+    return true;
+  });
 }
 
 // ---------- server-side items fetching ----------
@@ -430,12 +413,11 @@ function itemCard(i, opts = {}) {
   const a = i.action, sn = isSnoozed(i), w = opts.showWatch && i.watch_id ? watchById(i.watch_id) : null;
   const who = [i.org, i.location].filter(Boolean).map((x) => `<span>${esc(x)}</span>`).join("");
   const b = (act, tip, on, cls = "") => `<button class="ib ${on ? "on" : ""} ${cls}" data-item="${esc(i.id)}" data-set="${act}" data-tip="${tip}" aria-label="${tip}">${act === "hidden" && on ? I.undo : I[{ saved: "save", applied: "done", hidden: "hide" }[act]]}</button>`;
-  const also = i._alsoOn && i._alsoOn.length ? `<span class="tag">also on ${esc(i._alsoOn.join(", "))}</span>` : "";
   const upd = isUpdated(i);
   const updLabel = i.last_change_kind === "deadline_moved" ? "Deadline moved" : i.last_change_kind === "reopened" ? "Reopened" : "Updated";
   const updTag = upd ? `<span class="tag updated">${updLabel}</span>` : "";
   return `<article class="item">${whenBox(i)}<div class="ibody">
-      <div class="meta">${(opts.isNew ?? isNew(i)) ? '<span class="tag new">New</span>' : ""}${updTag}${i.category ? `<span class="tag accent">${esc(i.category)}</span>` : ""}<span class="tag">${esc(i.source_name)}</span>${also}${w ? `<a class="tag accent no-dec" href="#/watch/${w.id}">${esc(w.title)}</a>` : ""}${sn ? `<span class="tag warn">snoozed until ${short(i.snoozed_until)}</span>` : ""}${i.status === "gone" ? '<span class="tag bad">no longer listed</span>' : ""}</div>
+      <div class="meta">${(opts.isNew ?? isNew(i)) ? '<span class="tag new">New</span>' : ""}${updTag}${i.category ? `<span class="tag accent">${esc(i.category)}</span>` : ""}<span class="tag">${esc(i.source_name)}</span>${w ? `<a class="tag accent no-dec" href="#/watch/${w.id}">${esc(w.title)}</a>` : ""}${sn ? `<span class="tag warn">snoozed until ${short(i.snoozed_until)}</span>` : ""}${i.status === "gone" ? '<span class="tag bad">no longer listed</span>' : ""}</div>
       <h3><a href="${esc(safeUrl(i.url))}" data-ext target="_blank" rel="noopener noreferrer">${esc(i.title)}</a></h3>
       ${who ? `<div class="who">${who}</div>` : ""}${upd && i.change_summary ? `<div class="change-note">${esc(i.change_summary)}</div>` : ""}${i.summary ? `<p class="sum">${esc(i.summary)}</p>` : ""}${i.note ? `<div class="note">${esc(i.note)}</div>` : ""}</div>
     <div class="acts">${b("saved", a === "saved" ? "Remove from agenda" : "Add to agenda", a === "saved")}${b("applied", a === "applied" ? "Mark as not done" : "Mark as done", a === "applied", "green")}<button class="ib ${sn ? "on" : ""}" data-pick="snooze" data-sid="${esc(i.id)}" data-tip="${sn ? "Snoozed until " + short(i.snoozed_until) : "Snooze"}" aria-label="Snooze">${I.clock}</button>${b("hidden", a === "hidden" ? "Unhide" : "Hide", a === "hidden")}</div></article>`;

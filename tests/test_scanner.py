@@ -1,4 +1,5 @@
 """Unit tests for lookout.scanner."""
+import hashlib
 import json
 import threading
 import time
@@ -28,7 +29,7 @@ class ScannerTests(TempLookoutTestCase):
         self.assertIsNone(scanner.parse_date(""))
         self.assertIsNone(scanner.parse_date(None))
 
-    def test_normalise_strips_html_placeholders_tracking_and_keys_by_url(self):
+    def test_normalise_strips_html_placeholders_tracking_and_keys_by_title_and_url(self):
         src = {"id": 7, "name": "Board", "url": "https://ex.com/list"}
         self.assertIsNone(scanner.normalise({"url": "https://ex.com/1"}, src))
         self.assertIsNone(scanner.normalise({"title": "Job", "url": "javascript:alert(1)"}, src))
@@ -50,9 +51,31 @@ class ScannerTests(TempLookoutTestCase):
         self.assertIsNone(it["summary"])
         self.assertEqual(it["deadline"], "2027-04-15")
 
-        # Title edit on the same source+URL preserves item id rather than creating a duplicate
         it_edited = scanner.normalise({"title": "ML Intern (Updated)", "url": "https://ex.com/jobs?id=7"}, src)
-        self.assertEqual(it["id"], it_edited["id"])
+        self.assertNotEqual(it["id"], it_edited["id"])
+        raw = {"id": "7", "title": "ML Intern", "url": "https://ex.com/jobs?id=7"}
+        self.assertEqual(scanner.normalise(raw, src)["id"],
+                         scanner.normalise(dict(raw, title=it_edited["title"]), src)["id"])
+
+    def test_scan_keeps_distinct_titles_with_same_url_and_preserves_legacy_item(self):
+        db.set_settings({"agent": "claude"})
+        sid = db.add_source("Careers", "https://example.com/jobs")
+        source = db.source_by_id(sid)
+        url = "https://example.com/careers"
+        raw = [{"title": title, "url": url} for title in ("Summer Internship", "Young Talent")]
+        legacy_id = hashlib.sha1(f"src:{sid}|{url}".encode()).hexdigest()[:20]
+        scan_id = db.start_scan("manual", "claude", "", [])
+        db.save_item(scan_id, source, dict(raw[0], id=legacy_id))
+        db.set_item(legacy_id, action="saved")
+        db.finish_scan(scan_id, "done")
+        with patch.object(scanner, "read_agent_source", return_value=raw):
+            for _ in range(2):
+                scan_id = scanner.run_scan("manual")
+                items = {item["title"]: item for item in db.scan_detail(scan_id)["items"]}
+                self.assertEqual(set(items), {"Summer Internship", "Young Talent"})
+                self.assertEqual(items["Summer Internship"]["id"], legacy_id)
+                self.assertEqual(items["Summer Internship"]["action"], "saved")
+                self.assertNotEqual(items["Young Talent"]["id"], legacy_id)
 
     def test_passes_exclude_deadlines_and_turkish_dotted_i(self):
         tomorrow = (date.today() + timedelta(days=1)).isoformat()
@@ -267,8 +290,7 @@ class ScannerTests(TempLookoutTestCase):
         db.update_source(sid, extractor=ok_code, last_good_extractor=ok_code, extractor_ok=1,
                          extractor_updated=db.now(), struct_fail_count=0, learn_fail_count=0, learn_retry_after=None)
 
-        # 3. Natural drop (5 open items -> 1 item or 0 items with healthy shape) does NOT trigger relearn
-        #    and run_scan() still marks disappeared items gone via db.mark_gone()
+        # 3. A nonempty read that drops from five listings to one closes the missing listings.
         scan1 = db.start_scan("manual", "claude", "", [])
         src_row = db.source_by_id(sid)
         for k in range(5):
@@ -285,27 +307,7 @@ class ScannerTests(TempLookoutTestCase):
         self.assertEqual(db.source_open_item_count(sid), 1)
         self.assertEqual(db.item_by_id("old1")["status"], "gone")
 
-        # Zero items without broken page shape also keeps extractor intact and marks final item gone
-        db.update_source(sid, extractor="def fetch(): return []", extractor_ok=1, extractor_updated=db.now())
-        with patch.object(scanner, "check_page_shape", return_value=None), \
-             patch.object(tasks, "learn_source") as m_learn:
-            res_empty = scanner.read_agent_source(db.source_by_id(sid), [])
-        self.assertEqual(res_empty, [])
-        m_learn.assert_not_called()
-        self.assertEqual(db.source_by_id(sid)["extractor_ok"], 1)
-
-        # 4. Zero items WITH broken page shape (check_page_shape returns a reason) counts as structural
-        with patch.object(scanner, "check_page_shape", return_value="container missing"), \
-             patch.object(tasks, "learn_source", return_value=learned_ret) as m_learn:
-            with self.assertRaises(RuntimeError) as ctx_shape1:
-                scanner.read_agent_source(db.source_by_id(sid), [])
-            self.assertIn("1/2", str(ctx_shape1.exception))
-            m_learn.assert_not_called()
-            res_shape2 = scanner.read_agent_source(db.source_by_id(sid), [])
-        self.assertEqual(m_learn.call_count, 1)
-        self.assertEqual(len(res_shape2), 1)
-
-        # 5. Rows without title/url (<80% usable) counts as structural and triggers relearn after 2 failures
+        # Rows without title/url (<80% usable) count as structural failures.
         bad_rows = "def fetch(): return [{'title': '', 'url': 'bad'}, {'title': 'Ok', 'url': 'https://ex.com/ok'}]"
         db.update_source(sid, extractor=bad_rows, extractor_ok=1, extractor_updated=db.now(), struct_fail_count=1)
         with patch.object(tasks, "learn_source", return_value=learned_ret) as m_learn:
@@ -357,6 +359,80 @@ class ScannerTests(TempLookoutTestCase):
         with patch.object(tasks, "learn_source") as m_learn:
             scanner.read_agent_source(db.source_by_id(sid), [])
         self.assertEqual(m_learn.call_count, 0)
+
+    def test_suspect_empty_reads_require_two_consecutive_scans(self):
+        db.set_settings({"agent": "claude", "verify_weekly": "0"})
+        sid = db.add_source("Careers", "https://example.com/jobs")
+        other = db.add_source("Other", "https://other.example.com/jobs")
+        listing = {"title": "Summer Internship", "url": "https://example.com/jobs/summer"}
+        nonempty = f"def fetch(): return [{listing!r}]"
+        empty = "def fetch(): return []"
+        with patch.object(tasks, "learn_source") as learn:
+            for code, count, expected_open in (
+                (nonempty, 0, 1),
+                (empty, 1, 1),
+                ("def fetch(): raise RuntimeError('connection timed out')", 0, 1),
+                (empty, 1, 1),
+                (nonempty, 0, 1),
+                (empty, 1, 1),
+                (empty, 2, 0),
+            ):
+                with self.subTest(code=code, count=count):
+                    db.update_source(sid, extractor=code, extractor_ok=1, extractor_updated=db.now())
+                    with patch.object(db, "mark_gone", wraps=db.mark_gone) as mark_gone:
+                        scan_id = scanner.run_scan("manual", only=[sid])
+                    self.assertEqual(db.source_by_id(sid)["empty_read_count"], count)
+                    self.assertEqual(db.source_by_id(other)["empty_read_count"], 0)
+                    self.assertEqual(db.source_open_item_count(sid), expected_open)
+                    if count == 1:
+                        mark_gone.assert_not_called()
+                        result = db.scan_detail(scan_id)["sources"][0]
+                        self.assertIn("Suspect empty read", result["error"])
+            learn.assert_not_called()
+
+    def test_explicit_empty_reader_closes_items_on_first_scan(self):
+        db.set_settings({"agent": "claude", "verify_weekly": "1"})
+        sid = db.add_source("Careers", "https://example.com/jobs")
+        code = "def fetch(): return [{'empty': True}]"
+        old_date = (date.today() - timedelta(days=10)).isoformat()
+        db.update_source(sid, extractor=code, extractor_ok=1, extractor_updated=old_date)
+        scan_id = db.start_scan("manual", "claude", "", [])
+        source = db.source_by_id(sid)
+        db.save_item(scan_id, source, {"id": "old", "title": "Intern", "url": source["url"]})
+        db.finish_scan(scan_id, "done")
+        with patch.object(tasks, "learn_source") as learn:
+            scan_id = scanner.run_scan("manual", only=[sid])
+        learn.assert_not_called()
+        self.assertEqual(db.item_by_id("old")["status"], "gone")
+        self.assertEqual(db.source_by_id(sid)["empty_read_count"], 0)
+        self.assertEqual(db.scan_detail(scan_id)["sources"][0]["ok"], 1)
+
+    def test_missing_decision_stays_pending_and_retries_changed_content(self):
+        db.set_settings({"agent": "claude"})
+        sid = db.add_source("Careers", "https://example.com/jobs")
+        source = db.source_by_id(sid)
+        filters = [{"kind": "location", "value": "remote"}]
+        key = scanner.filter_match_key(filters)
+        intern = {"id": "intern", "title": "Intern", "url": source["url"], "location": "Ankara"}
+        scan_id = db.start_scan("manual", "claude", "", [])
+        db.save_item(scan_id, source, intern, match=0, match_key=key)
+        db.finish_scan(scan_id, "done")
+
+        scan_id = db.start_scan("manual", "claude", "", [])
+        db.save_item(scan_id, source, dict(intern, location="Remote"))
+        db.save_item(scan_id, source, dict(intern, id="other", title="Other"))
+        with patch.object(tasks, "classify", return_value={"other": False}) as classify:
+            scanner.apply_semantic_filters(scan_id, filters)
+        sent = {item["id"]: item for item in classify.call_args.args[0]}
+        self.assertEqual(sent["intern"]["location"], "Remote")
+        self.assertIsNone(db.item_by_id("intern")["match"])
+        self.assertIsNone(db.item_by_id("intern")["match_key"])
+        self.assertEqual(db.item_by_id("other")["match"], 0)
+
+        with patch.object(tasks, "classify", return_value={"intern": True}) as classify:
+            scanner.apply_semantic_filters(scan_id, filters)
+        self.assertEqual([item["id"] for item in classify.call_args.args[0]], ["intern"])
+        self.assertEqual(db.item_by_id("intern")["match"], 1)
 
     def test_empty_results_do_not_verify_reader(self):
         self.assertIs(extractors.agrees([], []), extractors.UNVERIFIED)

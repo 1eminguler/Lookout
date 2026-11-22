@@ -79,6 +79,7 @@ class TestDatabase(LookoutTestCase):
         self.assertEqual(srcs[0]["name"], "Legacy Site")
         self.assertEqual(srcs[0]["extractor_ok"], 0)
         self.assertEqual(srcs[0]["extractor_runs"], 0)
+        self.assertEqual(srcs[0]["empty_read_count"], 0)
         self.assertIsNone(srcs[0]["watch_id"])
         self.assertEqual(db.scans()[0]["label"], None)
         items = db.items()
@@ -911,6 +912,9 @@ class TestDatabase(LookoutTestCase):
         self.assertEqual(gone_cnt, 1)  # only vanish-1, NOT exc-1
         it_v = db.item_by_id("v-1")
         self.assertEqual(it_v["summary"], "Updated summary text")
+        self.assertIsNone(it_v["match"])
+        self.assertIsNone(it_v["match_key"])
+        self.assertIn("v-1", {r["id"] for r in db.items_needing_match(sc2, "k1")})
         self.assertEqual(it_v["extra"], '{"stipend": 1500}')
         self.assertIsNone(it_v["updated_at"])
         self.assertIsNone(it_v["last_change_kind"])
@@ -1005,8 +1009,6 @@ class TestDatabase(LookoutTestCase):
         ])
 
     def test_schema_v3_and_v1_v2_to_v3_baseline_done_migration(self):
-        self.assertEqual(db.SCHEMA_VERSION, 4)
-
         # v2 -> v3 migration sets baseline_done=1 for sources with prior ok=1 scans or items
         db.DB_PATH.unlink()
         with contextlib.closing(sqlite3.connect(str(db.DB_PATH))) as c:
@@ -1030,7 +1032,7 @@ class TestDatabase(LookoutTestCase):
 
         db.init()
         with contextlib.closing(db.connect()) as c:
-            self.assertEqual(c.execute("PRAGMA user_version").fetchone()[0], 4)
+            self.assertEqual(c.execute("PRAGMA user_version").fetchone()[0], db.SCHEMA_VERSION)
             ur_cols = {r[1] for r in c.execute("PRAGMA table_info(url_readers)")}
             self.assertIn("context_hash", ur_cols)
         by_name = {s["name"]: s for s in db.sources()}
@@ -1061,7 +1063,7 @@ class TestDatabase(LookoutTestCase):
 
         db.init()
         with contextlib.closing(db.connect()) as c:
-            self.assertEqual(c.execute("PRAGMA user_version").fetchone()[0], 4)
+            self.assertEqual(c.execute("PRAGMA user_version").fetchone()[0], db.SCHEMA_VERSION)
         v1_by_name = {s["name"]: s for s in db.sources()}
         self.assertEqual(v1_by_name["V1 Scanned"]["baseline_done"], 1)
         self.assertEqual(v1_by_name["V1 Scanned"]["last_good_extractor"], "def fetch(): return []")

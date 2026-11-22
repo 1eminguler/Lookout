@@ -13,6 +13,7 @@ import threading
 import time
 import webbrowser
 from pathlib import Path
+from urllib.parse import urlsplit
 
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
@@ -83,14 +84,52 @@ def port_busy() -> bool:
         return s.connect_ex(("127.0.0.1", server.PORT)) == 0
 
 
-def wait_for_internet(seconds: int = 300) -> bool:
-    end = time.time() + seconds
-    while time.time() < end:
+def wait_for_internet(seconds: int = 60) -> bool:
+    """Look for evidence of connectivity within a bounded wait."""
+    end = time.monotonic() + min(seconds, 60)
+    source_hosts = {}
+    for source in db.sources(active_only=True, include_code=False):
         try:
-            socket.create_connection(("1.1.1.1", 443), timeout=5).close()
-            return True
-        except OSError:
-            time.sleep(10)
+            parts = urlsplit(source["url"])
+            if parts.scheme in ("http", "https") and parts.hostname:
+                source_hosts.setdefault(parts.hostname, parts.port or (443 if parts.scheme == "https" else 80))
+        except ValueError:
+            continue
+        if len(source_hosts) == 3:
+            break
+
+    def connect(host, port):
+        socket.create_connection((host, port), timeout=2).close()
+
+    probes = [(connect, (host, port)) for host, port in source_hosts.items()]
+    probes.extend((connect, (host, 443)) for host in ("1.1.1.1", "8.8.8.8"))
+    if source_hosts:
+        probes.append((socket.getaddrinfo, (next(iter(source_hosts)), None)))
+
+    def probe(check, args):
+        remaining = end - time.monotonic()
+        if remaining <= 0:
+            return False
+        succeeded = threading.Event()
+
+        def attempt():
+            try:
+                check(*args)
+            except OSError:
+                return
+            succeeded.set()
+
+        # Name resolution can outlast the socket timeout.
+        worker = threading.Thread(target=attempt, daemon=True)
+        worker.start()
+        worker.join(min(3, max(0, end - time.monotonic())))
+        return succeeded.is_set()
+
+    while time.monotonic() < end:
+        for check, args in probes:
+            if probe(check, args):
+                return True
+        time.sleep(min(5, max(0, end - time.monotonic())))
     return False
 
 
@@ -127,8 +166,7 @@ def cmd_scan(scheduled: bool) -> None:
     db.init()
     db.mark_interrupted()
     if not wait_for_internet():
-        print("No internet connection; scan skipped.")
-        return
+        print("Internet check was inconclusive. Continuing with the scan.")
     print("Scanning…")
     scan_id = scanner.run_scan(
         "scheduled" if scheduled else "manual",

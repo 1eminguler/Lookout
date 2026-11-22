@@ -20,6 +20,7 @@ class TaskTests(TempLookoutTestCase):
 
         def fake_run(aid, model, workdir: Path, timeout, **kw):
             task_txt = (workdir / "TASK.md").read_text(encoding="utf-8")
+            self.assertIn('[{"empty": True}]', task_txt)
             seen_paths.append(str(workdir) in task_txt)
             (workdir / "results.json").write_text(
                 json.dumps([{"title": "Job 1", "url": "https://ex.com/1"}]), encoding="utf-8")
@@ -65,6 +66,14 @@ class TaskTests(TempLookoutTestCase):
         with patch.object(agents, "run_task", side_effect=fake_bad_json):
             with self.assertRaises(RuntimeError):
                 tasks.classify(items, [])
+
+    def test_classify_accepts_only_recognized_boolean_values(self):
+        values = [False, "false", "0", " NO ", 0, True, "true", "1", "yes", 1, None, [], "maybe", 1.0]
+        items = [{"id": str(i)} for i in range(len(values))]
+        payload = json.dumps({item["id"]: value for item, value in zip(items, values)})
+        with patch.object(tasks, "_run_agent", return_value={"raw": {"decisions.json": payload}}):
+            result = tasks.classify(items, [])
+        self.assertEqual(result, {str(i): i >= 5 for i in range(10)})
 
     def test_discover_sources_full_partial_missing_and_invalid(self):
         def fake_full(aid, model, workdir: Path, timeout, **kw):

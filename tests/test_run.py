@@ -52,6 +52,37 @@ class RunTests(TempLookoutTestCase):
         # Timer starts quickly to open URL in browser
         self.assertTrue(m_serve.called or m_open.called)
 
+    def test_internet_check_tries_source_hosts_then_ip_and_dns_fallbacks(self):
+        db.add_source("A", "https://first.example.com/careers")
+        db.add_source("B", "http://second.example.com/jobs")
+        with patch.object(run.socket, "create_connection", side_effect=OSError) as connect, \
+             patch.object(run.socket, "getaddrinfo", return_value=[]) as resolve:
+            self.assertTrue(run.wait_for_internet(10))
+        self.assertEqual([call.args[0] for call in connect.call_args_list], [
+            ("first.example.com", 443), ("second.example.com", 80), ("1.1.1.1", 443), ("8.8.8.8", 443),
+        ])
+        resolve.assert_called_once_with("first.example.com", None)
+
+    def test_internet_check_honors_deadline_when_resolution_stalls(self):
+        db.add_source("Careers", "https://example.com/jobs")
+        release = run.threading.Event()
+        stopped = run.threading.Event()
+
+        def stalled_connection(*args, **kwargs):
+            release.wait(3)
+            stopped.set()
+            raise OSError
+
+        start = time.monotonic()
+        with patch.object(run.socket, "create_connection", side_effect=stalled_connection) as connect:
+            try:
+                self.assertFalse(run.wait_for_internet(0.2))
+                self.assertLess(time.monotonic() - start, 1.5)
+                connect.assert_called_once()
+            finally:
+                release.set()
+                stopped.wait(3)
+
     def test_cmd_scan_runs_offline_without_http_token(self):
         db.set_settings({"notify": "1"})
         plugin_path = self.plugin_dir / "cli_p.py"
@@ -64,7 +95,7 @@ class RunTests(TempLookoutTestCase):
 
         # 1st scan sets silent baseline without desktop notification
         with patch.object(run, "URL", panel_url), \
-             patch.object(run, "wait_for_internet", return_value=True), \
+             patch.object(run, "wait_for_internet", return_value=False), \
              patch.object(run, "start_ui_in_background") as m_bg, \
              patch.object(notify, "desktop") as m_desk, \
              patch.object(notify, "mail_digest", return_value=(False, "not configured")):

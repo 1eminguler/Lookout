@@ -15,7 +15,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 ROOT = Path(__file__).resolve().parent.parent
 DB_PATH = Path(os.environ.get("LOOKOUT_DATA_DIR") or ROOT / "data") / "lookout.db"
 TS = "%Y-%m-%d %H:%M:%S"
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 _lock = threading.RLock()
 _UNSET = object()
 _TRACKING_EXACT = {"fbclid", "gclid", "mc_cid", "mc_eid"}
@@ -266,6 +266,10 @@ MIGRATIONS_V4 = {
     "items": {"expired": "INTEGER DEFAULT 0"},
 }
 
+MIGRATIONS_V5 = {
+    "sources": {"empty_read_count": "INTEGER NOT NULL DEFAULT 0"},
+}
+
 
 def _add_columns(c: sqlite3.Connection, spec: Dict[str, Dict[str, str]]) -> None:
     for table, cols in spec.items():
@@ -306,6 +310,8 @@ def init() -> None:
         if ver < 4:
             _add_columns(c, MIGRATIONS_V4)
             ver = 4
+        if ver < 5:
+            _add_columns(c, MIGRATIONS_V5)
         c.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         c.commit()
 
@@ -870,7 +876,7 @@ _SOURCE_UPDATABLE = {
     "extractor_updated", "extractor_runs", "watch_id", "last_good_extractor", "last_good_updated",
     "last_good_stats", "fail_count", "retry_after", "last_error_kind", "filter_hash",
     "struct_fail_count", "learn_fail_count", "learn_retry_after", "paused", "filters_changed",
-    "baseline_done",
+    "baseline_done", "empty_read_count",
 }
 
 
@@ -1088,6 +1094,7 @@ def delete_discovery(discovery_id: int) -> None:
 
 # ---------- items & history ----------
 _TRACKED_ITEM_FIELDS = ("title", "deadline", "start_date", "location", "org", "category")
+_CLASSIFY_ITEM_FIELDS = (*_TRACKED_ITEM_FIELDS, "summary")
 
 
 def _norm_field(v: Any) -> Optional[str]:
@@ -1130,17 +1137,21 @@ def save_item(scan_id: int, source: Dict[str, Any], it: Dict[str, Any], *,
     src_id = source.get("id")
     with _lock, _conn() as c:
         exists = c.execute("SELECT * FROM items WHERE id=?", (it["id"],)).fetchone()
+        if exists is None and it.get("legacy_id"):
+            exists = c.execute("SELECT * FROM items WHERE id=? AND title=?", (it["legacy_id"], it["title"])).fetchone()
         if exists is None and it.get("url"):
             listing_key = canonical_reader_url(source.get("url") or "")
             item_key = canonical_reader_url(it["url"])
             if item_key and item_key != listing_key:
                 if src_id is not None:
                     exists = c.execute(
-                        "SELECT * FROM items WHERE source_id=? AND url=? LIMIT 1", (src_id, it["url"])
+                        "SELECT * FROM items WHERE source_id=? AND url=? AND title=? LIMIT 1",
+                        (src_id, it["url"], it["title"]),
                     ).fetchone()
                 else:
                     exists = c.execute(
-                        "SELECT * FROM items WHERE source_name=? AND url=? LIMIT 1", (source["name"], it["url"])
+                        "SELECT * FROM items WHERE source_name=? AND url=? AND title=? LIMIT 1",
+                        (source["name"], it["url"], it["title"]),
                     ).fetchone()
         if exists:
             ex = dict(exists)
@@ -1174,7 +1185,9 @@ def save_item(scan_id: int, source: Dict[str, Any], it: Dict[str, Any], *,
             if match is not _UNSET:
                 new_match = match
                 new_match_key = None if match_key is _UNSET else match_key
-            elif ex.get("match_key") == "det_excluded":
+            elif ex.get("match_key") == "det_excluded" or any(
+                ex.get(field) != it.get(field) for field in _CLASSIFY_ITEM_FIELDS
+            ):
                 new_match = None
                 new_match_key = None
             else:
@@ -1646,13 +1659,13 @@ def agent_usage(agent: str) -> List[Dict[str, Any]]:
 def items_needing_match(scan_id: int, key: str, watch_id: Any = _UNSET) -> List[Dict[str, Any]]:
     if watch_id is _UNSET:
         return _rows("""SELECT i.* FROM scan_items si JOIN items i ON i.id = si.item_id
-                        WHERE si.scan_id=? AND (i.match_key IS NULL OR i.match_key != ?)
+                        WHERE si.scan_id=? AND (i.match IS NULL OR i.match_key IS NULL OR i.match_key != ?)
                         AND COALESCE(i.match_key, '') != 'det_excluded'""", (scan_id, key))
     return _rows("""SELECT i.* FROM scan_items si
                     JOIN items i ON i.id = si.item_id
                     LEFT JOIN sources s ON s.id = i.source_id
                     WHERE si.scan_id=? AND COALESCE(s.watch_id, i.watch_id) IS ?
-                    AND (i.match_key IS NULL OR i.match_key != ?)
+                    AND (i.match IS NULL OR i.match_key IS NULL OR i.match_key != ?)
                     AND COALESCE(i.match_key, '') != 'det_excluded'""", (scan_id, watch_id, key))
 
 
@@ -1690,7 +1703,7 @@ def open_items_needing_match(key: str, watch_id: Optional[int]) -> List[Dict[str
         """SELECT i.* FROM items i
            LEFT JOIN sources s ON s.id = i.source_id
            WHERE i.status='open' AND COALESCE(s.watch_id, i.watch_id) IS ?
-           AND (i.match_key IS NULL OR i.match_key != ?)
+           AND (i.match IS NULL OR i.match_key IS NULL OR i.match_key != ?)
            AND COALESCE(i.match_key, '') != 'det_excluded'""",
         (watch_id, key),
     )

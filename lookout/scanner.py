@@ -276,14 +276,17 @@ def normalise(raw: Dict[str, Any], source: Dict[str, Any], today: Optional[date]
     src_key = f"src:{source['id']}" if source.get("id") is not None else source["name"]
     item_key = db.canonical_reader_url(url)
     list_key = db.canonical_reader_url(source.get("url") or "")
+    legacy_id = None
     if raw.get("id"):
         key = f"{src_key}|{raw['id']}"
     elif item_key and item_key != list_key:
-        key = f"{src_key}|{item_key}"
+        legacy_id = hashlib.sha1(f"{src_key}|{item_key}".encode("utf-8")).hexdigest()[:20]
+        key = f"{src_key}|{item_key}|{title}"
     else:
         key = f"{src_key}|{url}|{title}"
     return {
         "id": hashlib.sha1(str(key).encode("utf-8")).hexdigest()[:20],
+        "legacy_id": legacy_id,
         "title": title,
         "org": blank_to_none(clean(raw.get("org") or raw.get("company"), 100)),
         "category": blank_to_none(clean(raw.get("category") or raw.get("type"), 40)),
@@ -417,9 +420,9 @@ def _learn_backoff_until(learn_fail_count: int) -> str:
     return (datetime.now() + timedelta(minutes=minutes)).strftime(db.TS)
 
 
-def check_page_shape(source: Dict[str, Any], prev_stats: Optional[Dict[str, Any]]) -> Optional[str]:
-    """Optional shape check when a reader returns zero items despite prior listings."""
-    return None
+def _confirmed_empty(items: List[Dict[str, Any]]) -> bool:
+    return (len(items) == 1 and isinstance(items[0], dict)
+            and items[0].keys() == {"empty"} and items[0]["empty"] is True)
 
 
 def _url_pattern(url: str) -> str:
@@ -531,16 +534,10 @@ def verify_reader_output(agent_items: List[Dict[str, Any]], code_items: List[Dic
     return True, ""
 
 
-def _check_structural_sanity(items: List[Dict[str, Any]], had_items: int,
-                             source: Optional[Dict[str, Any]] = None,
-                             prev_stats: Optional[Dict[str, Any]] = None) -> None:
+def _check_structural_sanity(items: List[Dict[str, Any]]) -> None:
     usable = [i for i in items if str(i.get("title") or "").strip() and str(i.get("url") or "").startswith("http")]
     if items and len(usable) < len(items) * 0.8:
         raise RuntimeError("most items have no title or link")
-    if not items and had_items:
-        reason = check_page_shape(source or {}, prev_stats)
-        if reason:
-            raise RuntimeError(f"returned nothing; page/API shape changed ({reason})")
 
 
 # ---------- agent sources ----------
@@ -679,12 +676,14 @@ def read_agent_source(source: Dict[str, Any], fs: List[Dict[str, Any]], force_le
     if source.get("extractor") and source.get("extractor_ok") and not force_learn:
         try:
             items = _run_fast_reader(source, source["extractor"])
-            _check_structural_sanity(items, had_items, source=source, prev_stats=prev_stats)
-            cur_stats = compute_item_stats(items)
+            confirmed_empty = _confirmed_empty(items)
+            listings = [] if confirmed_empty else items
+            _check_structural_sanity(listings)
+            cur_stats = compute_item_stats(listings)
             stats_json = json.dumps(cur_stats, ensure_ascii=False)
             now_ts = db.now()
             if stale:
-                anomaly = detect_anomaly(items, prev_stats, had_open_items=had_items)
+                anomaly = None if confirmed_empty else detect_anomaly(listings, prev_stats, had_open_items=had_items)
                 if anomaly is None or not settings.get("agent"):
                     if sid is not None:
                         upd_kw: Dict[str, Any] = {
@@ -798,8 +797,9 @@ def read_agent_source(source: Dict[str, Any], fs: List[Dict[str, Any]], force_le
             if shared and shared.get("extractor"):
                 try:
                     items = _run_fast_reader(source, shared["extractor"])
-                    _check_structural_sanity(items, had_items, source=source, prev_stats=prev_stats)
-                    stats_json = json.dumps(compute_item_stats(items), ensure_ascii=False)
+                    listings = [] if _confirmed_empty(items) else items
+                    _check_structural_sanity(listings)
+                    stats_json = json.dumps(compute_item_stats(listings), ensure_ascii=False)
                     ts = shared.get("extractor_updated") or db.now()
                     if sid is not None:
                         db.update_source(
@@ -973,8 +973,12 @@ def apply_semantic_filters(scan_id: int, global_fs: List[Dict[str, Any]],
                     seen_ids.add(o["id"])
         if not todo:
             continue
-        if key == "none" or not has_agent:
+        if key == "none":
             db.set_matches({i["id"]: True for i in todo}, key)
+            continue
+        db.update_item_matches((None, None, i["id"]) for i in todo
+                               if i["match"] is not None or i["match_key"] is not None)
+        if not has_agent:
             continue
         with _lock:
             progress["current"] = ["applying filters"]
@@ -986,7 +990,7 @@ def apply_semantic_filters(scan_id: int, global_fs: List[Dict[str, Any]],
                     return ""
                 part = todo[k:k + 80]
                 got = tasks.classify(part, effective_fs, cancel_event=_cancel_event)
-                decisions.update({i["id"]: got.get(i["id"], True) for i in part})
+                decisions.update({i["id"]: got[i["id"]] for i in part if i["id"] in got})
             db.set_matches(decisions, key)
         except agents.CancelledError:
             return ""
@@ -1036,6 +1040,7 @@ def test_source(source: Dict[str, Any], fs: Optional[List[Dict[str, Any]]] = Non
             if not it or it["id"] in seen:
                 continue
             seen.add(it["id"])
+            it.pop("legacy_id", None)
             it["passes_filters"] = passes(it, fs)
             out_items.append(it)
         if cancel_event and cancel_event.is_set():
@@ -1066,6 +1071,7 @@ def _scan_one(scan_id: int, source: Dict[str, Any], fs: List[Dict[str, Any]], pl
     ok, count, new, error = False, 0, 0, ""
     sid = source.get("id")
     is_baseline = bool(sid is not None and not source.get("baseline_done"))
+    previous_empty_reads = source.get("empty_read_count") or 0
     try:
         if progress["cancel"] or _cancel_event.is_set():
             raise agents.CancelledError("cancelled")
@@ -1078,6 +1084,15 @@ def _scan_one(scan_id: int, source: Dict[str, Any], fs: List[Dict[str, Any]], pl
             raw = read_agent_source(source, fs, ignore_backoff=ignore_backoff)
         if progress["cancel"] or _cancel_event.is_set():
             raise agents.CancelledError("cancelled")
+        empty_reads = 0
+        if not raw and sid is not None:
+            previous_stats = _load_stats(source.get("last_good_stats")) or {}
+            if previous_empty_reads or db.source_open_item_count(sid) or previous_stats.get("count"):
+                empty_reads = previous_empty_reads + 1
+                if empty_reads == 1:
+                    db.update_source(sid, empty_read_count=empty_reads)
+                    error = "Suspect empty read (1/2). Existing listings kept open."
+                    return
         seen = set()
         for r in raw:
             it = normalise(r, source) if isinstance(r, dict) else None
@@ -1096,6 +1111,8 @@ def _scan_one(scan_id: int, source: Dict[str, Any], fs: List[Dict[str, Any]], pl
                     notified=1 if is_baseline else db._UNSET,
                 )
         db.mark_gone(source, scan_id)
+        if sid is not None and empty_reads != previous_empty_reads:
+            db.update_source(sid, empty_read_count=empty_reads)
         if is_baseline and sid is not None:
             db.mark_source_scan_notified(source, scan_id)
             db.update_source(sid, baseline_done=1)
@@ -1107,6 +1124,8 @@ def _scan_one(scan_id: int, source: Dict[str, Any], fs: List[Dict[str, Any]], pl
         error = "cancelled"
     except Exception as e:
         error = format_user_error(e)
+        if sid is not None and previous_empty_reads:
+            db.update_source(sid, empty_read_count=0)
         if not isinstance(e, RuntimeError):
             traceback.print_exc()
     finally:

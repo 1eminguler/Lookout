@@ -120,7 +120,8 @@ A Python file with a function `fetch()` that returns the same kind of list for A
 - Convert dates to YYYY-MM-DD when you can; otherwise leave the raw date string.
 - Only currently open listings go in the output: skip cards marked closed/completed/expired (e.g. "Tamamlandı",
   "Kapandı", "Closed").
-- If the expected listing section, container, or API structure is missing or changed, raise `RuntimeError("page/API shape changed: ...")` instead of silently returning `[]`. Return `[]` only when the page/API loaded cleanly with zero active listings.
+- If the expected listing section, container, or API structure is missing or changed, raise `RuntimeError("page/API shape changed: ...")` instead of silently returning `[]`.
+- If the page or API explicitly confirms zero active listings, have `fetch()` return only `[{{"empty": True}}]` (serialized as `[{{"empty": true}}]`). Otherwise, an empty list needs a second consecutive empty scan to close previous listings.
 - If you can run shell commands, test it with `python test_extractor.py` (prints what fetch() returns) and fix it
   until it returns the listings. Make sure the titles and links match what you saw in Part 1.
 
@@ -381,7 +382,15 @@ def classify(items: List[Dict[str, Any]], fs: List[Dict[str, Any]],
         raise RuntimeError("The agent wrote invalid decisions.json") from None
     if not isinstance(data, dict):
         raise RuntimeError("The agent wrote invalid decisions.json")
-    return {str(k): bool(v) for k, v in data.items()}
+    decisions = {}
+    for item_id, value in data.items():
+        if isinstance(value, str):
+            value = value.strip().lower()
+        if value is True or (type(value) is int and value == 1) or value in ("true", "1", "yes"):
+            decisions[item_id] = True
+        elif value is False or (type(value) is int and value == 0) or value in ("false", "0", "no"):
+            decisions[item_id] = False
+    return decisions
 
 
 _FILLER = {

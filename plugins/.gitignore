@@ -1,0 +1,5 @@
+# Your own plugins stay on your computer; only the example and docs are shared.
+*
+!.gitignore
+!README.md
+!_example_hn_jobs.py

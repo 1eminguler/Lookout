@@ -1,13 +1,15 @@
 """Unit tests for lookout.tasks."""
 import json
+import subprocess
+import sys
 import threading
 import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from lookout import agents, db, tasks
-from tests.helpers import TempLookoutTestCase
+from lookout import agents, db, extractors, tasks
+from tests.helpers import TempLookoutTestCase, make_fake_agent
 
 
 class TaskTests(TempLookoutTestCase):
@@ -278,6 +280,139 @@ class TaskTests(TempLookoutTestCase):
         self.assertEqual(quick_calls[0]["kw"].get("session"), expected_quick_session)
         self.assertTrue(quick_calls[0]["kw"].get("session", "").startswith("lookout-102-"))
         self.assertIn(f"--session {expected_quick_session}", quick_calls[0]["task_md"])
+
+    def test_prompts_list_all_extractors_check_restrictions_from_constants(self):
+        captured = {}
+
+        def capture_agent(aid, model, workdir: Path, timeout, **kw):
+            captured["task_md"] = (workdir / "TASK.md").read_text(encoding="utf-8")
+            (workdir / "results.json").write_text("[]", encoding="utf-8")
+            return ""
+
+        src_initial = {"id": 1, "name": "Initial", "url": "https://ex.com/init"}
+        src_relearn = {
+            "id": 2,
+            "name": "Relearn",
+            "url": "https://ex.com/relearn",
+            "extractor": "def fetch():\n    return []\n",
+            "extractor_error": "shape changed",
+        }
+        prompts = []
+        with patch.object(agents, "run_task", side_effect=capture_agent):
+            tasks.learn_source(src_initial, [])
+            prompts.append(("learn", captured["task_md"]))
+            tasks.learn_source(src_relearn, [])
+            prompts.append(("relearn", captured["task_md"]))
+            tasks.quick_read_source(src_initial, [])
+            prompts.append(("quick_read", captured["task_md"]))
+
+        for label, prompt_text in prompts:
+            with self.subTest(prompt=label):
+                for mod in extractors.MODULES:
+                    self.assertIn(mod, prompt_text)
+                for helper in extractors.HELPERS:
+                    self.assertIn(helper, prompt_text)
+                for call in extractors.BANNED_CALLS:
+                    self.assertIn(call, prompt_text)
+                for attr in extractors.BANNED_ATTRS:
+                    self.assertIn(attr, prompt_text)
+                low = prompt_text.lower()
+                self.assertIn("no classes", low)
+                self.assertIn("dynamic `.format()`", low)
+                self.assertIn("f-strings", low)
+                self.assertIn("starting with `_`", low)
+                self.assertIn("def fetch():", prompt_text)
+
+        self.assertIn("check_reader.py", dict(prompts)["learn"])
+        self.assertIn("check_reader.py", dict(prompts)["relearn"])
+
+        # Confirm generation cannot drift when constants in extractors.py change
+        with patch.object(extractors, "MODULES", frozenset({*extractors.MODULES, " sentinel_mod "})), \
+             patch.object(extractors, "BANNED_CALLS", frozenset({*extractors.BANNED_CALLS, "sentinel_call"})), \
+             patch.object(agents, "run_task", side_effect=capture_agent):
+            tasks.learn_source(src_initial, [])
+            self.assertIn("sentinel_mod", captured["task_md"])
+            self.assertIn("sentinel_call", captured["task_md"])
+
+    def test_check_reader_script_in_workdir_checks_ast_and_dry_runs_fetch(self):
+        checks = {}
+
+        def fake_agent(aid, model, wd: Path, timeout, task_md: str):
+            script = wd / "check_reader.py"
+            checks["exists"] = script.is_file()
+            checks["in_prompt"] = "check_reader.py" in task_md
+
+            # 1. Dynamic .format() rejected by AST check
+            (wd / "extractor.py").write_text(
+                "def fetch():\n    tpl = 'https://ex.com/{0}'\n    return [{'title': 'A', 'url': tpl.format(1)}]\n",
+                encoding="utf-8",
+            )
+            r1 = subprocess.run([sys.executable, str(script)], cwd=str(wd), capture_output=True, text=True, timeout=15)
+            checks["r1_code"] = r1.returncode
+            checks["r1_out"] = (r1.stdout + r1.stderr).strip()
+
+            # 2. Runtime dry-run failure in fetch() rejected by sandbox runner
+            (wd / "extractor.py").write_text(
+                "def fetch():\n    return {'not': 'a list'}\n",
+                encoding="utf-8",
+            )
+            r2 = subprocess.run([sys.executable, str(script)], cwd=str(wd), capture_output=True, text=True, timeout=15)
+            checks["r2_code"] = r2.returncode
+            checks["r2_out"] = (r2.stdout + r2.stderr).strip()
+
+            # 3. Valid reader passes AST check and sandbox dry run
+            good_code = "def fetch():\n    return [{'title': 'Open Role', 'url': 'https://ex.com/1'}]\n"
+            r3 = subprocess.run([sys.executable, str(script)], cwd=str(wd), capture_output=True, text=True, timeout=15,
+                                input=None)
+            # Write good code and re-run
+            (wd / "extractor.py").write_text(good_code, encoding="utf-8")
+            r3 = subprocess.run([sys.executable, str(script)], cwd=str(wd), capture_output=True, text=True, timeout=15)
+            checks["r3_code"] = r3.returncode
+            checks["r3_out"] = (r3.stdout + r3.stderr).strip()
+            return {
+                "results.json": [{"title": "Open Role", "url": "https://ex.com/1"}],
+                "extractor.py": good_code,
+            }
+
+        fake_run, calls = make_fake_agent(fake_agent)
+        with patch.object(agents, "run_task", side_effect=fake_run):
+            out = tasks.learn_source({"id": 5, "name": "TestCheck", "url": "https://ex.com"}, [])
+
+        self.assertEqual(len(calls), 1)
+        self.assertTrue(checks["exists"])
+        self.assertTrue(checks["in_prompt"])
+        self.assertNotEqual(checks["r1_code"], 0)
+        self.assertIn("dynamic '.format()' calls are not allowed", checks["r1_out"])
+        self.assertNotEqual(checks["r2_code"], 0)
+        self.assertIn("fetch() must return a list", checks["r2_out"])
+        self.assertEqual(checks["r3_code"], 0)
+        self.assertTrue(checks["r3_out"].startswith("OK"))
+        self.assertEqual(len(out["items"]), 1)
+
+    def test_learn_source_gives_one_repair_round_in_same_workdir(self):
+        bad_code = "def fetch():\n    tpl = 'https://ex.com/{0}'\n    return [{'title': 'A', 'url': tpl.format(1)}]\n"
+        fixed_code = "def fetch():\n    return [{'title': 'A', 'url': f'https://ex.com/{1}'}]\n"
+        round_state = {"seen_existing_bad_code": False}
+
+        def repairing_agent(aid, model, wd: Path, timeout, task_md: str):
+            if len(calls) == 1:
+                return {
+                    "results.json": [{"title": "A", "url": "https://ex.com/1"}],
+                    "extractor.py": bad_code,
+                }
+            round_state["seen_existing_bad_code"] = (wd / "extractor.py").read_text(encoding="utf-8") == bad_code
+            return {"extractor.py": fixed_code}
+
+        fake_run, calls = make_fake_agent(repairing_agent)
+        with patch.object(agents, "run_task", side_effect=fake_run):
+            out = tasks.learn_source({"id": 9, "name": "RepairSite", "url": "https://ex.com"}, [])
+
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0]["workdir"], calls[1]["workdir"])
+        self.assertTrue(round_state["seen_existing_bad_code"])
+        self.assertIn("dynamic '.format()' calls are not allowed", calls[1]["task_md"])
+        self.assertEqual(out["code"], fixed_code)
+        self.assertEqual(out["items"], [{"title": "A", "url": "https://ex.com/1"}])
 
 
 if __name__ == "__main__":

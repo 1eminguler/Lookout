@@ -80,6 +80,7 @@ class TestDatabase(LookoutTestCase):
         self.assertEqual(srcs[0]["extractor_ok"], 0)
         self.assertEqual(srcs[0]["extractor_runs"], 0)
         self.assertEqual(srcs[0]["empty_read_count"], 0)
+        self.assertIsNone(srcs[0]["empty_reason"])
         self.assertIsNone(srcs[0]["watch_id"])
         self.assertEqual(db.scans()[0]["label"], None)
         items = db.items()

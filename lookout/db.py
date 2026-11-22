@@ -15,7 +15,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 ROOT = Path(__file__).resolve().parent.parent
 DB_PATH = Path(os.environ.get("LOOKOUT_DATA_DIR") or ROOT / "data") / "lookout.db"
 TS = "%Y-%m-%d %H:%M:%S"
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 _lock = threading.RLock()
 _UNSET = object()
 _TRACKING_EXACT = {"fbclid", "gclid", "mc_cid", "mc_eid"}
@@ -274,6 +274,10 @@ MIGRATIONS_V6 = {
     "items": {"deadline_raw": "TEXT"},
 }
 
+MIGRATIONS_V7 = {
+    "sources": {"empty_reason": "TEXT"},
+}
+
 
 def _add_columns(c: sqlite3.Connection, spec: Dict[str, Dict[str, str]]) -> None:
     for table, cols in spec.items():
@@ -318,6 +322,8 @@ def init() -> None:
             _add_columns(c, MIGRATIONS_V5)
         if ver < 6:
             _add_columns(c, MIGRATIONS_V6)
+        if ver < 7:
+            _add_columns(c, MIGRATIONS_V7)
         c.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         c.commit()
 
@@ -693,7 +699,8 @@ def get_shared_reader(url: str, notes: str = "", fs: Optional[List[Dict[str, Any
 def save_shared_reader(url: str, extractor: str, ok: bool = True, error: Optional[str] = None,
                        stats: Optional[str] = None, updated: Optional[str] = None,
                        propagate: bool = True, notes: str = "",
-                       fs: Optional[List[Dict[str, Any]]] = None) -> None:
+                       fs: Optional[List[Dict[str, Any]]] = None,
+                       empty_reason: Any = _UNSET) -> None:
     canon = canonical_reader_url(url)
     if not canon or not extractor:
         return
@@ -737,16 +744,28 @@ def save_shared_reader(url: str, extractor: str, ok: bool = True, error: Optiona
                 if reader_context_hash(r["notes"] or "", f_cache[wid]) == ctx_hash:
                     match_ids.append(r["id"])
             for sid in match_ids:
-                c.execute(
-                    """UPDATE sources SET extractor=?, last_good_extractor=?, extractor_ok=1,
-                       extractor_error=NULL, extractor_updated=?, last_good_updated=?,
-                       last_good_stats=COALESCE(?, last_good_stats),
-                       fail_count=0, retry_after=NULL, last_error_kind=NULL,
-                       struct_fail_count=0, learn_fail_count=0, learn_retry_after=NULL,
-                       paused=0, filter_hash=?, filters_changed=0
-                       WHERE id=?""",
-                    (extractor, extractor, ts, ts, eff_stats, f_hash, sid),
-                )
+                if empty_reason is _UNSET:
+                    c.execute(
+                        """UPDATE sources SET extractor=?, last_good_extractor=?, extractor_ok=1,
+                           extractor_error=NULL, extractor_updated=?, last_good_updated=?,
+                           last_good_stats=COALESCE(?, last_good_stats),
+                           fail_count=0, retry_after=NULL, last_error_kind=NULL,
+                           struct_fail_count=0, learn_fail_count=0, learn_retry_after=NULL,
+                           paused=0, filter_hash=?, filters_changed=0
+                           WHERE id=?""",
+                        (extractor, extractor, ts, ts, eff_stats, f_hash, sid),
+                    )
+                else:
+                    c.execute(
+                        """UPDATE sources SET extractor=?, last_good_extractor=?, extractor_ok=1,
+                           extractor_error=NULL, extractor_updated=?, last_good_updated=?,
+                           last_good_stats=COALESCE(?, last_good_stats),
+                           fail_count=0, retry_after=NULL, last_error_kind=NULL,
+                           struct_fail_count=0, learn_fail_count=0, learn_retry_after=NULL,
+                           paused=0, filter_hash=?, filters_changed=0, empty_reason=?, empty_read_count=0
+                           WHERE id=?""",
+                        (extractor, extractor, ts, ts, eff_stats, f_hash, empty_reason, sid),
+                    )
         c.commit()
 
 
@@ -882,7 +901,7 @@ _SOURCE_UPDATABLE = {
     "extractor_updated", "extractor_runs", "watch_id", "last_good_extractor", "last_good_updated",
     "last_good_stats", "fail_count", "retry_after", "last_error_kind", "filter_hash",
     "struct_fail_count", "learn_fail_count", "learn_retry_after", "paused", "filters_changed",
-    "baseline_done", "empty_read_count",
+    "baseline_done", "empty_read_count", "empty_reason",
 }
 
 
@@ -1251,6 +1270,38 @@ def mark_gone(source: Dict[str, Any], scan_id: int) -> int:
             gone_rows = c.execute(
                 "SELECT id FROM items WHERE source_id=? AND status='open' AND last_scan<?",
                 (source["id"], scan_id),
+            ).fetchall()
+        if not gone_rows:
+            return 0
+        ids = [r["id"] for r in gone_rows]
+        placeholders = ",".join("?" for _ in ids)
+        c.execute(
+            f"UPDATE items SET status='gone', updated_at=?, change_summary='Closed', last_change_kind='closed' "
+            f"WHERE id IN ({placeholders})",
+            [t, *ids],
+        )
+        c.executemany(
+            "INSERT INTO item_history(item_id, scan_id, changed_at, kind, field, old_value, new_value) "
+            "VALUES(?, ?, ?, 'closed', 'status', 'open', 'gone')",
+            [(iid, scan_id, t) for iid in ids],
+        )
+        c.commit()
+        return len(ids)
+
+
+def close_source_items(source: Dict[str, Any], scan_id: Optional[int] = None) -> int:
+    """Close all open items belonging to a verified-empty source (status='gone', never delete)."""
+    t = now()
+    with _lock, _conn() as c:
+        if source.get("id") is None:
+            gone_rows = c.execute(
+                "SELECT id FROM items WHERE source_name=? AND status='open'",
+                (source["name"],),
+            ).fetchall()
+        else:
+            gone_rows = c.execute(
+                "SELECT id FROM items WHERE source_id=? AND status='open'",
+                (source["id"],),
             ).fetchall()
         if not gone_rows:
             return 0

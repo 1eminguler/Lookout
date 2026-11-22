@@ -8,7 +8,7 @@ from datetime import date, datetime, timedelta
 from unittest.mock import patch
 
 from lookout import agents, db, extractors, notify, scanner, tasks
-from tests.helpers import TempLookoutTestCase
+from tests.helpers import TempLookoutTestCase, make_fake_agent
 
 
 class ScannerTests(TempLookoutTestCase):
@@ -961,6 +961,121 @@ class ScannerTests(TempLookoutTestCase):
         key_w2_after = scanner.filter_match_key(db.filters(True, watch_id=None), db.filters(True, watch_id=w2))
         self.assertNotEqual(key_w1_after, by_title["Python Intern"]["match_key"])
         self.assertEqual(key_w2_after, key_w2_before)
+
+    def test_honestly_empty_listing_with_repair_round_stores_reason_and_closes_stale_items(self):
+        db.set_settings({"agent": "claude", "verify_weekly": "0"})
+        sid = db.add_source("ClosedCalls", "https://calls.example.com/list")
+        src = db.source_by_id(sid)
+
+        # Seed 12 stale open items on this source
+        seed_scan = db.start_scan("manual", "claude", "", [])
+        for k in range(12):
+            db.save_item(seed_scan, src, {
+                "id": f"stale-{k}",
+                "title": f"Call #{k}",
+                "url": f"https://calls.example.com/detail/{k}",
+            }, match=1, match_key="none")
+        db.finish_scan(seed_scan, "done")
+        self.assertEqual(db.source_open_item_count(sid), 12)
+
+        bad_reader = (
+            "def fetch():\n"
+            "    fmt = 'https://calls.example.com/page/{0}'\n"
+            "    _ = fmt.format(1)\n"
+            "    return [{'empty': True}]\n"
+        )
+        good_empty_reader = "def fetch():\n    return [{'empty': True}]\n"
+        reason_text = "all 181 cards show 'Başvurular Tamamlandı'"
+
+        def fake_agent(aid, model, wd, timeout, task_md):
+            if len(calls) == 1:
+                return {
+                    "items.json": [],
+                    "result.json": {"empty_reason": reason_text},
+                    "extractor.py": bad_reader,
+                }
+            # Repair round in the same workdir receives the exact check error
+            return {"extractor.py": good_empty_reader}
+
+        fake_run, calls = make_fake_agent(fake_agent)
+        with patch.object(agents, "run_task", side_effect=fake_run):
+            scan_id = scanner.run_scan("manual", only=[sid])
+
+        self.assertIsNotNone(scan_id)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0]["workdir"], calls[1]["workdir"])
+        self.assertIn("dynamic '.format()' calls are not allowed", calls[1]["task_md"])
+
+        updated_src = db.source_by_id(sid)
+        self.assertEqual(updated_src["extractor_ok"], 1)
+        self.assertEqual(updated_src["learn_fail_count"], 0)
+        self.assertEqual(updated_src["empty_reason"], reason_text)
+        self.assertEqual(updated_src["empty_read_count"], 0)
+        # Shown in db.sources() for the Sources view
+        listed_src = next(s for s in db.sources() if s["id"] == sid)
+        self.assertEqual(listed_src["empty_reason"], reason_text)
+
+        # All 12 open items are closed (status='gone') and never deleted
+        self.assertEqual(db.source_open_item_count(sid), 0)
+        stored_items = db.items(source_id=sid)
+        self.assertEqual(len(stored_items), 12)
+        self.assertTrue(all(it["status"] == "gone" for it in stored_items))
+
+        # Subsequent scan that finds an open item clears empty_reason
+        reopened_code = "def fetch():\n    return [{'title': 'New 2027 Call', 'url': 'https://calls.example.com/2027'}]\n"
+        db.update_source(sid, extractor=reopened_code, last_good_extractor=reopened_code, extractor_ok=1)
+        scanner.run_scan("manual", only=[sid])
+        self.assertIsNone(db.source_by_id(sid)["empty_reason"])
+        self.assertEqual(db.source_open_item_count(sid), 1)
+
+    def test_repair_round_that_still_fails_check_fails_as_today(self):
+        db.set_settings({"agent": "claude", "verify_weekly": "0"})
+        sid = db.add_source("BrokenReaderSite", "https://broken.example.com/list")
+        bad_round_1 = "class Bad:\n    pass\ndef fetch():\n    return []\n"
+        bad_round_2 = "def fetch():\n    tpl = '{0}'\n    return [{'title': tpl.format(1), 'url': 'https://broken.example.com/1'}]\n"
+
+        fake_run, calls = make_fake_agent([
+            {
+                "results.json": [{"title": "Role 1", "url": "https://broken.example.com/1"}],
+                "extractor.py": bad_round_1,
+            },
+            {
+                "extractor.py": bad_round_2,
+            },
+        ])
+        with patch.object(agents, "run_task", side_effect=fake_run):
+            got = scanner.read_agent_source(db.source_by_id(sid), [])
+
+        # Exactly one repair round in the same workdir, then fails as today
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0]["workdir"], calls[1]["workdir"])
+        self.assertIn("class definitions are not allowed", calls[1]["task_md"])
+        self.assertEqual(len(got), 1)
+        s = db.source_by_id(sid)
+        self.assertEqual(s["extractor_ok"], 0)
+        self.assertEqual(s["learn_fail_count"], 1)
+        self.assertIn("dynamic '.format()' calls are not allowed", s["extractor_error"])
+
+    def test_empty_ok_module_marker_also_verifies_honestly_empty_listing(self):
+        db.set_settings({"agent": "claude", "verify_weekly": "0"})
+        sid = db.add_source("EmptyOkSite", "https://emptyok.example.com/list")
+        src = db.source_by_id(sid)
+        sc0 = db.start_scan("manual", "claude", "", [])
+        db.save_item(sc0, src, {"id": "old-open", "title": "Old", "url": "https://emptyok.example.com/1"})
+        db.finish_scan(sc0, "done")
+
+        fake_run, calls = make_fake_agent({
+            "results.json": {"items": [], "empty_reason": "No open positions right now"},
+            "extractor.py": "EMPTY_OK = True\ndef fetch():\n    return []\n",
+        })
+        with patch.object(agents, "run_task", side_effect=fake_run):
+            scanner.read_agent_source(db.source_by_id(sid), [])
+
+        self.assertEqual(len(calls), 1)
+        s = db.source_by_id(sid)
+        self.assertEqual(s["extractor_ok"], 1)
+        self.assertEqual(s["empty_reason"], "No open positions right now")
+        self.assertEqual(db.item_by_id("old-open")["status"], "gone")
 
 
 if __name__ == "__main__":

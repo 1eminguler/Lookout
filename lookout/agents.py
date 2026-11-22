@@ -70,6 +70,7 @@ AGENTS: Dict[str, Dict] = {
 
 _model_cache: Dict[str, Tuple[float, List[Tuple[str, str]]]] = {}
 QUOTA = re.compile(r"quota|rate.?limit|usage limit|resource_exhausted|\b429\b|limit reached|too many requests", re.I)
+_SHELL_META_RE = re.compile(r"(&&|\|\||[|;`]|\$\(|[\r\n])")
 
 _proc_lock = threading.Lock()
 _running: Dict[int, Dict[str, Any]] = {}
@@ -213,13 +214,30 @@ def _split_custom(cmd: str) -> List[str]:
     return parts
 
 
+def validate_custom_command(cmd: str) -> str:
+    """Validate a custom command template, rejecting shell metacharacters and broken quoting."""
+    s = str(cmd or "").strip()
+    if not s:
+        return ""
+    if _SHELL_META_RE.search(s):
+        raise ValueError("Custom command cannot contain shell metacharacters (&&, |, ;, backticks, $()).")
+    try:
+        parts = _split_custom(s)
+    except ValueError as e:
+        raise ValueError(f"Invalid custom command: {e}") from None
+    if not parts:
+        return ""
+    return s
+
+
 def which(agent_id: str) -> Optional[str]:
     if agent_id == "custom":
         cmd = db.get_settings().get("custom_command", "")
         if not cmd.strip():
             return None
         try:
-            parts = _split_custom(cmd)
+            clean = validate_custom_command(cmd)
+            parts = _split_custom(clean)
         except ValueError:
             return None
         return shutil.which(parts[0]) if parts else None
@@ -290,9 +308,10 @@ def build_command(agent_id: str, model: str, workdir: str, timeout: int) -> List
         if not tpl.strip():
             raise RuntimeError("Custom command is empty")
         try:
+            tpl = validate_custom_command(tpl)
             parts = _split_custom(tpl)
         except ValueError as e:
-            raise RuntimeError(f"Invalid custom command: {e}") from None
+            raise RuntimeError(str(e)) from None
         if not parts:
             raise RuntimeError("Custom command is empty")
         parts = [p.replace("{prompt}", prompt_for(workdir)).replace("{model}", model or "").replace("{dir}", workdir) for p in parts]

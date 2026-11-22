@@ -16,10 +16,15 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
-      - name: Compile
-        run: python -m compileall -q run.py lookout plugins
-      - name: Smoke test
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Compile Python
+        run: python -m compileall -q run.py lookout plugins tests
+      - name: Check JS syntax
+        run: node --check web/app.js
+      - name: Run unit tests
         env:
           LOOKOUT_DATA_DIR: ${{ runner.temp }}/lookout-ci
-        run: |
-          python -c "import sys; sys.path.insert(0, '.'); from lookout import db, scanner, extractors, agents; db.init(); print(scanner.parse_date('Jan 15, 2027'), scanner.parse_date('22.11.2026')); extractors.check('from lookout_extract import get_json\ndef fetch():\n    return []\n'); print(len(agents.detect()), 'agents known')"
+          LOOKOUT_PLUGIN_DIR: ${{ runner.temp }}/lookout-plugins
+        run: python -m unittest discover -s tests -v

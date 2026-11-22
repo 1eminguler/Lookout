@@ -44,6 +44,9 @@ class _StubHandler(http.server.BaseHTTPRequestHandler):
         hits = getattr(self.server, "hits", None)
         if hits is not None:
             hits.append((self.command, self.path))
+        uas = getattr(self.server, "user_agents", None)
+        if uas is not None:
+            uas.append(self.headers.get("User-Agent", ""))
 
     def do_GET(self):
         self._record()
@@ -55,6 +58,26 @@ class _StubHandler(http.server.BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+        elif self.path == "/private":
+            body = b"private"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        elif self.path == "/robots.txt":
+            status = getattr(self.server, "robots_status", 404)
+            body = getattr(self.server, "robots_body", b"")
+            hdrs = getattr(self.server, "robots_headers", {})
+            self.send_response(status)
+            for k, v in hdrs.items():
+                self.send_header(k, v)
+            if status == 200:
+                self.send_header("Content-Type", "text/plain; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            if status == 200 and body:
+                self.wfile.write(body)
         elif self.path == "/json":
             body = json.dumps({"items": [1, 2]}).encode("utf-8")
             self.send_response(200)
@@ -367,7 +390,18 @@ class TestExtractors(LookoutTestCase):
         self.assertIn("size limit", str(cm2.exception))
 
     def test_agrees_edge_cases(self):
-        self.assertTrue(extractors.agrees([], []))
+        for code_items in ([], [{"title": "A", "url": "https://a.test"}]):
+            res = extractors.agrees([], code_items)
+            self.assertIs(res, extractors.UNVERIFIED)
+            self.assertFalse(bool(res))
+            self.assertEqual(res, "unverified")
+            self.assertIsNot(res, True)
+            self.assertIsNot(res, False)
+            self.assertNotEqual(res, True)
+            self.assertNotEqual(res, False)
+            self.assertEqual(str(res), "unverified")
+            self.assertEqual(repr(res), "UNVERIFIED")
+
         self.assertFalse(extractors.agrees([{"title": "", "url": ""}], [{"title": "", "url": ""}]))
         agent = [
             {"title": "ML   Intern", "url": "https://a.test/1/"},
@@ -383,18 +417,97 @@ class TestExtractors(LookoutTestCase):
         self.assertFalse(extractors.agrees(five, five[:2]))
         self.assertTrue(extractors.agrees(five, five[:3]))
 
+    def test_run_and_compare(self):
+        stable_code = "def fetch():\n    return [{'title': 'Stable', 'url': 'https://a.test/1'}]\n"
+        ok, items, reason = extractors.run_and_compare(stable_code, timeout=15)
+        self.assertTrue(ok)
+        self.assertEqual(items, [{"title": "Stable", "url": "https://a.test/1"}])
+        self.assertEqual(reason, "")
+
+        empty_code = "def fetch():\n    return []\n"
+        ok_empty, items_empty, reason_empty = extractors.run_and_compare(empty_code, timeout=15)
+        self.assertFalse(ok_empty)
+        self.assertEqual(items_empty, [])
+        self.assertIn("no items", reason_empty.lower())
+
+        ok_allow, items_allow, reason_allow = extractors.run_and_compare(empty_code, timeout=15, allow_empty=True)
+        self.assertTrue(ok_allow)
+        self.assertEqual(items_allow, [])
+        self.assertEqual(reason_allow, "")
+
+        unstable_code = (
+            "import time\n"
+            "def fetch():\n"
+            "    n = time.monotonic_ns()\n"
+            "    return [{'title': f'Item {n}', 'url': f'https://a.test/{n}'}]\n"
+        )
+        ok_unstable, items_unstable, reason_unstable = extractors.run_and_compare(unstable_code, timeout=15)
+        self.assertFalse(ok_unstable)
+        self.assertEqual(len(items_unstable), 1)
+        self.assertTrue(reason_unstable)
+
+        # Verify partial overlap, count mismatch, asymmetric overlap, and cancellation
+        p_a = [{"title": f"Role {i}", "url": f"https://a.test/{i}"} for i in range(4)]
+        p_b = p_a[:3] + [{"title": "Role 99", "url": "https://a.test/99"}]
+        with mock.patch.object(extractors, "run", side_effect=[p_a, p_b]):
+            ok_partial, got_partial, reason_partial = extractors.run_and_compare("def fetch(): return []", min_overlap=0.7)
+        self.assertTrue(ok_partial)
+        self.assertEqual(got_partial, p_b)
+        self.assertEqual(reason_partial, "")
+
+        with mock.patch.object(extractors, "run", side_effect=[p_a, p_a[:1]]):
+            ok_cnt, _, reason_cnt = extractors.run_and_compare("def fetch(): return []", min_overlap=0.7)
+        self.assertFalse(ok_cnt)
+        self.assertIn("count", reason_cnt.lower())
+
+        with mock.patch.object(extractors, "run", side_effect=[[p_a[0]] * 4, p_a]):
+            ok_asym, _, reason_asym = extractors.run_and_compare("def fetch(): return []", min_overlap=0.7)
+        self.assertFalse(ok_asym)
+        self.assertIn("overlap", reason_asym.lower())
+
+        with mock.patch.object(extractors, "run", side_effect=[p_a, []]):
+            ok_drop, _, reason_drop = extractors.run_and_compare("def fetch(): return []")
+        self.assertFalse(ok_drop)
+        self.assertIn("changed", reason_drop.lower())
+
+        ev = threading.Event()
+        threading.Timer(0.05, ev.set).start()
+        with mock.patch.object(extractors, "run", return_value=p_a) as m_run:
+            with self.assertRaises(agents.CancelledError):
+                extractors.run_and_compare("def fetch(): return []", cancel_event=ev, delay=2.0)
+        self.assertEqual(m_run.call_count, 1)
+
 
 class TestLookoutExtractHelpers(LookoutTestCase):
     def setUp(self) -> None:
         super().setUp()
+        self._orig_interval = lookout_extract.MIN_HOST_INTERVAL
+        clean_env = {
+            k: v for k, v in os.environ.items()
+            if k not in ("LOOKOUT_USER_AGENT", "LOOKOUT_MIN_INTERVAL", "LOOKOUT_RESPECT_ROBOTS")
+        }
+        self._env_patch = mock.patch.dict(os.environ, clean_env, clear=True)
+        self._env_patch.start()
+        lookout_extract.set_host_interval(0.0)
+        lookout_extract.reset_throttle()
+        lookout_extract.clear_robots_cache()
+
         self.srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _StubHandler)
         self.srv.hits = []
+        self.srv.user_agents = []
+        self.srv.robots_status = 404
+        self.srv.robots_body = b""
+        self.srv.robots_headers = {}
         self.port = self.srv.server_address[1]
         threading.Thread(target=self.srv.serve_forever, daemon=True).start()
 
     def tearDown(self) -> None:
         self.srv.shutdown()
         self.srv.server_close()
+        lookout_extract.set_host_interval(self._orig_interval)
+        lookout_extract.reset_throttle()
+        lookout_extract.clear_robots_cache()
+        self._env_patch.stop()
         super().tearDown()
 
     def test_ssrf_blocks_local_private_link_local_cgnat_multicast_ipv6_and_dns(self):
@@ -549,6 +662,196 @@ class TestLookoutExtractHelpers(LookoutTestCase):
             with self.assertRaises(RuntimeError) as cm_missing:
                 lookout_extract._ab("s1", "open", "https://example.com")
             self.assertIn("not installed", str(cm_missing.exception))
+
+    def test_user_agent_default_and_override(self):
+        self.assertTrue(lookout_extract.DEFAULT_UA.startswith("Lookout/"))
+        self.assertNotIn("Chrome", lookout_extract.DEFAULT_UA)
+        self.assertNotIn("Mozilla", lookout_extract.DEFAULT_UA)
+        self.assertEqual(lookout_extract.get_user_agent(), lookout_extract.DEFAULT_UA)
+
+        base = f"http://public.example:{self.port}"
+        with _mock_public_dns(self.port):
+            self.assertEqual(lookout_extract.get(f"{base}/ok"), "hello world")
+            self.assertEqual(lookout_extract.post_json(f"{base}/post", {"k": 1}), {"echo": {"k": 1}})
+            self.assertEqual(self.srv.user_agents[-2:], [lookout_extract.DEFAULT_UA, lookout_extract.DEFAULT_UA])
+
+            # Caller-provided User-Agent header overrides default
+            lookout_extract.get(f"{base}/ok", headers={"User-Agent": "ExplicitAgent/2.0"})
+            lookout_extract.post_json(f"{base}/post", {"k": 2}, headers={"user-agent": "LowerAgent/3.0"})
+            self.assertEqual(self.srv.user_agents[-2:], ["ExplicitAgent/2.0", "LowerAgent/3.0"])
+
+            # LOOKOUT_USER_AGENT env var overrides get_user_agent() in get(), post_json(), and allowed()
+            with mock.patch.dict(os.environ, {"LOOKOUT_USER_AGENT": "EnvBot/1.2 (+https://example.org)"}):
+                self.assertEqual(lookout_extract.get_user_agent(), "EnvBot/1.2 (+https://example.org)")
+                lookout_extract.get(f"{base}/ok")
+                lookout_extract.post_json(f"{base}/post", {"k": 3})
+                lookout_extract.clear_robots_cache()
+                self.assertTrue(lookout_extract.allowed(f"{base}/ok"))
+                self.assertEqual(
+                    self.srv.user_agents[-3:],
+                    [
+                        "EnvBot/1.2 (+https://example.org)",
+                        "EnvBot/1.2 (+https://example.org)",
+                        "EnvBot/1.2 (+https://example.org)",
+                    ],
+                )
+
+    def test_per_host_throttle(self):
+        self.assertGreater(self._orig_interval, 0.0)
+
+        lookout_extract.set_host_interval(-1.0)
+        self.assertEqual(lookout_extract.MIN_HOST_INTERVAL, 0.0)
+        lookout_extract.set_host_interval(0.15)
+        self.assertEqual(lookout_extract.get_host_interval(), 0.15)
+
+        with mock.patch.dict(os.environ, {"LOOKOUT_MIN_INTERVAL": "0.08"}):
+            self.assertAlmostEqual(lookout_extract.get_host_interval(), 0.08)
+        with mock.patch.dict(os.environ, {"LOOKOUT_MIN_INTERVAL": "-2"}):
+            self.assertEqual(lookout_extract.get_host_interval(), 0.0)
+        for bad in ("not-a-float", "nan", "inf"):
+            with mock.patch.dict(os.environ, {"LOOKOUT_MIN_INTERVAL": bad}):
+                self.assertEqual(lookout_extract.get_host_interval(), 0.15)
+
+        base_a = f"http://public.example:{self.port}"
+        base_b = f"http://example.com:{self.port}"
+        lookout_extract.reset_throttle()
+
+        with _mock_public_dns(self.port):
+            t0 = time.monotonic()
+            self.assertEqual(lookout_extract.get(f"{base_a}/ok"), "hello world")
+            # Different host must NOT be blocked by base_a's throttle
+            t_b0 = time.monotonic()
+            self.assertEqual(lookout_extract.get(f"{base_b}/ok"), "hello world")
+            dt_other = time.monotonic() - t_b0
+            self.assertLess(dt_other, 0.12)
+
+            # Second request to same host must wait at least ~0.15s from first
+            self.assertEqual(lookout_extract.get(f"{base_a}/ok"), "hello world")
+            dt_same = time.monotonic() - t0
+            self.assertGreaterEqual(dt_same, 0.13)
+
+            # Concurrent requests to the same host queue cleanly without thundering herd
+            lookout_extract.reset_throttle()
+            barrier = threading.Barrier(3, timeout=3.0)
+            results = []
+
+            def worker():
+                barrier.wait()
+                results.append(lookout_extract.get(f"{base_a}/ok"))
+
+            t_conc0 = time.monotonic()
+            threads = [threading.Thread(target=worker) for _ in range(3)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(timeout=5.0)
+            dt_conc = time.monotonic() - t_conc0
+            self.assertEqual(results, ["hello world"] * 3)
+            self.assertGreaterEqual(dt_conc, 0.27)
+
+            # post_json and browser_eval also throttle per host
+            lookout_extract.reset_throttle()
+            t_pb0 = time.monotonic()
+            self.assertEqual(lookout_extract.post_json(f"{base_a}/post", {"a": 1}), {"echo": {"a": 1}})
+            with mock.patch.object(lookout_extract, "_ab", side_effect=lambda s, *a, **kw: (
+                json.dumps({"success": True, "data": {"result": "[]"}}) if a[0] == "eval" else ""
+            )):
+                self.assertEqual(lookout_extract.browser_eval(f"{base_a}/ok", "[]", wait_ms=0, scrolls=0), [])
+            self.assertGreaterEqual(time.monotonic() - t_pb0, 0.13)
+
+    def test_robots_txt_allowed_and_enforcement(self):
+        base = f"http://public.example:{self.port}"
+        with _mock_public_dns(self.port):
+            # 200 with Disallow: /private
+            self.srv.robots_status = 200
+            self.srv.robots_body = b"User-agent: *\nDisallow: /private\n"
+            lookout_extract.clear_robots_cache()
+            self.assertFalse(lookout_extract.allowed(f"{base}/private"))
+            self.assertTrue(lookout_extract.allowed(f"{base}/ok"))
+
+            # Cached result stays valid until cache is cleared
+            self.srv.robots_status = 403
+            self.assertTrue(lookout_extract.allowed(f"{base}/ok"))
+            lookout_extract.clear_robots_cache()
+            self.assertFalse(lookout_extract.allowed(f"{base}/ok"))
+
+            # 401 also disallows; 404 allows
+            self.srv.robots_status = 401
+            lookout_extract.clear_robots_cache()
+            self.assertFalse(lookout_extract.allowed(f"{base}/ok"))
+
+            self.srv.robots_status = 404
+            lookout_extract.clear_robots_cache()
+            self.assertTrue(lookout_extract.allowed(f"{base}/private"))
+
+            # 5xx fails open without caching
+            self.srv.robots_status = 503
+            lookout_extract.clear_robots_cache()
+            self.assertTrue(lookout_extract.allowed(f"{base}/private"))
+            self.srv.robots_status = 200
+            self.srv.robots_body = b"User-agent: *\nDisallow: /private\n"
+            self.assertFalse(lookout_extract.allowed(f"{base}/private"))
+
+            # Redirect from /robots.txt to loopback must raise SSRF ValueError
+            self.srv.robots_status = 302
+            self.srv.robots_headers = {"Location": f"http://127.0.0.1:{self.port}/secret"}
+            lookout_extract.clear_robots_cache()
+            with self.assertRaises(ValueError) as cm_ssrf:
+                lookout_extract.allowed(f"{base}/ok")
+            self.assertIn("blocked", str(cm_ssrf.exception).lower())
+            self.assertFalse(any(p == "/secret" for _, p in self.srv.hits))
+
+            # respect_robots=True blocks get, get_json, post_json, browser_eval before fetching
+            self.srv.robots_status = 200
+            self.srv.robots_headers = {}
+            self.srv.robots_body = b"User-agent: *\nDisallow: /private\n"
+            lookout_extract.clear_robots_cache()
+            self.srv.hits.clear()
+
+            with self.assertRaises(RuntimeError) as cm_get:
+                lookout_extract.get(f"{base}/private", respect_robots=True)
+            self.assertIn("robots.txt", str(cm_get.exception))
+            with self.assertRaises(RuntimeError):
+                lookout_extract.get_json(f"{base}/private", respect_robots=True)
+            with self.assertRaises(RuntimeError):
+                lookout_extract.post_json(f"{base}/private", {"a": 1}, respect_robots=True)
+            with mock.patch.object(lookout_extract, "_ab") as ab_mock:
+                with self.assertRaises(RuntimeError):
+                    lookout_extract.browser_eval(f"{base}/private", "[]", respect_robots=True)
+                ab_mock.assert_not_called()
+            self.assertFalse(any(p == "/private" for _, p in self.srv.hits))
+
+            # Default respect_robots=None leaves existing fetches unaffected; LOOKOUT_RESPECT_ROBOTS=1 enforces
+            self.assertEqual(lookout_extract.get(f"{base}/private"), "private")
+            with mock.patch.dict(os.environ, {"LOOKOUT_RESPECT_ROBOTS": "1"}):
+                with self.assertRaises(RuntimeError):
+                    lookout_extract.get(f"{base}/private")
+                self.assertEqual(lookout_extract.get(f"{base}/ok"), "hello world")
+                self.assertEqual(lookout_extract.get(f"{base}/private", respect_robots=False), "private")
+
+        # allowed() is exported in SANDBOX_HELPERS and usable in isolated extractors.run()
+        self.assertIn("allowed", lookout_extract.SANDBOX_HELPERS)
+        res = extractors.run(
+            "from lookout_extract import allowed\n"
+            "def fetch():\n"
+            "    return [{'title': str(callable(allowed)), 'url': 'https://a.test/1'}]\n",
+            timeout=15,
+        )
+        self.assertEqual(res, [{"title": "True", "url": "https://a.test/1"}])
+        with self.assertRaises(RuntimeError) as cm_sub:
+            extractors.run(
+                "from lookout_extract import allowed\n"
+                "def fetch():\n"
+                "    return [{'title': str(allowed('http://127.0.0.1/ok')), 'url': 'https://a.test/1'}]\n",
+                timeout=15,
+            )
+        self.assertIn("blocked", str(cm_sub.exception).lower())
+
+    def test_strip_control_chars(self):
+        self.assertEqual(lookout_extract.strip_control_chars(None), "")
+        self.assertEqual(lookout_extract.strip_control_chars(12345), "12345")
+        raw = "Hello\x00\x07\x08\tWorld\x0b\x0c\nLine2\r\n\x0e\x1fEnd\x7f\ufffe\uffff-şğüöçıİ"
+        self.assertEqual(lookout_extract.strip_control_chars(raw), "Hello\tWorld\nLine2\r\nEnd-şğüöçıİ")
 
 
 if __name__ == "__main__":

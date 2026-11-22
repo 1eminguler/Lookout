@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Union
 from unittest import mock
 
-from lookout import agents, db, notify, scanner, server, tasks
+from lookout import agents, db, lookout_extract, notify, scanner, server, tasks
 
 
 def free_port() -> int:
@@ -79,10 +79,22 @@ class TempLookoutTestCase(unittest.TestCase):
         server.discovery.clear()
         server.discovery.update(id=None, watch_id=None, running=False, request="", title="",
                                 results=[], error="", finished=None)
+        server._test_cancel.clear()
+        server.test_job.clear()
+        server.test_job.update(id=None, running=False, source_id=None, title="",
+                               result=None, error="", finished=None)
+        agents.set_cli_custom_command(None)
         agents._model_cache.clear()
         with agents._proc_lock:
             agents._running.clear()
+        with scanner._active_lock:
+            scanner._active_scan = None
+        with scanner._url_locks_guard:
+            scanner._url_locks.clear()
+            scanner._url_generations.clear()
         notify._schedule_cache.update(t=0.0, plat=None, val=None)
+        lookout_extract.reset_throttle()
+        lookout_extract.clear_robots_cache()
         server.last_hit["t"] = 0.0
 
 
@@ -187,6 +199,11 @@ class LiveServer:
         db.init()
         self.srv = ThreadingHTTPServer(("127.0.0.1", self.requested_port), server.Handler)
         self.srv.api_token = self.api_token
+        self.srv.auth_lock = threading.Lock()
+        self.srv.launch_secrets = set()
+        self.srv.session_tokens = set()
+        self.srv.issue_launch_secret = lambda: server._issue_launch_secret(self.srv)
+        self.srv.launch_secret = server._issue_launch_secret(self.srv)
         self.srv.daemon_threads = True
         try:
             self.port = self.srv.server_address[1]

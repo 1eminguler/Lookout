@@ -5,9 +5,11 @@
     python run.py scan       run one scan now (used by the daily schedule)
 """
 import argparse
+import os
 import socket
 import subprocess
 import sys
+import threading
 import time
 import webbrowser
 from pathlib import Path
@@ -20,9 +22,59 @@ for stream in (sys.stdout, sys.stderr):
     except Exception:
         pass
 
-from lookout import db, notify, scanner, server  # noqa: E402
+from lookout import agents, db, notify, scanner, server  # noqa: E402
 
 URL = f"http://127.0.0.1:{server.PORT}/"
+
+
+def _window_lock_path() -> Path:
+    return db.DB_PATH.parent / "window.pid"
+
+
+def acquire_window_lock() -> bool:
+    p = _window_lock_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    if p.is_file():
+        try:
+            lines = p.read_text(encoding="utf-8", errors="replace").strip().splitlines()
+            pid = int(lines[0]) if lines else 0
+            if pid and pid != os.getpid() and db._pid_alive(pid):
+                return False
+        except (OSError, ValueError):
+            pass
+    try:
+        p.write_text(f"{os.getpid()}\n{server.PORT}\n", encoding="utf-8")
+    except OSError:
+        pass
+    return True
+
+
+def release_window_lock() -> None:
+    p = _window_lock_path()
+    try:
+        if not p.is_file():
+            return
+        lines = p.read_text(encoding="utf-8", errors="replace").strip().splitlines()
+        if lines and lines[0].isdigit() and int(lines[0]) == os.getpid():
+            p.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _launch_url(srv=None) -> str:
+    if srv is not None:
+        sec = getattr(srv, "launch_secret", None)
+        port = srv.server_address[1]
+        return f"http://127.0.0.1:{port}/?k={sec}" if sec else f"http://127.0.0.1:{port}/"
+    sec_file = db.DB_PATH.parent / ".launch_secret"
+    if sec_file.is_file():
+        try:
+            sec = sec_file.read_text(encoding="utf-8", errors="replace").strip()
+            if sec:
+                return f"http://127.0.0.1:{server.PORT}/?k={sec}"
+        except OSError:
+            pass
+    return f"http://127.0.0.1:{server.PORT}/"
 
 
 def port_busy() -> bool:
@@ -47,9 +99,28 @@ def start_ui_in_background() -> None:
         return
     pyw = Path(sys.executable).with_name("pythonw.exe")
     exe = str(pyw if pyw.exists() else sys.executable)
-    flags = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-    subprocess.Popen([exe, str(ROOT / "run.py"), "--background"], cwd=str(ROOT), creationflags=flags,
-                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, close_fds=True)
+    kwargs = dict(
+        cwd=str(ROOT),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        close_fds=True,
+    )
+    if sys.platform == "win32":
+        kwargs["creationflags"] = (
+            getattr(subprocess, "DETACHED_PROCESS", 0)
+            | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        )
+    else:
+        kwargs["start_new_session"] = True
+    proc = subprocess.Popen([exe, str(ROOT / "run.py"), "--background"], **kwargs)
+    if isinstance(getattr(proc, "pid", None), int):
+        sec_file = db.DB_PATH.parent / ".launch_secret"
+        deadline = time.time() + 5.0
+        while time.time() < deadline:
+            if port_busy() and sec_file.is_file():
+                break
+            time.sleep(0.05)
 
 
 def cmd_scan(scheduled: bool) -> None:
@@ -59,27 +130,24 @@ def cmd_scan(scheduled: bool) -> None:
         print("No internet connection; scan skipped.")
         return
     print("Scanning…")
-    scan_id = scanner.run_scan("scheduled" if scheduled else "manual")
+    scan_id = scanner.run_scan(
+        "scheduled" if scheduled else "manual",
+        panel_url=URL,
+        before_desktop=start_ui_in_background,
+    )
     if scan_id is None:
         print("A scan is already running.")
         return
     d = db.scan_detail(scan_id)
     print(f"{d['found']} items, {d['new']} new. "
           f"{sum(1 for s in d['sources'] if s['ok'])}/{len(d['sources'])} sources read.")
-    fresh = db.unnotified()
-    if fresh and db.get_settings().get("notify") == "1":
-        start_ui_in_background()
-        notify.desktop(f"{len(fresh)} new item{'s' if len(fresh) != 1 else ''}",
-                       [f"{i['title']} — {i['source_name']}" for i in fresh[:2]], URL)
-        ok, msg = notify.mail_digest(fresh, URL)
-        if ok:
-            print(msg)
-    db.mark_notified(i["id"] for i in fresh)
     # Agenda reminders the user set for today
     due = [i for i in db.items() if i["remind_on"] == time.strftime("%Y-%m-%d") and i["action"] == "saved"]
     if due and db.get_settings().get("notify") == "1":
+        start_ui_in_background()
         notify.desktop(f"Reminder: {due[0]['title']}" if len(due) == 1 else f"{len(due)} reminders today",
-                       [i["title"] for i in due[:2]] if len(due) > 1 else [due[0].get("org") or due[0]["source_name"]], URL)
+                       [i["title"] for i in due[:2]] if len(due) > 1 else [due[0].get("org") or due[0]["source_name"]],
+                       notify.desktop_launch_url(URL))
 
 
 def main() -> None:
@@ -88,19 +156,25 @@ def main() -> None:
     ap.add_argument("--scheduled", action="store_true", help=argparse.SUPPRESS)
     ap.add_argument("--background", action="store_true", help=argparse.SUPPRESS)
     ap.add_argument("--browser", action="store_true", help="open in your web browser instead of a window")
+    ap.add_argument("--custom-command", default=None, help="custom agent command template (local CLI only)")
     a = ap.parse_args()
+    if a.custom_command is not None:
+        try:
+            agents.set_cli_custom_command(a.custom_command)
+        except ValueError as e:
+            print(f"Invalid --custom-command: {e}", file=sys.stderr)
+            sys.exit(2)
     if a.command == "scan":
         return cmd_scan(a.scheduled)
     if port_busy():
         if not a.background and (a.browser or not open_window(start_server=False)):
-            webbrowser.open(URL)
+            webbrowser.open(_launch_url())
         return
     if a.background:
         return server.serve(idle_minutes=12 * 60)
     if a.browser or not open_window():
         print(f"Lookout is running at {URL}  (close this window to stop)")
-        __import__("threading").Timer(0.5, lambda: webbrowser.open(URL)).start()
-        server.serve()
+        server.serve(on_start=lambda srv: threading.Timer(0.5, lambda: webbrowser.open(_launch_url(srv))).start())
 
 
 class WindowApi:
@@ -131,26 +205,22 @@ def open_window(start_server: bool = True) -> bool:
     except Exception as e:
         print(f"Desktop window unavailable ({e}); opening in browser.")
         return False
-    import threading
-    # One window at a time: a second launch while Lookout is open does nothing.
-    global _single
-    _single = socket.socket()
-    try:
-        _single.bind(("127.0.0.1", server.PORT + 1))
-    except OSError:
+    if not acquire_window_lock():
+        print(f"Lookout is already open in another window ({URL}).")
         return True
     srv = None
-    if start_server:
-        srv = server.make_server()
-        threading.Thread(target=srv.serve_forever, daemon=True).start()
-        for _ in range(50):
-            if port_busy():
-                break
-            time.sleep(0.1)
     try:
+        if start_server:
+            srv = server.make_server()
+            threading.Thread(target=srv.serve_forever, daemon=True).start()
+            for _ in range(50):
+                if port_busy():
+                    break
+                time.sleep(0.1)
         api = WindowApi()
-        api._window = webview.create_window("Lookout", URL, js_api=api, width=1320, height=860, min_size=(960, 620),
-                                            frameless=True, easy_drag=False, background_color="#0A0A0B")
+        api._window = webview.create_window("Lookout", _launch_url(srv), js_api=api, width=1320, height=860,
+                                            min_size=(960, 620), frameless=True, easy_drag=False,
+                                            background_color="#0A0A0B")
         webview.start()
         return True
     except Exception as e:
@@ -161,11 +231,9 @@ def open_window(start_server: bool = True) -> bool:
                 srv.server_close()
             except Exception:
                 pass
-        try:
-            _single.close()
-        except Exception:
-            pass
         return False
+    finally:
+        release_window_lock()
 
 
 if __name__ == "__main__":

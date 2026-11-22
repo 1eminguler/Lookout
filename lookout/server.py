@@ -1,7 +1,6 @@
-"""Local web UI + JSON API. Listens on 127.0.0.1 only."""
+"""Local web UI + JSON API. Listens on 127.0.0.1 by default (or LOOKOUT_BIND)."""
 import csv
 import hmac
-import html as _html
 import inspect
 import io as _io
 import json
@@ -17,6 +16,7 @@ import urllib.parse
 import uuid
 from datetime import date, datetime, timezone
 from email.utils import format_datetime
+from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, List, Optional
 from xml.sax.saxutils import escape as _xesc
@@ -26,16 +26,71 @@ from lookout import agents, db, notify, scanner, tasks
 WEB = db.ROOT / "web"
 PORT = int(os.environ.get("LOOKOUT_PORT") or 8780)
 HOSTS = {f"127.0.0.1:{PORT}", f"localhost:{PORT}"}
-SECRET_KEYS = {"smtp_password"}
+SECRET_KEYS = {"smtp_password", "custom_command"}
 API_TOKEN = secrets.token_urlsafe(32)
 DEFAULT_ITEMS_LIMIT = 200
 MAX_ITEMS_LIMIT = 500
+_SECURITY_HEADERS = {
+    "Content-Security-Policy": "default-src 'self'; img-src 'self' data:; frame-ancestors 'none'",
+    "X-Frame-Options": "DENY",
+    "Referrer-Policy": "no-referrer",
+    "X-Content-Type-Options": "nosniff",
+    "Cache-Control": "no-store",
+}
+_XML_CTRL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f\ufffe\uffff]")
+_DEFAULT_AUTH_LOCK = threading.Lock()
+_DEFAULT_LAUNCH_SECRETS: set = set()
+_DEFAULT_SESSION_TOKENS: set = set()
+
+DISCOVERY_HEARTBEAT_SEC = 15.0
 discovery: Dict[str, Any] = {"id": None, "watch_id": None, "running": False, "request": "", "title": "",
                              "results": [], "error": "", "finished": None}
 _disc_lock = threading.Lock()
 _disc_cancel = threading.Event()
+test_job: Dict[str, Any] = {"id": None, "running": False, "status": None, "source_id": None, "title": "",
+                            "result": None, "error": "", "finished": None}
+_test_lock = threading.Lock()
+_test_cancel = threading.Event()
 last_hit = {"t": time.time()}
 _sched_cache: Dict[str, Any] = {"t": 0.0, "key": None, "val": None}
+
+
+def _launch_secret_path():
+    return db.DB_PATH.parent / ".launch_secret"
+
+
+def _write_launch_secret_file(secret: str) -> None:
+    p = _launch_secret_path()
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(secret, encoding="utf-8")
+        if sys.platform != "win32":
+            os.chmod(p, 0o600)
+    except OSError:
+        pass
+
+
+def _clear_launch_secret_file(expected: Optional[str] = None) -> None:
+    p = _launch_secret_path()
+    try:
+        if not p.is_file():
+            return
+        if expected is not None:
+            cur = p.read_text(encoding="utf-8", errors="replace").strip()
+            if not hmac.compare_digest(cur, expected):
+                return
+        p.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _issue_launch_secret(srv: Any) -> str:
+    sec = secrets.token_urlsafe(32)
+    with srv.auth_lock:
+        srv.launch_secrets.add(sec)
+        srv.launch_secret = sec
+    _write_launch_secret_file(sec)
+    return sec
 
 
 def _cached_schedule_status() -> Dict[str, Any]:
@@ -52,29 +107,95 @@ def public_settings() -> Dict[str, Any]:
     s = db.get_settings()
     out = {k: v for k, v in s.items() if k not in SECRET_KEYS}
     out["smtp_password_set"] = bool(s.get("smtp_password"))
+    out["custom_command_configured"] = bool(agents.get_custom_command())
+    out["custom_command_path"] = str(agents.custom_command_path())
     return out
 
 
+def get_test_job() -> Dict[str, Any]:
+    with _test_lock:
+        return dict(test_job)
+
+
+def cancel_test_source(async_browser: bool = False) -> None:
+    with _test_lock:
+        if not test_job["running"]:
+            return
+        _test_cancel.set()
+    agents.cancel("test", async_browser=async_browser)
+
+
+def start_test_job(src: Dict[str, Any]) -> Dict[str, Any]:
+    with _test_lock:
+        if test_job["running"]:
+            return {"started": False, **dict(test_job)}
+        jid = uuid.uuid4().hex[:10]
+        _test_cancel.clear()
+        test_job.update(
+            id=jid,
+            running=True,
+            status="running",
+            source_id=src.get("id"),
+            title=src.get("name") or src.get("url") or "Source",
+            result=None,
+            error="",
+            finished=None,
+        )
+        snap = {"started": True, **dict(test_job)}
+
+    def _run():
+        res = None
+        err = ""
+        try:
+            res = scanner.test_source(src, cancel_event=_test_cancel)
+            if not res.get("ok"):
+                err = str(res.get("error") or "")
+        except Exception as e:
+            traceback.print_exc()
+            err = scanner.format_user_error(e)
+            res = {"ok": False, "status": "failed", "method": "reader", "count": 0, "matching": 0, "items": [], "error": err}
+        finally:
+            if _test_cancel.is_set() or (
+                isinstance(res, dict) and (res.get("cancelled") or res.get("status") == "cancelled")
+            ):
+                used_method = (res.get("method") if isinstance(res, dict) else None) or (
+                    "plugin" if src.get("method") == "plugin" else "reader"
+                )
+                err = "cancelled"
+                res = {
+                    "ok": False,
+                    "cancelled": True,
+                    "status": "cancelled",
+                    "method": used_method,
+                    "count": 0,
+                    "matching": 0,
+                    "items": [],
+                    "error": "cancelled",
+                }
+            with _test_lock:
+                if test_job.get("id") == jid:
+                    st = "cancelled" if (res and res.get("cancelled")) else ("done" if (res and res.get("ok")) else "failed")
+                    test_job.update(running=False, status=st, result=res, error=err, finished=db.now())
+
+    threading.Thread(target=_run, daemon=True).start()
+    return snap
+
+
 def state(limit: int = DEFAULT_ITEMS_LIMIT, offset: int = 0) -> Dict[str, Any]:
-    lim = max(1, min(MAX_ITEMS_LIMIT, int(limit)))
-    off = max(0, int(offset))
-    total = db.items_count()
-    page_items = db.items(limit=lim, offset=off)
+    cnt = db.counts()
     return {
-        "items": page_items,
-        "items_total": total,
-        "items_limit": lim,
-        "items_offset": off,
-        "items_has_more": (off + len(page_items)) < total,
+        "counts": cnt,
         "agenda_items": db.agenda_items(),
         "scans": db.scans(),
         "discoveries": db.discoveries(),
         "watches": db.watches(),
-        "sources": db.sources(),
+        "sources": db.sources(include_code=False),
         "filters": db.filters(),
         "progress": scanner.get_progress(),
         "settings": public_settings(),
         "discovery": dict(discovery),
+        "test_job": get_test_job(),
+        "notify_errors": db.recent_notify_errors(),
         "schedule": _cached_schedule_status(),
     }
 
@@ -136,9 +257,21 @@ def run_discovery(did: int, wid: Optional[int], request: str) -> None:
             elif scanner.start_scan_async("manual", only=new_sids, watch_id=wid):
                 scanned_ids.update(new_sids)
 
+    hb_stop = threading.Event()
+    hb_thread: Optional[threading.Thread] = None
     try:
         if db.acquire_scan_lock(disc_token, name="discover"):
             db.update_scan_lock(disc_token, scan_id=did, name="discover")
+
+            def _disc_heartbeat():
+                while not hb_stop.wait(DISCOVERY_HEARTBEAT_SEC):
+                    try:
+                        db.update_scan_lock(disc_token, scan_id=did, name="discover")
+                    except Exception:
+                        pass
+
+            hb_thread = threading.Thread(target=_disc_heartbeat, daemon=True)
+            hb_thread.start()
         kw: Dict[str, Any] = {"cancel_event": _disc_cancel, "session": f"lookout-discover-{did}"}
         sig_params = inspect.signature(tasks.discover_sources).parameters
         if "on_progress" in sig_params or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig_params.values()):
@@ -156,6 +289,9 @@ def run_discovery(did: int, wid: Optional[int], request: str) -> None:
         else:
             status, error = "failed", str(e)[:400]
     finally:
+        hb_stop.set()
+        if hb_thread is not None:
+            hb_thread.join(timeout=1.0)
         db.release_scan_lock(disc_token, name="discover")
         db.finish_discovery(did, status, results, error, title=title)
         remaining = [sid for sid in added_ids if sid not in scanned_ids]
@@ -208,19 +344,23 @@ def agenda_ics() -> str:
             if not day:
                 continue
             d = day.replace("-", "")
-            clean_url = str(i["url"] or "").replace("\r", "").replace("\n", "")
+            clean_url = re.sub(r"[\x00-\x1f\x7f]", "", str(i["url"] or ""))
             lines += [
                 "BEGIN:VEVENT",
                 f"UID:{i['id']}-{kind.lower()}@lookout",
                 f"DTSTAMP:{stamp}",
                 f"DTSTART;VALUE=DATE:{d}",
                 f"SUMMARY:{text(kind + ': ' + i['title'])}",
-                f"URL:{text(clean_url)}",
+                f"URL:{clean_url}",
                 f"DESCRIPTION:{text(' - '.join(x for x in (i['org'], i['source_name'], i['note']) if x))}",
                 "END:VEVENT",
             ]
     lines.append("END:VCALENDAR")
     return "\r\n".join(_ics_fold(ln) for ln in lines) + "\r\n"
+
+
+def _xml_text(v: Any) -> str:
+    return _XML_CTRL_RE.sub("", str(v or ""))
 
 
 def _rfc2822_ts(ts: str) -> str:
@@ -256,19 +396,19 @@ def _watch_rss(wid: int, base_url: str) -> Optional[str]:
         ) if x]
         entries.append(
             "<item>"
-            f"<title>{_xesc(it['title'])}</title>"
-            f"<link>{_xesc(it['url'])}</link>"
-            f"<guid isPermaLink=\"false\">{_xesc(it['id'])}</guid>"
+            f"<title>{_xesc(_xml_text(it['title']))}</title>"
+            f"<link>{_xesc(_xml_text(it['url']))}</link>"
+            f"<guid isPermaLink=\"false\">{_xesc(_xml_text(it['id']))}</guid>"
             f"<pubDate>{_xesc(_rfc2822_ts(it.get('updated_at') or it['first_seen']))}</pubDate>"
-            f"<description>{_xesc(' · '.join(desc_parts))}</description>"
+            f"<description>{_xesc(_xml_text(' · '.join(desc_parts)))}</description>"
             "</item>"
         )
     return (
         '<?xml version="1.0" encoding="utf-8"?>\n'
         '<rss version="2.0"><channel>'
-        f"<title>{_xesc('Lookout — ' + w['title'])}</title>"
-        f"<link>{_xesc(chan_link)}</link>"
-        f"<description>{_xesc(w.get('request') or w['title'])}</description>"
+        f"<title>{_xesc(_xml_text('Lookout — ' + w['title']))}</title>"
+        f"<link>{_xesc(_xml_text(chan_link))}</link>"
+        f"<description>{_xesc(_xml_text(w.get('request') or w['title']))}</description>"
         + "".join(entries)
         + "</channel></rss>\n"
     )
@@ -293,19 +433,19 @@ def _watch_atom(wid: int, base_url: str) -> Optional[str]:
         ) if x]
         entries.append(
             "<entry>"
-            f"<id>urn:lookout:item:{_xesc(it['id'])}</id>"
-            f"<title>{_xesc(it['title'])}</title>"
-            f"<link href=\"{_xesc(it['url'])}\"/>"
+            f"<id>urn:lookout:item:{_xesc(_xml_text(it['id']))}</id>"
+            f"<title>{_xesc(_xml_text(it['title']))}</title>"
+            f"<link href=\"{_xesc(_xml_text(it['url']))}\"/>"
             f"<updated>{_xesc(_rfc3339_ts(it.get('updated_at') or it['first_seen']))}</updated>"
-            f"<summary>{_xesc(' · '.join(desc_parts))}</summary>"
+            f"<summary>{_xesc(_xml_text(' · '.join(desc_parts)))}</summary>"
             "</entry>"
         )
     return (
         '<?xml version="1.0" encoding="utf-8"?>\n'
         '<feed xmlns="http://www.w3.org/2005/Atom">'
         f"<id>urn:lookout:watch:{wid}</id>"
-        f"<title>{_xesc('Lookout — ' + w['title'])}</title>"
-        f"<link href=\"{_xesc(base_url + '/#/watch/' + str(wid))}\"/>"
+        f"<title>{_xesc(_xml_text('Lookout — ' + w['title']))}</title>"
+        f"<link href=\"{_xesc(_xml_text(base_url + '/#/watch/' + str(wid)))}\"/>"
         f"<updated>{_xesc(updated)}</updated>"
         + "".join(entries)
         + "</feed>\n"
@@ -313,57 +453,16 @@ def _watch_atom(wid: int, base_url: str) -> Optional[str]:
 
 
 def _schedule_snippets(at: str) -> Dict[str, Any]:
-    if hasattr(notify, "schedule_preview"):
-        prev = notify.schedule_preview(at)
-        return {
-            "at": at,
-            "platform": sys.platform,
-            "cron": prev.get("cron", ""),
-            "crontab": prev.get("cron", ""),
-            "systemd_service": prev.get("systemd_service", ""),
-            "systemd_timer": prev.get("systemd_timer", ""),
-            "launchd_plist": prev.get("launchd_plist", ""),
-            "schedule": _cached_schedule_status(),
-        }
-    hh, mm = at.split(":")
-    h_num, m_num = int(hh), int(mm)
-    root = str(db.ROOT)
-    script = str(db.ROOT / "run.py")
-    py = sys.executable
-    cron_line = f"{m_num} {h_num} * * * cd \"{root}\" && \"{py}\" \"{script}\" scan --scheduled"
-    service = (
-        "[Unit]\nDescription=Lookout daily scan\n\n[Service]\nType=oneshot\n"
-        f"WorkingDirectory={root}\nExecStart=\"{py}\" \"{script}\" scan --scheduled\n"
-    )
-    timer = (
-        "[Unit]\nDescription=Run Lookout daily scan\n\n[Timer]\n"
-        f"OnCalendar=*-*-* {hh}:{mm}:00\nPersistent=true\n\n[Install]\nWantedBy=timers.target\n"
-    )
-    plist = (
-        '<?xml version="1.0" encoding="UTF-8"?>\n'
-        '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" '
-        '"http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
-        '<plist version="1.0"><dict>\n'
-        '  <key>Label</key><string>com.lookout.dailyscan</string>\n'
-        '  <key>ProgramArguments</key><array>\n'
-        f'    <string>{_xesc(py)}</string><string>{_xesc(script)}</string>'
-        '<string>scan</string><string>--scheduled</string>\n'
-        '  </array>\n'
-        f'  <key>WorkingDirectory</key><string>{_xesc(root)}</string>\n'
-        '  <key>StartCalendarInterval</key><dict>\n'
-        f'    <key>Hour</key><integer>{h_num}</integer>'
-        f'<key>Minute</key><integer>{m_num}</integer>\n'
-        '  </dict>\n'
-        '</dict></plist>\n'
-    )
+    prev = notify.schedule_preview(at)
     return {
         "at": at,
         "platform": sys.platform,
-        "cron": cron_line,
-        "crontab": cron_line,
-        "systemd_service": service,
-        "systemd_timer": timer,
-        "launchd_plist": plist,
+        "cron": prev.get("cron", ""),
+        "crontab": prev.get("cron", ""),
+        "systemd_service": prev.get("systemd_service", ""),
+        "systemd_timer": prev.get("systemd_timer", ""),
+        "launchd_plist": prev.get("launchd_plist", ""),
+        "test_command": prev.get("test_command", ""),
         "schedule": _cached_schedule_status(),
     }
 
@@ -478,15 +577,76 @@ class Handler(BaseHTTPRequestHandler):
     def _expected_token(self) -> str:
         return getattr(self.server, "api_token", None) or API_TOKEN
 
+    def _auth_lock(self):
+        return getattr(self.server, "auth_lock", _DEFAULT_AUTH_LOCK)
+
+    def _launch_secrets(self) -> set:
+        return getattr(self.server, "launch_secrets", _DEFAULT_LAUNCH_SECRETS)
+
+    def _session_tokens(self) -> set:
+        return getattr(self.server, "session_tokens", _DEFAULT_SESSION_TOKENS)
+
+    def _has_valid_api_token(self) -> bool:
+        got = self.headers.get("X-Lookout-Token") or ""
+        return bool(got) and hmac.compare_digest(got, self._expected_token())
+
+    def _has_valid_session_cookie(self) -> bool:
+        raw_cookie = self.headers.get("Cookie")
+        if not raw_cookie:
+            return False
+        jar = SimpleCookie()
+        try:
+            jar.load(raw_cookie)
+        except Exception:
+            return False
+        morsel = jar.get("lookout_session")
+        if not morsel or not morsel.value:
+            return False
+        val = morsel.value
+        with self._auth_lock():
+            tokens = list(self._session_tokens())
+        return any(hmac.compare_digest(val, tok) for tok in tokens)
+
+    def _consume_launch_secret(self, candidate: str) -> Optional[str]:
+        if not candidate:
+            return None
+        with self._auth_lock():
+            secrets_set = self._launch_secrets()
+            matched = None
+            for sec in secrets_set:
+                if hmac.compare_digest(candidate, sec):
+                    matched = sec
+                    break
+            if not matched:
+                return None
+            secrets_set.discard(matched)
+            sess = secrets.token_urlsafe(32)
+            self._session_tokens().add(sess)
+            new_sec = secrets.token_urlsafe(32)
+            secrets_set.add(new_sec)
+            try:
+                self.server.launch_secret = new_sec
+            except Exception:
+                pass
+        _write_launch_secret_file(new_sec)
+        return sess
+
     def _render_index(self) -> bytes:
-        raw = (WEB / "index.html").read_text(encoding="utf-8")
-        tok = _html.escape(self._expected_token(), quote=True)
-        meta = f'<meta name="lookout-token" content="{tok}">'
-        if '<meta name="lookout-token"' in raw:
-            out = re.sub(r'<meta name="lookout-token" content="[^"]*">', meta, raw, count=1)
-        else:
-            out = raw.replace("</head>", f"{meta}\n</head>", 1)
-        return out.encode("utf-8")
+        return (WEB / "index.html").read_bytes()
+
+    def _render_unauth_page(self) -> bytes:
+        return (
+            "<!doctype html>\n"
+            '<html lang="en">\n'
+            '<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">'
+            '<title>Lookout</title><link rel="icon" href="icon.svg" type="image/svg+xml">'
+            '<link rel="stylesheet" href="app.css"></head>\n'
+            '<body class="gate-body"><main class="gate">'
+            '<div class="gate-card">'
+            '<h1>Open Lookout from the app</h1>'
+            '<p>Open Lookout from the app or its shortcut, then use this link again.</p>'
+            '</div></main></body></html>\n'
+        ).encode("utf-8")
 
     def _token_exempt(self, method: str, path: str) -> bool:
         return (
@@ -516,12 +676,27 @@ class Handler(BaseHTTPRequestHandler):
             return True
         if self._token_exempt(method, path):
             return True
-        got = self.headers.get("X-Lookout-Token") or ""
-        if not hmac.compare_digest(got, self._expected_token()):
-            self._drain_small_body()
-            self.send(401, {"error": "unauthorized"})
-            return False
-        return True
+        if self._has_valid_session_cookie() or self._has_valid_api_token():
+            return True
+        self._drain_small_body()
+        self.send(401, {"error": "unauthorized"})
+        return False
+
+    def _send_security_headers(self) -> None:
+        for k, v in _SECURITY_HEADERS.items():
+            self.send_header(k, v)
+
+    def _redirect(self, location: str, set_cookie: Optional[str] = None) -> None:
+        try:
+            self.send_response(302)
+            self.send_header("Location", location)
+            self.send_header("Content-Length", "0")
+            if set_cookie:
+                self.send_header("Set-Cookie", set_cookie)
+            self._send_security_headers()
+            self.end_headers()
+        except OSError:
+            pass
 
     def send(self, code: int, body, ctype: str = "application/json; charset=utf-8"):
         data = body if isinstance(body, bytes) else json.dumps(body, ensure_ascii=False, default=str).encode("utf-8")
@@ -529,8 +704,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(code)
             self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(data)))
-            self.send_header("Cache-Control", "no-store")
-            self.send_header("X-Content-Type-Options", "nosniff")
+            self._send_security_headers()
             self.end_headers()
             self.wfile.write(data)
         except OSError:
@@ -545,11 +719,22 @@ class Handler(BaseHTTPRequestHandler):
             self._drain_small_body()
             self.send(403, {"error": "forbidden"})
             return False
+        if self.headers.get("Sec-Fetch-Site") == "cross-site":
+            self._drain_small_body()
+            self.send(403, {"error": "forbidden"})
+            return False
         origin = self.headers.get("Origin")
         if self.command == "POST" and origin:
             p = urllib.parse.urlparse(origin)
             if (p.scheme not in ("http", "https") or p.netloc not in allowed_hosts
                     or p.path not in ("", "/") or p.query or p.fragment):
+                self._drain_small_body()
+                self.send(403, {"error": "forbidden"})
+                return False
+        referer = self.headers.get("Referer")
+        if self.command == "POST" and referer:
+            rp = urllib.parse.urlparse(referer)
+            if rp.scheme not in ("http", "https") or rp.netloc not in allowed_hosts:
                 self._drain_small_body()
                 self.send(403, {"error": "forbidden"})
                 return False
@@ -594,7 +779,16 @@ class Handler(BaseHTTPRequestHandler):
     def _get(self, path: str, qs: Optional[Dict[str, List[str]]] = None):
         qs = qs or {}
         if path in ("/", "/index.html"):
-            return self.send(200, self._render_index(), "text/html; charset=utf-8")
+            if "k" in qs and qs["k"]:
+                sess = self._consume_launch_secret(str(qs["k"][0] or ""))
+                if sess:
+                    return self._redirect("/", set_cookie=f"lookout_session={sess}; HttpOnly; SameSite=Strict; Path=/")
+                if self._has_valid_session_cookie():
+                    return self._redirect("/")
+                return self.send(401, self._render_unauth_page(), "text/html; charset=utf-8")
+            if self._has_valid_session_cookie() or self._has_valid_api_token():
+                return self.send(200, self._render_index(), "text/html; charset=utf-8")
+            return self.send(200, self._render_unauth_page(), "text/html; charset=utf-8")
         if re.fullmatch(r"/[\w.-]+\.(js|css|svg|ico|png)", path) and (WEB / path[1:]).is_file():
             ctype = mimetypes.guess_type(path)[0] or "application/octet-stream"
             return self.send(200, (WEB / path[1:]).read_bytes(), ctype)
@@ -602,6 +796,20 @@ class Handler(BaseHTTPRequestHandler):
             lim = max(1, min(MAX_ITEMS_LIMIT, _parse_int(qs["limit"][0], "limit"))) if "limit" in qs else DEFAULT_ITEMS_LIMIT
             off = max(0, _parse_int(qs["offset"][0], "offset")) if "offset" in qs else 0
             return self.send(200, state(limit=lim, offset=off))
+        if path == "/api/counts":
+            return self.send(200, db.counts())
+        if path == "/api/progress":
+            return self.send(200, {
+                "progress": scanner.get_progress(),
+                "discovery": dict(discovery),
+                "test_job": get_test_job(),
+                "counts": db.counts(),
+            })
+        if path == "/api/sources/test":
+            return self.send(200, get_test_job())
+        if m := re.fullmatch(r"/api/sources/(\d+)/code", path):
+            code_row = db.source_code(int(m[1]))
+            return self.send(200 if code_row else 404, code_row or {"error": "not found"})
         if path == "/api/items":
             lim = max(1, min(MAX_ITEMS_LIMIT, _parse_int(qs["limit"][0], "limit"))) if "limit" in qs else DEFAULT_ITEMS_LIMIT
             off = max(0, _parse_int(qs["offset"][0], "offset")) if "offset" in qs else 0
@@ -609,10 +817,60 @@ class Handler(BaseHTTPRequestHandler):
             if "watch_id" in qs and qs["watch_id"][0] != "":
                 raw_w = qs["watch_id"][0]
                 wid_arg = None if raw_w == "global" else _parse_int(raw_w, "watch_id")
-            total = db.items_count(watch_id=wid_arg)
-            rows = db.items(limit=lim, offset=off, watch_id=wid_arg)
-            return self.send(200, {"items": rows, "total": total, "limit": lim, "offset": off,
-                                   "has_more": (off + len(rows)) < total})
+            status_val = qs["status"][0] if "status" in qs and qs["status"][0] else None
+            raw_match = qs["match"][0] if "match" in qs and qs["match"][0] else None
+            match_only = raw_match == "1"
+            match_param = raw_match if raw_match in ("0", "1") else None
+            exc_hidden = (qs.get("exclude_hidden", ["0"])[0] in ("1", "true"))
+            exc_applied = (qs.get("exclude_applied", ["0"])[0] in ("1", "true"))
+            exc_expired = (qs.get("exclude_expired", ["0"])[0] in ("1", "true"))
+            snoozed_val = qs.get("snoozed", ["all"])[0] or "all"
+            if snoozed_val not in ("all", "include", "exclude", "only"):
+                snoozed_val = "all"
+            only_upd = (qs.get("updated", ["0"])[0] in ("1", "true"))
+            cats: List[str] = []
+            for raw_cat in qs.get("category", []):
+                cats.extend(c.strip() for c in raw_cat.split(",") if c.strip())
+            src_name = qs["source"][0] if "source" in qs and qs["source"][0] else None
+            src_id = _parse_int(qs["source_id"][0], "source_id") if "source_id" in qs and qs["source_id"][0] else None
+            q_val = (qs.get("q") or qs.get("search") or [""])[0] or None
+            sort_val = (qs.get("sort") or ["first_seen"])[0]
+            if sort_val not in ("first_seen", "new", "deadline", "updated"):
+                sort_val = "first_seen"
+            flt_kw = dict(
+                status=status_val,
+                match_only=match_only,
+                match=match_param,
+                exclude_hidden=exc_hidden,
+                exclude_applied=exc_applied,
+                exclude_expired=exc_expired,
+                snoozed=snoozed_val,
+                only_updated=only_upd,
+                categories=cats or None,
+                source_name=src_name,
+                source_id=src_id,
+                search=q_val,
+            )
+            total = db.items_count(watch_id=wid_arg, **flt_kw)
+            rows = db.items(limit=lim, offset=off, watch_id=wid_arg, sort=sort_val, **flt_kw)
+            resp: Dict[str, Any] = {
+                "items": rows,
+                "total": total,
+                "limit": lim,
+                "offset": off,
+                "has_more": (off + len(rows)) < total,
+            }
+            if qs.get("facets", ["0"])[0] in ("1", "true"):
+                resp["facets"] = db.items_facets(
+                    watch_id=wid_arg,
+                    status=status_val or "open",
+                    match_only=match_only or (match_param == "1"),
+                    exclude_hidden=exc_hidden,
+                    exclude_applied=exc_applied,
+                    exclude_expired=exc_expired,
+                    snoozed="exclude" if snoozed_val == "exclude" else "include",
+                )
+            return self.send(200, resp)
         if m := re.fullmatch(r"/api/items/([\w-]+)/history", path):
             if not db.item_by_id(m[1]):
                 return self.send(404, {"error": "not found"})
@@ -766,16 +1024,44 @@ class Handler(BaseHTTPRequestHandler):
                 "method": "agent",
                 "watch_id": wid,
             }
-            return self.send(200, scanner.test_source(src))
+            return self.send(200, start_test_job(src))
+        if p == "/api/sources/test/cancel":
+            cancel_test_source(async_browser=True)
+            return self.send(200, {"ok": True})
+        if p == "/api/sources/test/clear":
+            with _test_lock:
+                if test_job["running"]:
+                    return self.send(409, {"error": "Cannot clear while a source test is running"})
+                test_job.update(id=None, status=None, source_id=None, title="", result=None, error="", finished=None)
+            return self.send(200, {"ok": True})
         if m := re.fullmatch(r"/api/sources/(\d+)/test", p):
             src = db.source_by_id(int(m[1]))
             if not src:
                 return self.send(404, {"error": "not found"})
             if "notes" in b and b["notes"] is not None:
                 src = {**src, "notes": str(b["notes"]).strip()[:1000]}
-            return self.send(200, scanner.test_source(src))
+            return self.send(200, start_test_job(src))
+        if m := re.fullmatch(r"/api/sources/(\d+)/resume", p):
+            sid = int(m[1])
+            if not db.source_by_id(sid):
+                return self.send(404, {"error": "not found"})
+            db.update_source(
+                sid,
+                paused=0,
+                learn_fail_count=0,
+                learn_retry_after=None,
+                struct_fail_count=0,
+                fail_count=0,
+                retry_after=None,
+                last_error_kind=None,
+                extractor_error=None,
+            )
+            return self.send(200, {"ok": True})
         if m := re.fullmatch(r"/api/sources/(\d+)", p):
             sid = int(m[1])
+            cur = db.source_by_id(sid)
+            if not cur:
+                return self.send(404, {"error": "not found"})
             fields: Dict[str, Any] = {}
             if "name" in b:
                 name = str(b["name"] or "").strip()
@@ -787,8 +1073,12 @@ class Handler(BaseHTTPRequestHandler):
                 if not re.match(r"^https?://", url, re.I):
                     raise ValueError("An http(s) URL is required")
                 fields["url"] = url[:500]
+                if fields["url"] != cur["url"]:
+                    fields.update(extractor_ok=0, filters_changed=1)
             if "notes" in b:
                 fields["notes"] = str(b["notes"] or "").strip()[:1000]
+                if fields["notes"] != (cur.get("notes") or "") and cur.get("extractor"):
+                    fields["filters_changed"] = 1
             if "active" in b:
                 fields["active"] = int(bool(b["active"]))
             if "watch_id" in b:
@@ -798,12 +1088,35 @@ class Handler(BaseHTTPRequestHandler):
                     if not db.watch_detail(wid):
                         return self.send(404, {"error": "watch not found"})
                 fields["watch_id"] = wid
+                if wid != cur.get("watch_id") and cur.get("extractor"):
+                    fields["filters_changed"] = 1
+            if b.get("resume"):
+                fields.update(
+                    paused=0,
+                    learn_fail_count=0,
+                    learn_retry_after=None,
+                    struct_fail_count=0,
+                    fail_count=0,
+                    retry_after=None,
+                    last_error_kind=None,
+                    extractor_error=None,
+                )
             if b.get("relearn"):
-                fields.update(extractor_ok=0, extractor_error="relearn requested")
+                fields.update(
+                    extractor_ok=0,
+                    extractor_error="relearn requested",
+                    paused=0,
+                    learn_fail_count=0,
+                    learn_retry_after=None,
+                    struct_fail_count=0,
+                    fail_count=0,
+                    retry_after=None,
+                    last_error_kind=None,
+                    filters_changed=0,
+                )
             if not fields:
                 raise ValueError("No fields to update")
-            if not db.update_source(sid, **fields):
-                return self.send(404, {"error": "not found"})
+            db.update_source(sid, **fields)
             return self.send(200, {"ok": True})
         if m := re.fullmatch(r"/api/sources/(\d+)/delete", p):
             if not db.delete_source(int(m[1])):
@@ -816,16 +1129,31 @@ class Handler(BaseHTTPRequestHandler):
                 wid = _parse_int(b["watch_id"], "watch_id")
                 if not db.watch_detail(wid):
                     return self.send(404, {"error": "watch not found"})
-            return self.send(200, {"id": db.add_filter(str(b.get("kind") or ""), str(b.get("value") or ""), watch_id=wid)})
+            fid = db.add_filter(str(b.get("kind") or ""), str(b.get("value") or ""), watch_id=wid)
+            scanner.reevaluate_open_items(watch_id=wid)
+            return self.send(200, {"id": fid})
         if m := re.fullmatch(r"/api/filters/(\d+)", p):
-            if "active" not in b:
-                raise ValueError("active is required")
-            if not db.update_filter(int(m[1]), bool(b["active"])):
+            fid = int(m[1])
+            cur = db.filter_by_id(fid)
+            if not cur:
                 return self.send(404, {"error": "not found"})
+            if not any(k in b for k in ("active", "kind", "value")):
+                raise ValueError("active, kind, or value is required")
+            db.update_filter(
+                fid,
+                active=bool(b["active"]) if "active" in b else db._UNSET,
+                kind=b["kind"] if "kind" in b else db._UNSET,
+                value=b["value"] if "value" in b else db._UNSET,
+            )
+            scanner.reevaluate_open_items(watch_id=cur.get("watch_id"))
             return self.send(200, {"ok": True})
         if m := re.fullmatch(r"/api/filters/(\d+)/delete", p):
-            if not db.delete_filter(int(m[1])):
+            fid = int(m[1])
+            cur = db.filter_by_id(fid)
+            if not cur:
                 return self.send(404, {"error": "not found"})
+            db.delete_filter(fid)
+            scanner.reevaluate_open_items(watch_id=cur.get("watch_id"))
             return self.send(200, {"ok": True})
 
         if m := re.fullmatch(r"/api/items/([\w-]+)", p):
@@ -848,11 +1176,10 @@ class Handler(BaseHTTPRequestHandler):
 
         if p == "/api/settings":
             if "custom_command" in b:
-                if b.get("confirm_custom_command") is not True:
-                    return self.send(403, {"error": "Changing custom_command requires confirmation from the Settings form"})
+                return self.send(403, {
+                    "error": "custom_command cannot be changed over HTTP; use data/agent_command.txt or --custom-command"
+                })
             vals = {k: v for k, v in b.items() if k in db.DEFAULTS and not (k in SECRET_KEYS and not v)}
-            if "custom_command" in vals:
-                vals["custom_command"] = agents.validate_custom_command(str(vals["custom_command"] or ""))
             if vals.get("agent") not in (None, "") and vals["agent"] != "custom" and vals["agent"] not in agents.AGENTS:
                 raise ValueError("unknown agent")
             for k, lo, hi in (("agent_timeout_min", 1, 120), ("parallel", 1, 8), ("smtp_port", 1, 65535)):
@@ -874,12 +1201,29 @@ class Handler(BaseHTTPRequestHandler):
                 if wu and not re.match(r"^https?://", wu, re.I):
                     raise ValueError("webhook_url must start with http:// or https://")
                 vals["webhook_url"] = wu
+            if "webhook_format" in vals:
+                wf = str(vals["webhook_format"] or "auto").strip().lower()
+                if wf not in ("auto", "json", "slack", "discord", "telegram", "ntfy"):
+                    raise ValueError("invalid webhook_format")
+                vals["webhook_format"] = wf
+            if "telegram_chat_id" in vals:
+                vals["telegram_chat_id"] = str(vals["telegram_chat_id"] or "").strip()[:120]
+            if "mail_from" in vals:
+                vals["mail_from"] = str(vals["mail_from"] or "").strip()[:200]
+            if "smtp_starttls" in vals:
+                stls = str(vals["smtp_starttls"] or "auto").strip().lower()
+                if stls not in ("auto", "0", "1", "always", "never"):
+                    raise ValueError("invalid smtp_starttls")
+                vals["smtp_starttls"] = stls
             if "schedule_time" in vals:
                 st_val = str(vals["schedule_time"]).strip()[:5]
                 if not notify._TIME_RE.fullmatch(st_val):
                     raise ValueError("schedule_time must be HH:MM")
                 vals["schedule_time"] = st_val
             db.set_settings(vals)
+            return self.send(200, {"ok": True})
+        if p == "/api/notifications/dismiss":
+            db.dismiss_notify_errors()
             return self.send(200, {"ok": True})
         if p == "/api/schedule":
             enabled = bool(b.get("enabled"))
@@ -898,6 +1242,12 @@ class Handler(BaseHTTPRequestHandler):
             if ok:
                 db.set_settings({"schedule_time": at})
             return self.send(200, {"ok": ok, "message": msg})
+        if p == "/api/schedule/test":
+            fn = getattr(notify, "run_schedule_now", None)
+            if not callable(fn):
+                return self.send(200, {"ok": False, "message": "Schedule self-test is unavailable."})
+            ok, msg = fn()
+            return self.send(200, {"ok": ok, "message": msg})
         if p == "/api/schedule/preview":
             at = str(b.get("at") or db.get_settings().get("schedule_time") or "08:30").strip()[:5]
             if not notify._TIME_RE.fullmatch(at):
@@ -906,6 +1256,7 @@ class Handler(BaseHTTPRequestHandler):
         if p == "/api/mail/test":
             port = self.server.server_address[1]
             ok, msg = notify.mail_digest([], f"http://127.0.0.1:{port}/")
+            db.log_notification(None, "email", ok, msg)
             return self.send(200, {"ok": ok, "message": msg})
         if p == "/api/webhook/test":
             st = db.get_settings()
@@ -920,25 +1271,32 @@ class Handler(BaseHTTPRequestHandler):
             allow_local = (
                 bool(b["allow_local"]) if "allow_local" in b else (st.get("webhook_allow_local") == "1")
             )
-            payload = {
+            fmt = str(b.get("format") or b.get("fmt") or st.get("webhook_format") or "auto").strip().lower()
+            payload: Dict[str, Any] = {
                 "event": "test",
                 "title": "Lookout test webhook",
                 "message": "Webhook notifications from Lookout are working.",
                 "items": [],
             }
+            chat_id = str(b.get("chat_id") or st.get("telegram_chat_id") or "").strip()
+            if chat_id:
+                payload["chat_id"] = chat_id
             try:
                 wh_params = inspect.signature(fn).parameters
                 wh_kw = any(param.kind == inspect.Parameter.VAR_KEYWORD for param in wh_params.values())
+                call_kw: Dict[str, Any] = {}
                 if "allow_local" in wh_params or wh_kw:
-                    res = fn(url, payload, allow_local=allow_local)
-                else:
-                    res = fn(url, payload)
+                    call_kw["allow_local"] = allow_local
+                if fmt and ("fmt" in wh_params or wh_kw):
+                    call_kw["fmt"] = fmt
+                res = fn(url, payload, **call_kw)
                 if isinstance(res, tuple):
                     ok, msg = bool(res[0]), str(res[1])
                 else:
                     ok, msg = bool(res), ("Webhook sent." if res else "Webhook failed.")
             except Exception as e:
                 ok, msg = False, str(e)[:300]
+            db.log_notification(None, "webhook", ok, msg)
             return self.send(200, {"ok": ok, "message": msg})
         if p == "/api/import":
             return self.send(200, {"ok": True, "added": _import_payload(b)})
@@ -957,6 +1315,8 @@ class Handler(BaseHTTPRequestHandler):
                     if not w:
                         return self.send(404, {"error": "watch not found"})
                     title = w["title"]
+                    if req != (w.get("request") or ""):
+                        db.update_watch(wid, request=req)
                 else:
                     title = tasks.quick_title(req)
                     wid = db.add_watch(title, req)
@@ -997,21 +1357,32 @@ def make_server(port: Optional[int] = None) -> ThreadingHTTPServer:
     scanner.load_plugins()
     token = secrets.token_urlsafe(32)
     API_TOKEN = token
-    srv = ThreadingHTTPServer(("127.0.0.1", PORT if port is None else port), Handler)
+    bind_host = (os.environ.get("LOOKOUT_BIND") or "127.0.0.1").strip() or "127.0.0.1"
+    srv = ThreadingHTTPServer((bind_host, PORT if port is None else port), Handler)
     srv.api_token = token
+    srv.auth_lock = threading.Lock()
+    srv.launch_secrets = set()
+    srv.session_tokens = set()
+    srv.issue_launch_secret = lambda: _issue_launch_secret(srv)
+    srv.launch_secret = _issue_launch_secret(srv)
     srv.daemon_threads = True
     return srv
 
 
-def serve(idle_minutes: int = 0) -> None:
+def serve(idle_minutes: int = 0, on_start=None) -> None:
     srv = make_server()
+    if on_start is not None:
+        on_start(srv)
     if idle_minutes:
         def watchdog():
             while True:
                 time.sleep(30)
-                busy = scanner.progress["running"] or discovery["running"]
+                busy = scanner.progress["running"] or discovery["running"] or test_job["running"]
                 if not busy and time.time() - last_hit["t"] > idle_minutes * 60:
                     srv.shutdown()
                     return
         threading.Thread(target=watchdog, daemon=True).start()
-    srv.serve_forever()
+    try:
+        srv.serve_forever()
+    finally:
+        _clear_launch_secret_file(expected=getattr(srv, "launch_secret", None))

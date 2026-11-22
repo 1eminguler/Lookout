@@ -20,6 +20,8 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from lookout import agents, db, extractors, notify, tasks
 
 PLUGIN_DIR = Path(os.environ.get("LOOKOUT_PLUGIN_DIR") or db.ROOT / "plugins")
+STRUCTURAL_FAIL_THRESHOLD = 2
+LEARN_FAIL_PAUSE_THRESHOLD = 3
 progress: Dict[str, Any] = {
     "running": False, "scan_id": None, "done": 0, "total": 0, "current": [],
     "learning": [], "learning_total": 0, "learning_done": 0, "sources_state": {}, "cancel": False,
@@ -34,32 +36,57 @@ _active_scan: Optional[Dict[str, Any]] = None
 
 _TRACKING_EXACT = {"fbclid", "gclid", "mc_cid", "mc_eid"}
 
+_BLOCKED_RE = re.compile(
+    r"http\s*(?:401|403|451)|forbidden|access denied|cloudflare|captcha|bot check|"
+    r"just a moment|attention required|\bblocked\b",
+    re.I,
+)
 _TRANSIENT_RE = re.compile(
-    r"timed?\s*out|timeout|http\s*(?:408|429|500|502|503|504|52\d)|"
+    r"timed?\s*out|timeout|took longer than \d+s|http\s*(?:408|429|500|502|503|504|52\d)|"
     r"too many requests|rate.?limit|quota|resource_exhausted|"
-    r"connection\s*(?:refused|reset|aborted|closed)|remote end closed|"
-    r"broken pipe|eof occurred|temporarily unavailable|"
+    r"connection\s*(?:refused|reset|aborted|closed)|remote end closed|remotedisconnected|"
+    r"reset by peer|incomplete read|broken pipe|eof occurred|temporarily unavailable|"
     r"temporary failure in name resolution|name or service not known|"
     r"getaddrinfo failed|nodename nor servname|network is unreachable|"
-    r"no route to host|ssl.*(?:eof|handshake|timeout)|"
+    r"no route to host|ssl|tls|certificate|winerror|10054|10060|10061|11001|"
     r"net::err_|err_connection|err_timed_out|err_name_not_resolved|err_network",
     re.I,
 )
 _STRUCTURAL_RE = re.compile(
-    r"returned nothing|returned \d+ items|most items have no title|"
+    r"most items have no title|shape changed|container missing|"
     r"invalid json|jsondecodeerror|syntax error|is not allowed|no fetch\(\)|"
     r"must return a list|zerodivisionerror|keyerror|indexerror|typeerror|"
-    r"attributeerror|valueerror|http\s*(?:400|401|403|404|410|451)",
+    r"attributeerror|valueerror|http\s*(?:404|410)",
     re.I,
 )
+_EXC_PREFIX_RE = re.compile(r"^[A-Za-z_]\w*(?:Error|Exception):\s*")
+
+
+def format_user_error(exc: Any, limit: int = 400) -> str:
+    msg = _EXC_PREFIX_RE.sub("", str(exc or "").strip())
+    if not msg and isinstance(exc, BaseException):
+        msg = type(exc).__name__
+    return msg[:limit]
 
 
 class TransientError(RuntimeError):
     """Raised when a reader hits a temporary network/rate-limit failure and should keep its code."""
 
 
-def _url_learn_lock(url: str) -> threading.Lock:
-    key = db.canonical_reader_url(url) or str(url)
+class BlockedError(RuntimeError):
+    """Raised when a site blocks access (e.g. HTTP 401/403/451, Cloudflare, CAPTCHA) without relearning."""
+
+
+class PausedSourceError(RuntimeError):
+    """Raised when a source is paused after repeated learn failures."""
+
+
+def _reader_lock_key(url: str, notes: str = "", fs: Optional[List[Dict[str, Any]]] = None) -> str:
+    return db.shared_reader_key(url, notes=notes, fs=fs) or db.canonical_reader_url(url) or str(url)
+
+
+def _url_learn_lock(url: str, notes: str = "", fs: Optional[List[Dict[str, Any]]] = None) -> threading.Lock:
+    key = _reader_lock_key(url, notes=notes, fs=fs)
     with _url_locks_guard:
         lk = _url_locks.get(key)
         if lk is None:
@@ -68,14 +95,14 @@ def _url_learn_lock(url: str) -> threading.Lock:
         return lk
 
 
-def _url_gen(url: str) -> int:
-    key = db.canonical_reader_url(url) or str(url)
+def _url_gen(url: str, notes: str = "", fs: Optional[List[Dict[str, Any]]] = None) -> int:
+    key = _reader_lock_key(url, notes=notes, fs=fs)
     with _url_locks_guard:
         return _url_generations.get(key, 0)
 
 
-def _bump_url_gen(url: str) -> int:
-    key = db.canonical_reader_url(url) or str(url)
+def _bump_url_gen(url: str, notes: str = "", fs: Optional[List[Dict[str, Any]]] = None) -> int:
+    key = _reader_lock_key(url, notes=notes, fs=fs)
     with _url_locks_guard:
         nxt = _url_generations.get(key, 0) + 1
         _url_generations[key] = nxt
@@ -216,15 +243,25 @@ def normalise(raw: Dict[str, Any], source: Dict[str, Any]) -> Optional[Dict[str,
     }
 
 
+def _tr_lower(v: Any) -> str:
+    return str(v or "").replace("İ", "i").replace("I\u0307", "i").lower()
+
+
+def _is_expired(item: Dict[str, Any]) -> bool:
+    dl = item.get("deadline")
+    return bool(dl and dl < date.today().isoformat())
+
+
 def passes(item: Dict[str, Any], fs: List[Dict[str, Any]]) -> bool:
     """Deterministic part of the filters; the agent also applies them while browsing."""
-    today = date.today().isoformat()
-    dl = item.get("deadline")
-    if dl and dl < today:
+    if _is_expired(item):
         return False
-    text = " ".join(str(item.get(k) or "") for k in ("title", "org", "category", "summary", "location")).lower()
+    dl = item.get("deadline")
+    text = " ".join(_tr_lower(item.get(k)) for k in ("title", "org", "category", "summary", "location"))
     for f in fs:
-        v = f["value"].lower().strip()
+        v = _tr_lower(f["value"]).strip()
+        if not v:
+            continue
         if f["kind"] == "exclude":
             for w in (x.strip() for x in v.split(",") if x.strip()):
                 pat = (r"\b" if w[0].isalnum() else "") + re.escape(w) + (r"\b" if w[-1].isalnum() else "")
@@ -238,22 +275,34 @@ def passes(item: Dict[str, Any], fs: List[Dict[str, Any]]) -> bool:
 
 # ---------- failure classification, anomaly detection & verification ----------
 def classify_error(exc: Exception) -> str:
-    """Classify a reader failure as 'transient' (keep code, retry later) or 'structural' (relearn)."""
-    if isinstance(exc, TransientError):
-        return "transient"
-    if isinstance(exc, (TimeoutError, ConnectionError)):
+    """Classify a reader failure as 'blocked', 'transient', or 'structural'."""
+    if isinstance(exc, BlockedError):
+        return "blocked"
+    if isinstance(exc, (TransientError, TimeoutError, ConnectionError)):
         return "transient"
     msg = str(exc or "")
-    if _STRUCTURAL_RE.search(msg):
-        return "structural"
+    if _BLOCKED_RE.search(msg):
+        return "blocked"
     if _TRANSIENT_RE.search(msg):
         return "transient"
-    return "structural"
+    if _STRUCTURAL_RE.search(msg):
+        return "structural"
+    return "transient"
 
 
 def _backoff_until(fail_count: int) -> str:
     minutes = min(360, 5 * (2 ** max(0, fail_count - 1)))
     return (datetime.now() + timedelta(minutes=minutes)).strftime(db.TS)
+
+
+def _learn_backoff_until(learn_fail_count: int) -> str:
+    minutes = min(24 * 60, 30 * (2 ** max(0, learn_fail_count - 1)))
+    return (datetime.now() + timedelta(minutes=minutes)).strftime(db.TS)
+
+
+def check_page_shape(source: Dict[str, Any], prev_stats: Optional[Dict[str, Any]]) -> Optional[str]:
+    """Optional shape check when a reader returns zero items despite prior listings."""
+    return None
 
 
 def _url_pattern(url: str) -> str:
@@ -321,12 +370,12 @@ def detect_anomaly(items: List[Dict[str, Any]], prev_stats: Optional[Dict[str, A
 def verify_reader_output(agent_items: List[Dict[str, Any]], code_items: List[Dict[str, Any]],
                        prev_stats: Optional[Dict[str, Any]] = None) -> Tuple[bool, str]:
     """Stronger verification of learned extractor output beyond simple title/URL overlap."""
-    if agent_items and not code_items:
-        return False, f"code found 0 items, agent saw {len(agent_items)}"
-    if not extractors.agrees(agent_items, code_items):
-        return False, f"code found {len(code_items)} items, agent saw {len(agent_items)}"
+    if not agent_items:
+        return False, "agent returned 0 items (unverified)"
     if not code_items:
-        return True, ""
+        return False, f"code found 0 items, agent saw {len(agent_items)}"
+    if extractors.agrees(agent_items, code_items) is not True:
+        return False, f"code found {len(code_items)} items, agent saw {len(agent_items)}"
     cur_stats = compute_item_stats(code_items)
     if cur_stats["usable_rate"] < 0.8:
         return False, "most extracted items have no title or link"
@@ -349,14 +398,16 @@ def verify_reader_output(agent_items: List[Dict[str, Any]], code_items: List[Dic
     return True, ""
 
 
-def _check_structural_sanity(items: List[Dict[str, Any]], had_items: int) -> None:
+def _check_structural_sanity(items: List[Dict[str, Any]], had_items: int,
+                             source: Optional[Dict[str, Any]] = None,
+                             prev_stats: Optional[Dict[str, Any]] = None) -> None:
     usable = [i for i in items if str(i.get("title") or "").strip() and str(i.get("url") or "").startswith("http")]
-    if not items and had_items:
-        raise RuntimeError("returned nothing although the site had listings before")
-    if had_items >= 5 and len(items) < had_items * 0.3:
-        raise RuntimeError(f"returned {len(items)} items, {had_items} were listed last time")
     if items and len(usable) < len(items) * 0.8:
         raise RuntimeError("most items have no title or link")
+    if not items and had_items:
+        reason = check_page_shape(source or {}, prev_stats)
+        if reason:
+            raise RuntimeError(f"returned nothing; page/API shape changed ({reason})")
 
 
 # ---------- agent sources ----------
@@ -375,6 +426,57 @@ def _run_fast_reader(source: Dict[str, Any], code: str) -> List[Dict[str, Any]]:
     return extractors.run(code, tag="scan", cancel_event=_cancel_event)
 
 
+def _record_learn_failure(
+    sid: Optional[int],
+    source: Dict[str, Any],
+    err_msg: str,
+    prev_good: Optional[str],
+    weekly_fallback_items: Optional[List[Dict[str, Any]]],
+    candidate_code: Optional[str] = None,
+) -> None:
+    if sid is None:
+        return
+    lfc = int(source.get("learn_fail_count") or 0) + 1
+    should_pause = lfc >= LEARN_FAIL_PAUSE_THRESHOLD
+    lra = None if should_pause else _learn_backoff_until(lfc)
+    ts = db.now()
+    pause_note = " (paused after repeated failures)" if should_pause else ""
+    if weekly_fallback_items is not None and prev_good:
+        db.update_source(
+            sid,
+            extractor=prev_good,
+            extractor_ok=1,
+            extractor_updated=ts,
+            struct_fail_count=0,
+            learn_fail_count=lfc,
+            learn_retry_after=lra,
+            paused=int(should_pause),
+            extractor_error=f"Weekly re-check failed ({err_msg[:180]}); kept previous working reader{pause_note}"[:300],
+        )
+    elif prev_good:
+        db.update_source(
+            sid,
+            extractor=prev_good,
+            extractor_ok=0,
+            learn_fail_count=lfc,
+            learn_retry_after=lra,
+            paused=int(should_pause),
+            extractor_error=f"{err_msg}{pause_note}"[:300],
+        )
+    else:
+        fields: Dict[str, Any] = {
+            "extractor_ok": 0,
+            "extractor_updated": ts,
+            "learn_fail_count": lfc,
+            "learn_retry_after": lra,
+            "paused": int(should_pause),
+            "extractor_error": f"{err_msg}{pause_note}"[:300],
+        }
+        if candidate_code:
+            fields["extractor"] = candidate_code
+        db.update_source(sid, **fields)
+
+
 def read_agent_source(source: Dict[str, Any], fs: List[Dict[str, Any]], force_learn: bool = False,
                       ignore_backoff: bool = False) -> List[Dict]:
     """Fast path: run the learned reader. Weekly check only invokes the agent if output is anomalous."""
@@ -382,8 +484,16 @@ def read_agent_source(source: Dict[str, Any], fs: List[Dict[str, Any]], force_le
         raise agents.CancelledError("cancelled")
     settings = db.get_settings()
     sid = source.get("id")
-    if (not force_learn and not ignore_backoff and source.get("last_error_kind") == "transient"
+    notes = source.get("notes") or ""
+    f_hash = db.filters_hash(fs)
+
+    if source.get("paused") and not force_learn:
+        raise PausedSourceError("Source is paused after repeated learn failures (click Resume to retry)")
+    if (not force_learn and not ignore_backoff
+            and source.get("last_error_kind") in ("transient", "blocked")
             and source.get("retry_after") and source["retry_after"] > db.now()):
+        if source.get("last_error_kind") == "blocked":
+            raise BlockedError(f"Blocked cooldown until {source['retry_after'][11:16]}")
         raise TransientError(f"Waiting for retry backoff until {source['retry_after'][11:16]}")
 
     prev_good = source.get("last_good_extractor") or (source.get("extractor") if source.get("extractor_ok") else None)
@@ -392,7 +502,7 @@ def read_agent_source(source: Dict[str, Any], fs: List[Dict[str, Any]], force_le
     prev_stats = _load_stats(source.get("last_good_stats"))
 
     if (not source.get("extractor") or not source.get("extractor_ok")) and not force_learn:
-        shared = db.get_shared_reader(source["url"])
+        shared = db.get_shared_reader(source["url"], notes=notes, fs=fs)
         if shared and shared.get("extractor"):
             ts = shared.get("extractor_updated") or db.now()
             source = {
@@ -415,6 +525,8 @@ def read_agent_source(source: Dict[str, Any], fs: List[Dict[str, Any]], force_le
                     extractor_updated=ts,
                     last_good_updated=ts,
                     last_good_stats=source["last_good_stats"],
+                    filter_hash=f_hash,
+                    filters_changed=0,
                 )
             prev_good = source["last_good_extractor"]
             prev_good_updated = ts
@@ -425,13 +537,16 @@ def read_agent_source(source: Dict[str, Any], fs: List[Dict[str, Any]], force_le
         and source.get("extractor_updated")
         and source["extractor_updated"] < (date.today() - timedelta(days=7)).isoformat()
     )
+    filters_stale = bool(source.get("filters_changed")) or bool(
+        source.get("filter_hash") and source["filter_hash"] != f_hash
+    )
     weekly_fallback_items: Optional[List[Dict[str, Any]]] = None
     had_items = db.source_open_item_count(sid) if sid is not None else 0
 
     if source.get("extractor") and source.get("extractor_ok") and not force_learn:
         try:
             items = _run_fast_reader(source, source["extractor"])
-            _check_structural_sanity(items, had_items)
+            _check_structural_sanity(items, had_items, source=source, prev_stats=prev_stats)
             cur_stats = compute_item_stats(items)
             stats_json = json.dumps(cur_stats, ensure_ascii=False)
             now_ts = db.now()
@@ -439,43 +554,76 @@ def read_agent_source(source: Dict[str, Any], fs: List[Dict[str, Any]], force_le
                 anomaly = detect_anomaly(items, prev_stats, had_open_items=had_items)
                 if anomaly is None or not settings.get("agent"):
                     if sid is not None:
-                        db.update_source(
-                            sid,
-                            extractor_error=None,
-                            extractor_updated=now_ts,
-                            last_good_extractor=source["extractor"],
-                            last_good_updated=now_ts,
-                            last_good_stats=stats_json,
-                            extractor_runs=(source.get("extractor_runs") or 0) + 1,
-                            fail_count=0,
-                            retry_after=None,
-                            last_error_kind=None,
+                        upd_kw: Dict[str, Any] = {
+                            "extractor_error": None,
+                            "extractor_updated": now_ts,
+                            "last_good_extractor": source["extractor"],
+                            "last_good_updated": now_ts,
+                            "last_good_stats": stats_json,
+                            "extractor_runs": (source.get("extractor_runs") or 0) + 1,
+                            "fail_count": 0,
+                            "retry_after": None,
+                            "last_error_kind": None,
+                            "struct_fail_count": 0,
+                            "learn_fail_count": 0,
+                            "learn_retry_after": None,
+                            "paused": 0,
+                        }
+                        if not filters_stale:
+                            upd_kw["filter_hash"] = f_hash
+                            upd_kw["filters_changed"] = 0
+                        db.update_source(sid, **upd_kw)
+                    if not filters_stale:
+                        db.save_shared_reader(
+                            source["url"], source["extractor"], ok=True, stats=stats_json,
+                            updated=now_ts, notes=notes, fs=fs,
                         )
-                    db.save_shared_reader(source["url"], source["extractor"], ok=True, stats=stats_json, updated=now_ts)
                     return items
                 weekly_fallback_items = items
                 source = {**source, "extractor_error": anomaly}
             else:
                 if sid is not None:
-                    db.update_source(
-                        sid,
-                        extractor_error=None,
-                        last_good_extractor=prev_good or source["extractor"],
-                        last_good_updated=prev_good_updated or source.get("extractor_updated") or now_ts,
-                        last_good_stats=stats_json,
-                        extractor_runs=(source.get("extractor_runs") or 0) + 1,
-                        fail_count=0,
-                        retry_after=None,
-                        last_error_kind=None,
+                    upd_kw = {
+                        "extractor_error": None,
+                        "last_good_extractor": prev_good or source["extractor"],
+                        "last_good_updated": prev_good_updated or source.get("extractor_updated") or now_ts,
+                        "last_good_stats": stats_json,
+                        "extractor_runs": (source.get("extractor_runs") or 0) + 1,
+                        "fail_count": 0,
+                        "retry_after": None,
+                        "last_error_kind": None,
+                        "struct_fail_count": 0,
+                        "learn_fail_count": 0,
+                        "learn_retry_after": None,
+                        "paused": 0,
+                    }
+                    if not filters_stale:
+                        upd_kw["filter_hash"] = f_hash
+                        upd_kw["filters_changed"] = 0
+                    db.update_source(sid, **upd_kw)
+                if not filters_stale:
+                    db.save_shared_reader(
+                        source["url"], source["extractor"], ok=True, stats=stats_json,
+                        updated=source.get("extractor_updated") or now_ts, propagate=False, notes=notes, fs=fs,
                     )
-                db.save_shared_reader(source["url"], source["extractor"], ok=True, stats=stats_json,
-                                      updated=source.get("extractor_updated") or now_ts, propagate=False)
                 return items
         except agents.CancelledError:
             raise
         except Exception as e:
             kind = classify_error(e)
             err_str = str(e)[:300]
+            if kind == "blocked":
+                fc = int(source.get("fail_count") or 0) + 1
+                ra = _backoff_until(fc)
+                if sid is not None:
+                    db.update_source(
+                        sid,
+                        fail_count=fc,
+                        retry_after=ra,
+                        last_error_kind="blocked",
+                        extractor_error=err_str,
+                    )
+                raise BlockedError(err_str) from None
             if kind == "transient":
                 fc = int(source.get("fail_count") or 0) + 1
                 ra = _backoff_until(fc)
@@ -488,25 +636,36 @@ def read_agent_source(source: Dict[str, Any], fs: List[Dict[str, Any]], force_le
                         extractor_error=err_str,
                     )
                 raise TransientError(err_str) from None
+            sfc = int(source.get("struct_fail_count") or 0) + 1
+            if sfc < STRUCTURAL_FAIL_THRESHOLD:
+                if sid is not None:
+                    db.update_source(
+                        sid,
+                        struct_fail_count=sfc,
+                        last_error_kind="structural",
+                        extractor_error=err_str,
+                    )
+                raise RuntimeError(f"Structural failure ({sfc}/{STRUCTURAL_FAIL_THRESHOLD}): {err_str}") from None
             if sid is not None:
                 db.update_source(
                     sid,
+                    struct_fail_count=sfc,
                     extractor_ok=0,
                     last_error_kind="structural",
                     extractor_error=err_str,
                 )
-            source = {**source, "extractor_ok": 0, "extractor_error": err_str}
+            source = {**source, "extractor_ok": 0, "extractor_error": err_str, "struct_fail_count": sfc}
 
-    gen_before = _url_gen(source["url"])
-    with _url_learn_lock(source["url"]):
+    gen_before = _url_gen(source["url"], notes=notes, fs=fs)
+    with _url_learn_lock(source["url"], notes=notes, fs=fs):
         if progress["cancel"] or _cancel_event.is_set():
             raise agents.CancelledError("cancelled")
-        if not force_learn and _url_gen(source["url"]) > gen_before:
-            shared = db.get_shared_reader(source["url"])
+        if not force_learn and _url_gen(source["url"], notes=notes, fs=fs) > gen_before:
+            shared = db.get_shared_reader(source["url"], notes=notes, fs=fs)
             if shared and shared.get("extractor"):
                 try:
                     items = _run_fast_reader(source, shared["extractor"])
-                    _check_structural_sanity(items, had_items)
+                    _check_structural_sanity(items, had_items, source=source, prev_stats=prev_stats)
                     stats_json = json.dumps(compute_item_stats(items), ensure_ascii=False)
                     ts = shared.get("extractor_updated") or db.now()
                     if sid is not None:
@@ -522,12 +681,25 @@ def read_agent_source(source: Dict[str, Any], fs: List[Dict[str, Any]], force_le
                             fail_count=0,
                             retry_after=None,
                             last_error_kind=None,
+                            struct_fail_count=0,
+                            learn_fail_count=0,
+                            learn_retry_after=None,
+                            paused=0,
+                            filter_hash=f_hash,
+                            filters_changed=0,
                         )
                     return items
                 except agents.CancelledError:
                     raise
                 except Exception:
                     pass
+
+        if not force_learn and source.get("learn_retry_after") and source["learn_retry_after"] > db.now():
+            if weekly_fallback_items is not None:
+                if sid is not None:
+                    db.update_source(sid, extractor_updated=db.now(), extractor_ok=1)
+                return weekly_fallback_items
+            raise TransientError(f"Waiting for relearn cooldown until {source['learn_retry_after'][11:16]}")
 
         with _lock:
             progress.setdefault("learning", [])
@@ -541,16 +713,9 @@ def read_agent_source(source: Dict[str, Any], fs: List[Dict[str, Any]], force_le
         except agents.CancelledError:
             raise
         except Exception as e:
-            if prev_good and sid is not None:
-                if weekly_fallback_items is not None:
-                    db.update_source(
-                        sid,
-                        extractor=prev_good,
-                        extractor_ok=1,
-                        extractor_error=f"Weekly re-check failed ({str(e)[:200]}); kept previous working reader",
-                    )
-                    return weekly_fallback_items
-                db.update_source(sid, extractor=prev_good, extractor_ok=0, extractor_error=str(e)[:300])
+            _record_learn_failure(sid, source, str(e)[:250], prev_good, weekly_fallback_items)
+            if weekly_fallback_items is not None:
+                return weekly_fallback_items
             raise
         finally:
             with _lock:
@@ -579,49 +744,73 @@ def read_agent_source(source: Dict[str, Any], fs: List[Dict[str, Any]], force_le
                             fail_count=0,
                             retry_after=None,
                             last_error_kind=None,
+                            struct_fail_count=0,
+                            learn_fail_count=0,
+                            learn_retry_after=None,
+                            paused=0,
+                            filter_hash=f_hash,
+                            filters_changed=0,
                         )
-                    db.save_shared_reader(source["url"], code, ok=True, stats=stats_json, updated=ts, propagate=True)
-                    _bump_url_gen(source["url"])
+                    db.save_shared_reader(
+                        source["url"], code, ok=True, stats=stats_json, updated=ts,
+                        propagate=True, notes=notes, fs=fs,
+                    )
+                    _bump_url_gen(source["url"], notes=notes, fs=fs)
                     return got
                 err_msg = f"{reason}; keeping previous reader" if prev_good else reason
-                if sid is not None:
-                    if prev_good:
-                        db.update_source(
-                            sid,
-                            extractor=prev_good,
-                            extractor_ok=1 if weekly_fallback_items is not None else 0,
-                            extractor_error=err_msg[:300],
-                        )
-                    else:
-                        db.update_source(sid, extractor=code, extractor_ok=0, extractor_updated=db.now(),
-                                         extractor_error=err_msg[:300])
+                _record_learn_failure(sid, source, err_msg, prev_good, weekly_fallback_items, candidate_code=code)
             except agents.CancelledError:
                 raise
             except Exception as e:
-                err_msg = str(e)[:300]
-                if sid is not None:
-                    if prev_good:
-                        db.update_source(
-                            sid,
-                            extractor=prev_good,
-                            extractor_ok=1 if weekly_fallback_items is not None else 0,
-                            extractor_error=f"{err_msg}; kept previous reader"[:300],
-                        )
-                    else:
-                        db.update_source(sid, extractor=code, extractor_ok=0, extractor_updated=db.now(),
-                                         extractor_error=err_msg)
-        elif sid is not None and prev_good:
-            db.update_source(
-                sid,
-                extractor=prev_good,
-                extractor_ok=1 if weekly_fallback_items is not None else 0,
-                extractor_error="Agent did not produce a new reader; kept previous reader",
+                _record_learn_failure(sid, source, str(e)[:250], prev_good, weekly_fallback_items, candidate_code=code)
+        else:
+            _record_learn_failure(
+                sid, source, "Agent did not produce a new reader", prev_good, weekly_fallback_items
             )
-    if not seen and not code:
+    if not seen:
         if weekly_fallback_items is not None:
             return weekly_fallback_items
         raise RuntimeError("The agent returned nothing. " + learned["log"][-200:].strip())
-    return seen if seen else (weekly_fallback_items or [])
+    return seen
+
+
+def reevaluate_open_items(watch_id: Optional[int] = None) -> Dict[str, int]:
+    """Re-evaluate open items after filter edits: deterministic filters now, semantic queued for next scan."""
+    global_fs = db.filters(active_only=True, watch_id=None)
+    if watch_id is None:
+        scopes: List[Optional[int]] = [None] + [w["id"] for w in db.watches()]
+    else:
+        scopes = [watch_id]
+    updated_count = 0
+    queued_semantic = 0
+    excluded_count = 0
+    for wid in scopes:
+        wfs = db.filters(active_only=True, watch_id=wid) if wid is not None else []
+        eff_fs = list(global_fs) + list(wfs)
+        sem_key = filter_match_key(global_fs, wfs)
+        open_rows = db.open_items_for_scope(wid)
+        if not open_rows:
+            continue
+        batch: List[Tuple[Optional[int], Optional[str], str]] = []
+        for it in open_rows:
+            if not passes(it, eff_fs):
+                if it.get("match") != 0 or it.get("match_key") != "det_excluded":
+                    batch.append((0, "det_excluded", it["id"]))
+                    excluded_count += 1
+            elif sem_key == "none":
+                if it.get("match") != 1 or it.get("match_key") != "none":
+                    batch.append((1, "none", it["id"]))
+                    updated_count += 1
+            else:
+                if it.get("match_key") == "det_excluded":
+                    batch.append((None, None, it["id"]))
+                    queued_semantic += 1
+                elif it.get("match_key") != sem_key:
+                    batch.append((it.get("match"), None, it["id"]))
+                    queued_semantic += 1
+        if batch:
+            db.update_item_matches(batch)
+    return {"updated": updated_count, "excluded": excluded_count, "queued_semantic": queued_semantic}
 
 
 def apply_semantic_filters(scan_id: int, global_fs: List[Dict[str, Any]],
@@ -642,6 +831,13 @@ def apply_semantic_filters(scan_id: int, global_fs: List[Dict[str, Any]],
             return ""
         key = filter_match_key(global_fs, wfs)
         todo = db.items_needing_match(scan_id, key, watch_id=wid)
+        if wid is not db._UNSET:
+            open_todo = db.open_items_needing_match(key, watch_id=wid)
+            seen_ids = {i["id"] for i in todo}
+            for o in open_todo:
+                if o["id"] not in seen_ids:
+                    todo.append(o)
+                    seen_ids.add(o["id"])
         if not todo:
             continue
         if key == "none" or not has_agent:
@@ -669,11 +865,14 @@ def apply_semantic_filters(scan_id: int, global_fs: List[Dict[str, Any]],
 
 
 # ---------- source preview (Test this source) ----------
-def test_source(source: Dict[str, Any], fs: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+def test_source(source: Dict[str, Any], fs: Optional[List[Dict[str, Any]]] = None,
+                cancel_event: Optional[threading.Event] = None) -> Dict[str, Any]:
     """Preview parsed items for a source without writing items or modifying saved extractors."""
     fs = fs if fs is not None else db.filters_for_watch(source.get("watch_id"), active_only=True)
     used_method = "reader"
     try:
+        if cancel_event and cancel_event.is_set():
+            raise agents.CancelledError("cancelled")
         if source.get("method") == "plugin":
             used_method = "plugin"
             plugins = load_plugins()
@@ -684,17 +883,19 @@ def test_source(source: Dict[str, Any], fs: Optional[List[Dict[str, Any]]] = Non
         else:
             code = source.get("extractor") if source.get("extractor_ok") else None
             if not code:
-                shared = db.get_shared_reader(source["url"])
+                shared = db.get_shared_reader(source["url"], notes=source.get("notes") or "", fs=fs)
                 if shared and shared.get("extractor"):
                     code = shared["extractor"]
                     used_method = "shared_reader"
             if code:
-                raw = extractors.run(code, tag="test")
+                raw = extractors.run(code, tag="test", cancel_event=cancel_event)
             elif db.get_settings().get("agent"):
                 used_method = "agent_preview"
-                raw = tasks.quick_read_source(source, fs)["items"]
+                raw = tasks.quick_read_source(source, fs, cancel_event=cancel_event)["items"]
             else:
                 raise RuntimeError("No reader for this source yet and no AI agent selected")
+        if cancel_event and cancel_event.is_set():
+            raise agents.CancelledError("cancelled")
         seen = set()
         out_items: List[Dict[str, Any]] = []
         for r in raw:
@@ -704,26 +905,34 @@ def test_source(source: Dict[str, Any], fs: Optional[List[Dict[str, Any]]] = Non
             seen.add(it["id"])
             it["passes_filters"] = passes(it, fs)
             out_items.append(it)
+        if cancel_event and cancel_event.is_set():
+            raise agents.CancelledError("cancelled")
         return {
             "ok": True,
+            "status": "done",
             "method": used_method,
             "count": len(out_items),
             "matching": sum(1 for i in out_items if i["passes_filters"]),
             "items": out_items[:50],
         }
+    except agents.CancelledError:
+        return {"ok": False, "cancelled": True, "status": "cancelled", "method": used_method, "count": 0, "matching": 0,
+                "items": [], "error": "cancelled"}
     except Exception as e:
-        return {"ok": False, "method": used_method, "count": 0, "matching": 0, "items": [],
-                "error": f"{type(e).__name__}: {e}"[:400]}
+        return {"ok": False, "status": "failed", "method": used_method, "count": 0, "matching": 0, "items": [],
+                "error": format_user_error(e)}
 
 
 # ---------- scan ----------
 def _scan_one(scan_id: int, source: Dict[str, Any], fs: List[Dict[str, Any]], plugins: Dict[str, Callable],
-              ignore_backoff: bool = False) -> None:
+              ignore_backoff: bool = False, baseline_ids: Optional[set] = None) -> None:
     t0 = time.time()
     with _lock:
         progress["current"].append(source["name"])
         progress.setdefault("sources_state", {})[source["name"]] = "reading"
     ok, count, new, error = False, 0, 0, ""
+    sid = source.get("id")
+    is_baseline = bool(sid is not None and not source.get("baseline_done"))
     try:
         if progress["cancel"] or _cancel_event.is_set():
             raise agents.CancelledError("cancelled")
@@ -739,17 +948,30 @@ def _scan_one(scan_id: int, source: Dict[str, Any], fs: List[Dict[str, Any]], pl
         seen = set()
         for r in raw:
             it = normalise(r, source) if isinstance(r, dict) else None
-            if not it or it["id"] in seen or not passes(it, fs):
+            if not it or it["id"] in seen:
                 continue
             seen.add(it["id"])
-            count += 1
-            new += int(db.save_item(scan_id, source, it))
+            if passes(it, fs):
+                count += 1
+                new += int(db.save_item(scan_id, source, it, notified=1 if is_baseline else db._UNSET))
+            elif not _is_expired(it):
+                db.save_item(
+                    scan_id, source, it,
+                    match=0, match_key="det_excluded",
+                    notified=1 if is_baseline else db._UNSET,
+                )
         db.mark_gone(source, scan_id)
+        if is_baseline and sid is not None:
+            db.mark_source_scan_notified(source, scan_id)
+            db.update_source(sid, baseline_done=1)
+            if baseline_ids is not None:
+                with _lock:
+                    baseline_ids.add(sid)
         ok = True
     except agents.CancelledError:
         error = "cancelled"
     except Exception as e:
-        error = f"{type(e).__name__}: {e}"[:400]
+        error = format_user_error(e)
         if not isinstance(e, RuntimeError):
             traceback.print_exc()
     finally:
@@ -783,55 +1005,152 @@ def _scan_label(trigger: str, only: Optional[List[int]], srcs: List[Dict[str, An
     return "All sources"
 
 
-def _notify_webhook(scan_id: int) -> None:
+def _call_notify_webhook(fn: Callable, url: str, payload: Dict[str, Any], settings: Dict[str, str]) -> Tuple[bool, str]:
+    params = inspect.signature(fn).parameters
+    accepts_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+    kw: Dict[str, Any] = {}
+    fmt = (settings.get("webhook_format") or "auto").strip().lower()
+    if fmt and ("fmt" in params or accepts_kw):
+        kw["fmt"] = fmt
+    if "allow_local" in params or accepts_kw:
+        kw["allow_local"] = settings.get("webhook_allow_local") == "1"
+    res = fn(url, payload, **kw)
+    if isinstance(res, tuple):
+        return bool(res[0]), str(res[1])
+    return bool(res), ("Webhook delivered." if res else "Webhook failed.")
+
+
+def _call_notify_mail(fn: Callable, new_items: List[Dict[str, Any]], changed_items: List[Dict[str, Any]],
+                      panel_url: str) -> Tuple[bool, str]:
+    params = inspect.signature(fn).parameters
+    accepts_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+    if "changed_items" in params or accepts_kw:
+        res = fn(new_items, panel_url, changed_items=changed_items)
+    else:
+        res = fn(new_items or changed_items, panel_url)
+    if isinstance(res, tuple):
+        return bool(res[0]), str(res[1])
+    return bool(res), ("E-mail sent." if res else "E-mail failed.")
+
+
+def notify_after_scan(
+    scan_id: int,
+    baseline_source_ids: Optional[set] = None,
+    panel_url: Optional[str] = None,
+    before_desktop: Optional[Callable[[], None]] = None,
+) -> Dict[str, Any]:
+    """Unified post-scan notifier for desktop, e-mail, and webhook across all triggers."""
     settings = db.get_settings()
-    url = (settings.get("webhook_url") or "").strip()
-    if not url or settings.get("notify") != "1":
-        return
-    fn = getattr(notify, "webhook", None)
-    if not callable(fn):
-        return
-    changes = db.scan_changes(scan_id)
-    if not changes:
-        return
-    new_items = [i for i in changes if i.get("is_new")]
-    upd_items = [i for i in changes if not i.get("is_new") and i.get("is_updated")]
-    lines = []
-    for it in changes[:8]:
-        prefix = "NEW" if it.get("is_new") else (it.get("change_summary") or "UPDATED")
-        lines.append(f"- [{prefix}] {it['title']} ({it['source_name']}) {it['url']}")
-    payload = {
-        "event": "scan_finished",
-        "scan_id": scan_id,
-        "title": f"Lookout: {len(new_items)} new, {len(upd_items)} updated",
-        "message": "\n".join(lines),
-        "new_count": len(new_items),
-        "updated_count": len(upd_items),
-        "items": [
-            {
-                "id": i["id"],
-                "title": i["title"],
-                "org": i.get("org"),
-                "source": i["source_name"],
-                "source_name": i["source_name"],
-                "url": i["url"],
-                "deadline": i.get("deadline"),
-                "is_new": bool(i.get("is_new")),
-                "is_updated": bool(i.get("is_updated")),
-                "change_summary": i.get("change_summary"),
-            }
-            for i in changes[:20]
-        ],
-    }
+    if settings.get("notify") != "1":
+        return {"sent": False, "channels": {}, "skipped": "notify_disabled"}
+    base_ids = set(baseline_source_ids or ())
+    today = db.now()[:10]
+    new_items = [i for i in db.unnotified() if i.get("source_id") not in base_ids]
+    new_ids = {i["id"] for i in new_items}
+    changed_items = [
+        i for i in db.scan_changes(scan_id)
+        if not i.get("is_new")
+        and i.get("is_updated")
+        and i["id"] not in new_ids
+        and i.get("source_id") not in base_ids
+        and i.get("status") == "open"
+        and i.get("action") != "hidden"
+        and (not i.get("snoozed_until") or i["snoozed_until"] <= today)
+    ]
+    changed_ids = {i["id"] for i in changed_items}
+    if not new_items and not changed_items:
+        return {"sent": False, "channels": {}}
+
+    port = int(os.environ.get("LOOKOUT_PORT") or 8780)
+    eff_url = notify.bare_panel_url(panel_url or f"http://127.0.0.1:{port}/")
+    channels: Dict[str, Tuple[bool, str]] = {}
+    remote_results: List[Tuple[bool, str]] = []
+
+    if before_desktop is not None:
+        try:
+            before_desktop()
+        except Exception:
+            pass
+
+    if new_items and changed_items:
+        d_title = f"{len(new_items)} new, {len(changed_items)} updated"
+        d_lines = [
+            *(f"New: {i['title']} — {i['source_name']}" for i in new_items[:1]),
+            *(f"Updated: {i['title']} — {i.get('change_summary') or i['source_name']}" for i in changed_items[:1]),
+        ]
+    elif new_items:
+        d_title = f"{len(new_items)} new item{'s' if len(new_items) != 1 else ''}"
+        d_lines = [f"{i['title']} — {i['source_name']}" for i in new_items[:2]]
+    else:
+        d_title = f"{len(changed_items)} updated item{'s' if len(changed_items) != 1 else ''}"
+        d_lines = [f"{i['title']} — {i.get('change_summary') or i['source_name']}" for i in changed_items[:2]]
+
     try:
-        params = inspect.signature(fn).parameters
-        accepts_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
-        if "allow_local" in params or accepts_kw:
-            fn(url, payload, allow_local=(settings.get("webhook_allow_local") == "1"))
-        else:
-            fn(url, payload)
-    except Exception:
-        pass
+        d_res = notify.desktop(d_title, d_lines, notify.desktop_launch_url(eff_url))
+        d_ok, d_msg = (bool(d_res[0]), str(d_res[1])) if isinstance(d_res, tuple) else (True, "Desktop notification sent.")
+    except Exception as e:
+        d_ok, d_msg = False, str(e)[:300]
+    channels["desktop"] = (d_ok, d_msg)
+    db.log_notification(scan_id, "desktop", d_ok, d_msg)
+
+    mail_from = (settings.get("mail_from") or settings.get("smtp_user") or "").strip()
+    smtp_user = (settings.get("smtp_user") or "").strip()
+    mail_auth_ok = (not smtp_user) or bool(settings.get("smtp_password"))
+    if (settings.get("mail_to") or "").strip() and mail_from and mail_auth_ok and (settings.get("smtp_host") or "").strip():
+        try:
+            m_ok, m_msg = _call_notify_mail(notify.mail_digest, new_items, changed_items, eff_url)
+        except Exception as e:
+            m_ok, m_msg = False, str(e)[:300]
+        channels["email"] = (m_ok, m_msg)
+        remote_results.append((m_ok, m_msg))
+        db.log_notification(scan_id, "email", m_ok, m_msg)
+
+    wh_url = (settings.get("webhook_url") or "").strip()
+    wh_fn = getattr(notify, "webhook", None)
+    if wh_url and callable(wh_fn):
+        combined = new_items + changed_items
+        lines = []
+        for it in combined[:8]:
+            prefix = "NEW" if it["id"] in new_ids else (it.get("change_summary") or "UPDATED")
+            lines.append(f"- [{prefix}] {it['title']} ({it['source_name']}) {it['url']}")
+        payload: Dict[str, Any] = {
+            "event": "scan_finished",
+            "scan_id": scan_id,
+            "title": f"Lookout: {len(new_items)} new, {len(changed_items)} updated",
+            "message": "\n".join(lines),
+            "new_count": len(new_items),
+            "updated_count": len(changed_items),
+            "items": [
+                {
+                    "id": i["id"],
+                    "title": i["title"],
+                    "org": i.get("org"),
+                    "source": i["source_name"],
+                    "source_name": i["source_name"],
+                    "url": i["url"],
+                    "deadline": i.get("deadline"),
+                    "is_new": bool(i["id"] in new_ids or i.get("is_new")),
+                    "is_updated": bool(i["id"] in changed_ids or i.get("is_updated")),
+                    "change_summary": i.get("change_summary"),
+                }
+                for i in combined[:20]
+            ],
+        }
+        chat_id = (settings.get("telegram_chat_id") or "").strip()
+        if chat_id:
+            payload["chat_id"] = chat_id
+        try:
+            w_ok, w_msg = _call_notify_webhook(wh_fn, wh_url, payload, settings)
+        except Exception as e:
+            w_ok, w_msg = False, str(e)[:300]
+        channels["webhook"] = (w_ok, w_msg)
+        remote_results.append((w_ok, w_msg))
+        db.log_notification(scan_id, "webhook", w_ok, w_msg)
+
+    delivered = all(ok for ok, _ in remote_results) if remote_results else d_ok
+    if delivered and new_items:
+        db.mark_notified(i["id"] for i in new_items)
+    return {"sent": delivered, "channels": channels, "new": len(new_items), "updated": len(changed_items)}
 
 
 def enqueue_scan_sources(source_ids: List[int], watch_id: Optional[int] = None) -> bool:
@@ -845,7 +1164,7 @@ def enqueue_scan_sources(source_ids: List[int], watch_id: Optional[int] = None) 
         want = set(source_ids) - ctx["submitted_ids"]
         if not want:
             return True
-        srcs = [s for s in db.sources(watch_id=watch_id) if s["id"] in want and s["active"]]
+        srcs = [s for s in db.sources(watch_id=watch_id) if s["id"] in want and s["active"] and not s.get("paused")]
         if not srcs:
             return True
         global_fs = ctx["global_fs"]
@@ -863,12 +1182,15 @@ def enqueue_scan_sources(source_ids: List[int], watch_id: Optional[int] = None) 
             ctx["srcs"].append(s)
             fs = global_fs + watch_fs_map.get(s.get("watch_id"), [])
             pool = fast if s["method"] == "plugin" else slow
-            ctx["futures"].append(pool.submit(_scan_one, scan_id, s, fs, plugins, ctx["ignore_backoff"]))
+            ctx["futures"].append(
+                pool.submit(_scan_one, scan_id, s, fs, plugins, ctx["ignore_backoff"], ctx["baseline_ids"])
+            )
         return True
 
 
 def _run_scan_body(trigger: str, only: Optional[List[int]], watch_id: Optional[int],
-                   lock_token: str) -> Optional[int]:
+                   lock_token: str, panel_url: Optional[str] = None,
+                   before_desktop: Optional[Callable[[], None]] = None) -> Optional[int]:
     global _active_scan
     hb_stop = threading.Event()
     hb_thread: Optional[threading.Thread] = None
@@ -886,10 +1208,10 @@ def _run_scan_body(trigger: str, only: Optional[List[int]], watch_id: Optional[i
             only_set = set(only)
             srcs = [s for s in db.sources() if s["id"] in only_set]
         elif watch_id is not None:
-            srcs = db.sources(active_only=True, watch_id=watch_id)
+            srcs = [s for s in db.sources(active_only=True, watch_id=watch_id) if not s.get("paused")]
         else:
             srcs = [s for s in db.sources(active_only=True)
-                    if s.get("watch_id") is None or s["watch_id"] in active_watches]
+                    if (s.get("watch_id") is None or s["watch_id"] in active_watches) and not s.get("paused")]
         if not settings["agent"]:
             srcs = [s for s in srcs if s["method"] == "plugin"]
         label = _scan_label(trigger, only, srcs, watch_id=watch_id)
@@ -907,7 +1229,8 @@ def _run_scan_body(trigger: str, only: Optional[List[int]], watch_id: Optional[i
         hb_thread = threading.Thread(target=_heartbeat, daemon=True)
         hb_thread.start()
 
-        ignore_backoff = bool(only)
+        ignore_backoff = (trigger == "manual") or bool(only)
+        baseline_ids: set = set()
         with _lock:
             progress.update(
                 scan_id=scan_id,
@@ -928,6 +1251,7 @@ def _run_scan_body(trigger: str, only: Optional[List[int]], watch_id: Optional[i
                 "fast": fast,
                 "slow": slow,
                 "ignore_backoff": ignore_backoff,
+                "baseline_ids": baseline_ids,
                 "submitted_ids": {s["id"] for s in srcs if s.get("id") is not None},
                 "srcs": list(srcs),
                 "futures": [],
@@ -935,7 +1259,7 @@ def _run_scan_body(trigger: str, only: Optional[List[int]], watch_id: Optional[i
             for s in srcs:
                 fs = global_fs + watch_fs_map.get(s.get("watch_id"), [])
                 pool = fast if s["method"] == "plugin" else slow
-                ctx["futures"].append(pool.submit(_scan_one, scan_id, s, fs, plugins, ignore_backoff))
+                ctx["futures"].append(pool.submit(_scan_one, scan_id, s, fs, plugins, ignore_backoff, baseline_ids))
             with _active_lock:
                 _active_scan = ctx
             try:
@@ -968,7 +1292,9 @@ def _run_scan_body(trigger: str, only: Optional[List[int]], watch_id: Optional[i
         final_status = "cancelled" if (cancelled or progress["cancel"] or _cancel_event.is_set()) else "done"
         db.finish_scan(scan_id, final_status, note)
         if final_status == "done":
-            _notify_webhook(scan_id)
+            notify_after_scan(
+                scan_id, baseline_source_ids=baseline_ids, panel_url=panel_url, before_desktop=before_desktop
+            )
         return scan_id
     finally:
         hb_stop.set()
@@ -981,7 +1307,8 @@ def _run_scan_body(trigger: str, only: Optional[List[int]], watch_id: Optional[i
 
 
 def run_scan(trigger: str = "manual", only: Optional[List[int]] = None,
-             watch_id: Optional[int] = None) -> Optional[int]:
+             watch_id: Optional[int] = None, panel_url: Optional[str] = None,
+             before_desktop: Optional[Callable[[], None]] = None) -> Optional[int]:
     """Blocking scan. Returns the scan id (None if one is already running in this or another process)."""
     lock_token = uuid.uuid4().hex
     with _lock:
@@ -993,7 +1320,7 @@ def run_scan(trigger: str = "manual", only: Optional[List[int]] = None,
         _cancel_event.clear()
         progress.update(running=True, scan_id=None, done=0, total=0, current=[], learning=[],
                         learning_total=0, learning_done=0, sources_state={}, cancel=False)
-    return _run_scan_body(trigger, only, watch_id, lock_token)
+    return _run_scan_body(trigger, only, watch_id, lock_token, panel_url=panel_url, before_desktop=before_desktop)
 
 
 def start_scan_async(trigger: str = "manual", only: Optional[List[int]] = None,

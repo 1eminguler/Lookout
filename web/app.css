@@ -388,3 +388,66 @@ table.t .err { color: var(--orange); font-size: 12.5px; }
   .page { padding: 22px 16px 60px; }
 }
 @media (prefers-reduced-motion: reduce) { * { animation: none !important; transition: none !important; } }
+
+/* ---------- layout helpers & CSP-clean utilities (no inline styles) ---------- */
+.no-dec { text-decoration: none; }
+.link-bold { text-decoration: none; font-weight: 520; }
+.minw-0 { min-width: 0; }
+.span-all { grid-column: 1 / -1; }
+.ta-sm { min-height: 60px; }
+.mt-8 { margin-top: 8px; }
+.mt-10 { margin-top: 10px; }
+.mt-12 { margin-top: 12px; }
+.mt-18 { margin-top: 18px; }
+.mt-22 { margin-top: 22px; }
+.fs-12 { font-size: 12px; }
+.fs-125 { font-size: 12.5px; }
+.fs-13 { font-size: 13px; }
+.sub-note { font-size: 13px; margin-top: 2px; }
+.err-note { color: var(--red); font-size: 13px; margin: 12px 0 0; }
+.home-prog { width: min(760px, 100%); }
+.row-tight { flex-wrap: nowrap; gap: 2px; }
+.nowrap { flex-wrap: nowrap; }
+.align-end { align-items: flex-end; flex-wrap: nowrap; }
+.w-190 { width: 190px; flex: none; }
+.w-110 { width: 110px; }
+.w-90 { width: 90px; }
+.num-col { text-align: right; white-space: nowrap; }
+.ag-sum { font-size: 12.5px; max-width: 260px; text-align: right; }
+.pop-sub { min-width: 180px; }
+
+progress.pbar-prog {
+  display: block;
+  width: 100%;
+  height: 3px;
+  border: 0;
+  border-radius: 3px;
+  overflow: hidden;
+  margin-top: 10px;
+  background: var(--line);
+  appearance: none;
+  -webkit-appearance: none;
+}
+progress.pbar-prog::-webkit-progress-bar { background: var(--line); border-radius: 3px; }
+progress.pbar-prog::-webkit-progress-value { background: var(--accent); border-radius: 3px; transition: width .3s; }
+progress.pbar-prog::-moz-progress-bar { background: var(--accent); border-radius: 3px; }
+
+.inline-edit {
+  display: grid;
+  gap: 8px;
+  margin-top: 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  background: var(--panel);
+}
+.inline-edit.side-edit { margin: 0; border-radius: 0; border-left: 0; border-right: 0; }
+.banner-body { flex: 1; min-width: 0; }
+.banner-list { margin: 4px 0 0; padding-left: 16px; font-size: 12.5px; color: var(--ink-2); }
+
+body.gate-body { overflow: auto; display: grid; place-items: center; padding: 24px; }
+.gate { width: min(460px, 100%); }
+.gate-card { background: var(--raise); border: 1px solid var(--line); border-radius: var(--r-lg); padding: 28px; }
+.gate-card h1 { margin: 0 0 8px; font: 600 22px/1.25 var(--display); }
+.gate-card p { margin: 0; color: var(--ink-2); line-height: 1.55; }
+.gate-card code { font: 12.5px "Cascadia Code", Consolas, monospace; background: var(--panel); padding: 2px 6px; border-radius: 5px; border: 1px solid var(--line-soft); }

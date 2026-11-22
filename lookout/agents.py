@@ -3,6 +3,7 @@
 Every agent gets the same one-line prompt; the real task is written to TASK.md in a scratch
 directory (passing long multi-line prompts through Windows .cmd shims is unreliable).
 """
+import inspect
 import os
 import re
 import shlex
@@ -12,19 +13,36 @@ import subprocess
 import sys
 import threading
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from lookout import db
 
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+DEFAULT_QUOTA_COOLDOWN_MINUTES = 30
 PROMPT = ("Read the file {dir}{sep}TASK.md and carry out exactly what it says. All files it mentions live in the "
           "folder {dir}. Do not ask questions.")
+_cli_custom_command: Optional[str] = None
 
-
-class CancelledError(RuntimeError):
-    """Raised when an in-flight agent or extractor process is cancelled."""
+CLAUDE_TASK_TOOLS: Dict[str, List[str]] = {
+    "classify": ["Read", "Write"],
+    "quick_read": ["Bash(agent-browser:*)", "Bash(agent-browser *)", "Read", "Write"],
+    "learn": [
+        "Bash(agent-browser:*)", "Bash(agent-browser *)",
+        "Bash(python test_extractor.py)", "Bash(python3 test_extractor.py)",
+        "Read", "Write", "Edit", "WebFetch",
+    ],
+    "discover": [
+        "Bash(agent-browser:*)", "Bash(agent-browser *)",
+        "Read", "Write", "Edit", "WebSearch", "WebFetch",
+    ],
+    "default": [
+        "Bash(agent-browser:*)", "Bash(agent-browser *)",
+        "Bash(python test_extractor.py)", "Bash(python3 test_extractor.py)",
+        "Read", "Write", "Edit", "WebSearch", "WebFetch",
+    ],
+}
 
 
 def prompt_for(workdir: str) -> str:
@@ -32,12 +50,16 @@ def prompt_for(workdir: str) -> str:
     return PROMPT.format(dir=workdir, sep=os.sep)
 
 
-def _claude(exe, model, workdir, timeout):
-    # Only the browser CLI and file tools are allowed; no general shell access.
-    cmd = [exe, "-p", prompt_for(workdir), "--add-dir", workdir, "--permission-mode", "acceptEdits", "--allowedTools",
-           "Bash(agent-browser:*)", "Bash(agent-browser *)", "Bash(python test_extractor.py)",
-           "Bash(python3 test_extractor.py)", "Read", "Write", "Edit", "WebSearch", "WebFetch"]
+def _claude(exe, model, workdir, timeout, task_kind: Optional[str] = None):
+    # Scoped per task; classify never gets browser or network tools.
+    tools = CLAUDE_TASK_TOOLS.get(task_kind or "default", CLAUDE_TASK_TOOLS["default"])
+    cmd = [exe, "-p", prompt_for(workdir), "--add-dir", workdir, "--permission-mode", "acceptEdits",
+           "--allowedTools", *tools]
     return cmd + (["--model", model] if model else [])
+
+
+class CancelledError(RuntimeError):
+    """Raised when an in-flight agent or extractor process is cancelled."""
 
 
 def _agy(exe, model, workdir, timeout):
@@ -202,6 +224,9 @@ def run_tracked(cmd: List[str], timeout: int, cwd: Optional[str] = None, tag: Op
     return code, out + err
 
 
+_DEFAULT_RUN_TRACKED = run_tracked
+
+
 def _run(cmd: List[str], timeout: int, cwd: Optional[str] = None) -> Tuple[int, str]:
     return run_tracked(cmd, timeout, cwd)
 
@@ -230,9 +255,49 @@ def validate_custom_command(cmd: str) -> str:
     return s
 
 
+def custom_command_path() -> Path:
+    return db.DB_PATH.parent / "agent_command.txt"
+
+
+def set_cli_custom_command(cmd: Optional[str]) -> Optional[str]:
+    global _cli_custom_command
+    if cmd is None:
+        _cli_custom_command = None
+        return None
+    clean = validate_custom_command(cmd)
+    _cli_custom_command = clean
+    return clean
+
+
+def _file_custom_command() -> str:
+    p = custom_command_path()
+    if not p.is_file():
+        return ""
+    try:
+        for line in p.read_text(encoding="utf-8", errors="replace").splitlines():
+            s = line.strip()
+            if s and not s.startswith("#"):
+                return s
+    except OSError:
+        return ""
+    return ""
+
+
+def get_custom_command() -> str:
+    if _cli_custom_command:
+        return _cli_custom_command
+    file_cmd = _file_custom_command()
+    if file_cmd:
+        return file_cmd
+    try:
+        return (db.get_settings().get("custom_command") or "").strip()
+    except Exception:
+        return ""
+
+
 def which(agent_id: str) -> Optional[str]:
     if agent_id == "custom":
-        cmd = db.get_settings().get("custom_command", "")
+        cmd = get_custom_command()
         if not cmd.strip():
             return None
         try:
@@ -281,30 +346,98 @@ def models(agent_id: str) -> List[Tuple[str, str]]:
 
 
 def detect() -> List[Dict]:
-    """All known agents with install state on this machine, plus the user's custom command."""
+    """All known agents with install state on this computer, plus the user's local custom command."""
     out = []
     for aid, info in AGENTS.items():
         exe = shutil.which(info["exe"])
         out.append({"id": aid, "name": info["name"], "installed": bool(exe), "version": version(exe) if exe else None,
                     "verified": info["verified"], "lists_models": "list_models" in info,
                     "usage": db.agent_usage(aid) if exe else []})
-    custom = db.get_settings().get("custom_command", "")
+    custom = get_custom_command()
+    src = "cli" if _cli_custom_command else ("file" if _file_custom_command() else ("db" if custom else None))
     out.append({"id": "custom", "name": "Custom command", "installed": bool(which("custom")), "version": None,
-                "verified": False, "lists_models": False, "command": custom, "usage": db.agent_usage("custom")})
+                "verified": False, "lists_models": False, "configured": bool(custom),
+                "config_path": str(custom_command_path()), "source": src,
+                "usage": db.agent_usage("custom")})
     return out
 
 
+_ISO_TS_RE = re.compile(
+    r"\b(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2})?(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?)\b"
+)
+_CLOCK_RESET_RE = re.compile(
+    r"\b(?:resets?|until|after|available)\s+(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\s*(utc|gmt|z)?\b",
+    re.I,
+)
+_REL_WAIT_RE = re.compile(
+    r"(?:try again|retry|wait)\s+(?:in\s+|after[:\s]+)?(?:(\d+)\s*h(?:ours?)?\s*)?(?:(\d+)\s*m(?:in(?:utes?)?)?\s*)?(?:(\d+)\s*s(?:ec(?:onds?)?)?)?",
+    re.I,
+)
+
+
 def _resets_at(text: str) -> Optional[str]:
-    m = re.search(r"resets? in\s+((\d+)h)?\s*((\d+)m)?\s*((\d+)s)?", text, re.I)
-    if not m or not any(m.group(i) for i in (2, 4, 6)):
-        return None
-    secs = int(m.group(2) or 0) * 3600 + int(m.group(4) or 0) * 60 + int(m.group(6) or 0)
-    return (datetime.now() + timedelta(seconds=secs)).strftime(db.TS)
+    txt = str(text or "")
+    m = re.search(r"resets? in\s+((\d+)h)?\s*((\d+)m)?\s*((\d+)s)?", txt, re.I)
+    if m and any(m.group(i) for i in (2, 4, 6)):
+        secs = int(m.group(2) or 0) * 3600 + int(m.group(4) or 0) * 60 + int(m.group(6) or 0)
+        return (datetime.now() + timedelta(seconds=secs)).strftime(db.TS)
+
+    m_rel = _REL_WAIT_RE.search(txt)
+    if m_rel and any(m_rel.group(i) for i in (1, 2, 3)):
+        secs = int(m_rel.group(1) or 0) * 3600 + int(m_rel.group(2) or 0) * 60 + int(m_rel.group(3) or 0)
+        if secs > 0:
+            return (datetime.now() + timedelta(seconds=secs)).strftime(db.TS)
+
+    m_iso = _ISO_TS_RE.search(txt)
+    if m_iso:
+        raw_iso = m_iso.group(1)
+        try:
+            norm = raw_iso[:-1] + "+00:00" if raw_iso.endswith("Z") else raw_iso
+            dt = datetime.fromisoformat(norm)
+            if dt.tzinfo is not None:
+                dt = dt.astimezone().replace(tzinfo=None)
+            return dt.strftime(db.TS)
+        except ValueError:
+            pass
+
+    m_clk = _CLOCK_RESET_RE.search(txt)
+    if m_clk:
+        hh = int(m_clk.group(1))
+        mm_s, ampm, tz_flag = m_clk.group(2), m_clk.group(3), m_clk.group(4)
+        if mm_s is not None or ampm:
+            mm = int(mm_s or 0)
+            if ampm:
+                ap = ampm.lower()
+                if ap == "pm" and hh < 12:
+                    hh += 12
+                elif ap == "am" and hh == 12:
+                    hh = 0
+            if 0 <= hh <= 23 and 0 <= mm <= 59:
+                if tz_flag:
+                    now_ref = datetime.now(timezone.utc)
+                    cand = now_ref.replace(hour=hh, minute=mm, second=0, microsecond=0)
+                    if cand <= now_ref:
+                        cand += timedelta(days=1)
+                    cand = cand.astimezone().replace(tzinfo=None)
+                else:
+                    now_ref = datetime.now()
+                    cand = now_ref.replace(hour=hh, minute=mm, second=0, microsecond=0)
+                    if cand <= now_ref:
+                        cand += timedelta(days=1)
+                return cand.strftime(db.TS)
+    return None
 
 
-def build_command(agent_id: str, model: str, workdir: str, timeout: int) -> List[str]:
+def _quota_tail(stdout: str, stderr: str) -> str:
+    err_lines = [ln for ln in (stderr or "").splitlines() if ln.strip()][-40:]
+    out_lines = [ln for ln in (stdout or "").splitlines() if ln.strip()][-15:]
+    return "\n".join(err_lines + out_lines)
+
+
+def build_command(agent_id: str, model: str, workdir: str, timeout: int,
+                  task_kind: Optional[str] = None) -> List[str]:
     if agent_id == "custom":
-        tpl = db.get_settings().get("custom_command", "")
+        tpl = get_custom_command()
         if not tpl.strip():
             raise RuntimeError("Custom command is empty")
         try:
@@ -322,11 +455,15 @@ def build_command(agent_id: str, model: str, workdir: str, timeout: int) -> List
     if agent_id not in AGENTS:
         raise ValueError(f"Unknown agent: {agent_id}")
     exe = which(agent_id) or AGENTS[agent_id]["exe"]
-    return AGENTS[agent_id]["build"](exe, model, workdir, timeout)
+    builder = AGENTS[agent_id]["build"]
+    if "task_kind" in inspect.signature(builder).parameters:
+        return builder(exe, model, workdir, timeout, task_kind=task_kind)
+    return builder(exe, model, workdir, timeout)
 
 
 def run_task(agent_id: str, model: str, workdir: Path, timeout: int, tag: Optional[str] = None,
-             session: Optional[str] = None, cancel_event: Optional[threading.Event] = None) -> str:
+             session: Optional[str] = None, cancel_event: Optional[threading.Event] = None,
+             task_kind: Optional[str] = None) -> str:
     """Runs the agent inside workdir. Raises when missing, out of quota, or cancelled."""
     if cancel_event and cancel_event.is_set():
         raise CancelledError("cancelled")
@@ -335,11 +472,20 @@ def run_task(agent_id: str, model: str, workdir: Path, timeout: int, tag: Option
     blocked = db.agent_blocked_until(agent_id, model)
     if blocked:
         raise RuntimeError(f"{agent_id} quota is used up until {blocked[11:16]}")
-    code, out = run_tracked(build_command(agent_id, model, str(workdir), timeout), timeout + 60, str(workdir),
-                            tag=tag, session=session, cancel_event=cancel_event)
-    quota_hit = code != 0 and bool(QUOTA.search(out))
+    cmd = build_command(agent_id, model, str(workdir), timeout, task_kind=task_kind)
+    if run_tracked is _DEFAULT_RUN_TRACKED:
+        code, stdout, stderr = _run_proc(cmd, timeout + 60, str(workdir), tag=tag, session=session, cancel_event=cancel_event)
+        out = stdout + stderr
+        tail = _quota_tail(stdout, stderr)
+    else:
+        code, out = run_tracked(cmd, timeout + 60, str(workdir), tag=tag, session=session, cancel_event=cancel_event)
+        tail = _quota_tail(out, "")
+    quota_hit = code != 0 and bool(QUOTA.search(tail))
+    reset = None
+    if quota_hit:
+        reset = _resets_at(tail) or (datetime.now() + timedelta(minutes=DEFAULT_QUOTA_COOLDOWN_MINUTES)).strftime(db.TS)
     db.log_agent_call(agent_id, model, ok=code == 0 and not quota_hit, error=out[-400:] if code else "",
-                      resets_at=_resets_at(out) if quota_hit else None)
+                      resets_at=reset)
     if quota_hit:
         raise RuntimeError(f"{agent_id} quota is used up")
     return out

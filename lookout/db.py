@@ -1,5 +1,6 @@
 """SQLite storage: watches, sources, filters, scans, discoveries, items, history, locks, settings and agent usage."""
 import ctypes
+import hashlib
 import json
 import os
 import sqlite3
@@ -7,17 +8,21 @@ import sys
 import threading
 import urllib.parse
 from contextlib import contextmanager
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 ROOT = Path(__file__).resolve().parent.parent
 DB_PATH = Path(os.environ.get("LOOKOUT_DATA_DIR") or ROOT / "data") / "lookout.db"
 TS = "%Y-%m-%d %H:%M:%S"
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 _lock = threading.RLock()
 _UNSET = object()
 _TRACKING_EXACT = {"fbclid", "gclid", "mc_cid", "mc_eid"}
+
+
+def _tr_lower(v: Any) -> str:
+    return str(v or "").replace("İ", "i").replace("I\u0307", "i").lower()
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT);
@@ -163,6 +168,15 @@ CREATE TABLE IF NOT EXISTS scan_locks (
     acquired_at TEXT NOT NULL,
     heartbeat_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS notification_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    scan_id INTEGER,
+    channel TEXT NOT NULL,
+    ok INTEGER NOT NULL,
+    message TEXT,
+    created TEXT NOT NULL
+);
 """
 
 
@@ -174,6 +188,7 @@ def connect() -> sqlite3.Connection:
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(DB_PATH), timeout=30, check_same_thread=False)
     conn.row_factory = sqlite3.Row
+    conn.create_function("norm_tr", 1, _tr_lower)
     conn.execute("PRAGMA foreign_keys=ON")
     conn.execute("PRAGMA busy_timeout=30000")
     conn.execute("PRAGMA synchronous=NORMAL")
@@ -227,6 +242,25 @@ CREATE INDEX IF NOT EXISTS idx_scan_sources_source_id ON scan_sources(source_id,
 CREATE INDEX IF NOT EXISTS idx_sources_watch_id ON sources(watch_id);
 """
 
+MIGRATIONS_V3 = {
+    "sources": {
+        "struct_fail_count": "INTEGER DEFAULT 0",
+        "learn_fail_count": "INTEGER DEFAULT 0",
+        "learn_retry_after": "TEXT",
+        "paused": "INTEGER DEFAULT 0",
+        "filters_changed": "INTEGER DEFAULT 0",
+        "baseline_done": "INTEGER DEFAULT 0",
+    },
+    "url_readers": {
+        "context_hash": "TEXT",
+    },
+}
+
+INDEXES_V3 = """
+CREATE INDEX IF NOT EXISTS idx_items_status_match ON items(status, match, first_seen DESC);
+CREATE INDEX IF NOT EXISTS idx_notification_log_channel ON notification_log(channel, id DESC);
+"""
+
 
 def _add_columns(c: sqlite3.Connection, spec: Dict[str, Dict[str, str]]) -> None:
     for table, cols in spec.items():
@@ -253,6 +287,17 @@ def init() -> None:
             )
             c.executescript(INDEXES_V2)
             ver = 2
+        if ver < 3:
+            _add_columns(c, MIGRATIONS_V3)
+            c.executescript(INDEXES_V3)
+            c.execute(
+                """UPDATE sources SET baseline_done = 1
+                   WHERE baseline_done = 0 AND (
+                       EXISTS (SELECT 1 FROM scan_sources ss WHERE ss.source_id = sources.id AND ss.ok = 1)
+                       OR EXISTS (SELECT 1 FROM items i WHERE i.source_id = sources.id)
+                   )"""
+            )
+            ver = 3
         c.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         c.commit()
 
@@ -444,9 +489,10 @@ def _exec(sql: str, args: Iterable = ()) -> int:
 DEFAULTS = {
     "agent": "", "model": "", "headed": "0", "notify": "1", "schedule_time": "08:30",
     "agent_timeout_min": "12", "parallel": "2", "first_run_done": "0",
-    "custom_command": "", "mail_to": "", "smtp_host": "smtp.gmail.com", "smtp_port": "587", "smtp_user": "",
-    "smtp_password": "", "language_hint": "", "verify_weekly": "1",
-    "rss_public": "0", "webhook_url": "", "webhook_allow_local": "0",
+    "custom_command": "", "mail_to": "", "mail_from": "", "smtp_host": "smtp.gmail.com", "smtp_port": "587",
+    "smtp_user": "", "smtp_password": "", "smtp_starttls": "auto", "language_hint": "", "verify_weekly": "1",
+    "rss_public": "0", "webhook_url": "", "webhook_format": "auto", "webhook_allow_local": "0",
+    "telegram_chat_id": "", "notify_errors_dismissed_id": "0",
 }
 
 
@@ -564,21 +610,54 @@ def canonical_reader_url(url: str) -> str:
     return urllib.parse.urlunsplit((scheme, netloc, path, query, ""))
 
 
-def get_shared_reader(url: str) -> Optional[Dict[str, Any]]:
-    key = canonical_reader_url(url)
-    if not key:
+def filters_hash(fs: Optional[List[Dict[str, Any]]] = None) -> str:
+    norm = sorted(
+        [
+            str(f.get("kind") or "").strip().lower(),
+            " ".join(str(f.get("value") or "").strip().lower().split()),
+        ]
+        for f in (fs or [])
+        if f.get("active", 1)
+    )
+    return hashlib.sha1(json.dumps(norm, ensure_ascii=False).encode("utf-8")).hexdigest()[:12]
+
+
+def reader_context_hash(notes: str = "", fs: Optional[List[Dict[str, Any]]] = None) -> str:
+    payload = {
+        "n": " ".join(str(notes or "").strip().lower().split()),
+        "f": filters_hash(fs),
+    }
+    return hashlib.sha1(json.dumps(payload, ensure_ascii=False).encode("utf-8")).hexdigest()[:12]
+
+
+def shared_reader_key(url: str, notes: str = "", fs: Optional[List[Dict[str, Any]]] = None) -> str:
+    canon = canonical_reader_url(url)
+    if not canon:
+        return ""
+    return f"{canon}#{reader_context_hash(notes, fs)}"
+
+
+def get_shared_reader(url: str, notes: str = "", fs: Optional[List[Dict[str, Any]]] = None) -> Optional[Dict[str, Any]]:
+    canon = canonical_reader_url(url)
+    if not canon:
         return None
+    ctx_hash = reader_context_hash(notes, fs)
+    key = f"{canon}#{ctx_hash}"
     row = _one("SELECT * FROM url_readers WHERE url_key=? AND extractor_ok=1 AND extractor IS NOT NULL", (key,))
     if row:
         return row
-    for s in _rows("SELECT id, url, extractor, last_good_extractor, extractor_ok, extractor_error, "
+    for s in _rows("SELECT id, url, notes, watch_id, extractor, last_good_extractor, extractor_ok, extractor_error, "
                    "extractor_updated, last_good_updated, extractor_runs, last_good_stats "
                    "FROM sources WHERE method='agent' AND extractor_ok=1 AND extractor IS NOT NULL "
                    "ORDER BY COALESCE(extractor_updated, '') DESC, id DESC"):
-        if canonical_reader_url(s["url"]) == key:
+        if canonical_reader_url(s["url"]) != canon:
+            continue
+        s_fs = filters_for_watch(s.get("watch_id"), active_only=True)
+        if reader_context_hash(s.get("notes") or "", s_fs) == ctx_hash:
             return {
                 "url_key": key,
                 "url": s["url"],
+                "context_hash": ctx_hash,
                 "extractor": s["extractor"],
                 "last_good_extractor": s.get("last_good_extractor") or s["extractor"],
                 "extractor_ok": 1,
@@ -592,10 +671,14 @@ def get_shared_reader(url: str) -> Optional[Dict[str, Any]]:
 
 def save_shared_reader(url: str, extractor: str, ok: bool = True, error: Optional[str] = None,
                        stats: Optional[str] = None, updated: Optional[str] = None,
-                       propagate: bool = True) -> None:
-    key = canonical_reader_url(url)
-    if not key or not extractor:
+                       propagate: bool = True, notes: str = "",
+                       fs: Optional[List[Dict[str, Any]]] = None) -> None:
+    canon = canonical_reader_url(url)
+    if not canon or not extractor:
         return
+    ctx_hash = reader_context_hash(notes, fs)
+    key = f"{canon}#{ctx_hash}"
+    f_hash = filters_hash(fs)
     ts = updated or now()
     with _lock, _conn() as c:
         existing = c.execute("SELECT * FROM url_readers WHERE url_key=?", (key,)).fetchone()
@@ -603,10 +686,11 @@ def save_shared_reader(url: str, extractor: str, ok: bool = True, error: Optiona
         eff_stats = stats if stats is not None else (existing["last_good_stats"] if existing else None)
         c.execute(
             """INSERT INTO url_readers(url_key, url, extractor, last_good_extractor, extractor_ok,
-                                       extractor_error, extractor_updated, extractor_runs, last_good_stats)
-               VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                       extractor_error, extractor_updated, extractor_runs, last_good_stats, context_hash)
+               VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT(url_key) DO UPDATE SET
                    url=excluded.url,
+                   context_hash=excluded.context_hash,
                    extractor=CASE WHEN excluded.extractor_ok=1 THEN excluded.extractor ELSE url_readers.extractor END,
                    last_good_extractor=CASE WHEN excluded.extractor_ok=1 THEN excluded.extractor ELSE url_readers.last_good_extractor END,
                    extractor_ok=CASE WHEN excluded.extractor_ok=1 THEN 1 ELSE url_readers.extractor_ok END,
@@ -614,25 +698,74 @@ def save_shared_reader(url: str, extractor: str, ok: bool = True, error: Optiona
                    extractor_updated=excluded.extractor_updated,
                    extractor_runs=CASE WHEN excluded.extractor_ok=1 THEN url_readers.extractor_runs + 1 ELSE url_readers.extractor_runs END,
                    last_good_stats=COALESCE(excluded.last_good_stats, url_readers.last_good_stats)""",
-            (key, str(url)[:500], extractor, last_good, int(bool(ok)), error, ts, 1 if ok else 0, eff_stats),
+            (key, str(url)[:500], extractor, last_good, int(bool(ok)), error, ts, 1 if ok else 0, eff_stats, ctx_hash),
         )
         if ok and propagate:
-            rows = c.execute("SELECT id, url FROM sources WHERE method='agent'").fetchall()
-            match_ids = [r["id"] for r in rows if canonical_reader_url(r["url"]) == key]
+            rows = c.execute("SELECT id, url, notes, watch_id FROM sources WHERE method='agent'").fetchall()
+            f_cache: Dict[Optional[int], List[Dict[str, Any]]] = {}
+            match_ids: List[int] = []
+            for r in rows:
+                if canonical_reader_url(r["url"]) != canon:
+                    continue
+                wid = r["watch_id"]
+                if wid not in f_cache:
+                    clauses = ["watch_id IS NULL"] if wid is None else ["(watch_id IS NULL OR watch_id=?)"]
+                    f_args = [] if wid is None else [wid]
+                    clauses.append("active=1")
+                    f_cache[wid] = [dict(fr) for fr in c.execute(f"SELECT * FROM filters WHERE {' AND '.join(clauses)}", f_args)]
+                if reader_context_hash(r["notes"] or "", f_cache[wid]) == ctx_hash:
+                    match_ids.append(r["id"])
             for sid in match_ids:
                 c.execute(
                     """UPDATE sources SET extractor=?, last_good_extractor=?, extractor_ok=1,
                        extractor_error=NULL, extractor_updated=?, last_good_updated=?,
                        last_good_stats=COALESCE(?, last_good_stats),
-                       fail_count=0, retry_after=NULL, last_error_kind=NULL
+                       fail_count=0, retry_after=NULL, last_error_kind=NULL,
+                       struct_fail_count=0, learn_fail_count=0, learn_retry_after=NULL,
+                       paused=0, filter_hash=?, filters_changed=0
                        WHERE id=?""",
-                    (extractor, extractor, ts, ts, eff_stats, sid),
+                    (extractor, extractor, ts, ts, eff_stats, f_hash, sid),
                 )
         c.commit()
 
 
+def mark_filters_changed(watch_id: Optional[int] = None) -> int:
+    """Flag learned agent sources whose effective active filters differ from their recorded filter_hash."""
+    with _lock, _conn() as c:
+        if watch_id is not None:
+            rows = c.execute(
+                "SELECT id, watch_id, filter_hash, filters_changed FROM sources "
+                "WHERE method='agent' AND extractor IS NOT NULL AND watch_id=?",
+                (watch_id,),
+            ).fetchall()
+        else:
+            rows = c.execute(
+                "SELECT id, watch_id, filter_hash, filters_changed FROM sources "
+                "WHERE method='agent' AND extractor IS NOT NULL"
+            ).fetchall()
+        if not rows:
+            return 0
+        hash_cache: Dict[Optional[int], str] = {}
+        flagged = 0
+        for r in rows:
+            wid = r["watch_id"]
+            if wid not in hash_cache:
+                clauses = ["watch_id IS NULL"] if wid is None else ["(watch_id IS NULL OR watch_id=?)"]
+                f_args = [] if wid is None else [wid]
+                clauses.append("active=1")
+                fs_rows = [dict(fr) for fr in c.execute(f"SELECT * FROM filters WHERE {' AND '.join(clauses)}", f_args)]
+                hash_cache[wid] = filters_hash(fs_rows)
+            changed = int(r["filter_hash"] != hash_cache[wid])
+            if int(r["filters_changed"] or 0) != changed:
+                c.execute("UPDATE sources SET filters_changed=? WHERE id=?", (changed, r["id"]))
+            if changed:
+                flagged += 1
+        c.commit()
+        return flagged
+
+
 # ---------- sources ----------
-def sources(active_only: bool = False, watch_id: Any = _UNSET) -> List[Dict[str, Any]]:
+def sources(active_only: bool = False, watch_id: Any = _UNSET, include_code: bool = True) -> List[Dict[str, Any]]:
     clauses, args = [], []
     if active_only:
         clauses.append("active=1")
@@ -672,7 +805,20 @@ def sources(active_only: bool = False, watch_id: Any = _UNSET) -> List[Dict[str,
         for s in out:
             s["last"] = last_map.get(s["id"])
             s["open_items"] = open_map.get(s["id"], 0)
+            s["has_extractor"] = bool(s.get("extractor"))
+            s["has_last_good_extractor"] = bool(s.get("last_good_extractor"))
+            if not include_code:
+                s.pop("extractor", None)
+                s.pop("last_good_extractor", None)
     return out
+
+
+def source_code(sid: int) -> Optional[Dict[str, Any]]:
+    return _one(
+        "SELECT id, extractor, last_good_extractor, extractor_ok, extractor_updated, extractor_runs, extractor_error "
+        "FROM sources WHERE id=?",
+        (sid,),
+    )
 
 
 def source_by_id(sid: int) -> Optional[Dict[str, Any]]:
@@ -687,10 +833,12 @@ def source_open_item_count(sid: int) -> int:
 def add_source(name: str, url: str, notes: str = "", method: str = "agent", plugin: Optional[str] = None,
                watch_id: Optional[int] = None) -> int:
     clean_url = url.strip()[:500]
+    clean_notes = notes.strip()[:1000]
     sid = _exec("INSERT INTO sources(name, url, notes, method, plugin, watch_id, created) VALUES(?, ?, ?, ?, ?, ?, ?)",
-                (name.strip()[:80], clean_url, notes.strip()[:1000], method, plugin, watch_id, now()))
+                (name.strip()[:80], clean_url, clean_notes, method, plugin, watch_id, now()))
     if method == "agent":
-        shared = get_shared_reader(clean_url)
+        fs = filters_for_watch(watch_id, active_only=True)
+        shared = get_shared_reader(clean_url, notes=clean_notes, fs=fs)
         if shared and shared.get("extractor"):
             ts = shared.get("extractor_updated") or now()
             update_source(
@@ -702,6 +850,8 @@ def add_source(name: str, url: str, notes: str = "", method: str = "agent", plug
                 extractor_updated=ts,
                 last_good_updated=ts,
                 last_good_stats=shared.get("last_good_stats"),
+                filter_hash=filters_hash(fs),
+                filters_changed=0,
             )
     return sid
 
@@ -710,6 +860,8 @@ _SOURCE_UPDATABLE = {
     "name", "url", "notes", "active", "recipe", "extractor", "extractor_ok", "extractor_error",
     "extractor_updated", "extractor_runs", "watch_id", "last_good_extractor", "last_good_updated",
     "last_good_stats", "fail_count", "retry_after", "last_error_kind", "filter_hash",
+    "struct_fail_count", "learn_fail_count", "learn_retry_after", "paused", "filters_changed",
+    "baseline_done",
 }
 
 
@@ -760,22 +912,61 @@ def filters_for_watch(watch_id: Optional[int], active_only: bool = True) -> List
     return _rows(f"SELECT * FROM filters WHERE {' AND '.join(clauses)} ORDER BY watch_id IS NOT NULL, kind, id", args)
 
 
+def filter_by_id(fid: int) -> Optional[Dict[str, Any]]:
+    return _one("SELECT * FROM filters WHERE id=?", (fid,))
+
+
 def add_filter(kind: str, value: str, watch_id: Optional[int] = None) -> int:
     val = (value or "").strip()[:500]
     if kind not in FILTER_KINDS or not val:
         raise ValueError("invalid filter")
     if kind == "deadline_within" and (not val.isdigit() or int(val) <= 0):
         raise ValueError("deadline_within must be a positive number of days")
-    return _exec("INSERT INTO filters(kind, value, watch_id, created) VALUES(?, ?, ?, ?)",
-                 (kind, val, watch_id, now()))
+    fid = _exec("INSERT INTO filters(kind, value, watch_id, created) VALUES(?, ?, ?, ?)",
+                (kind, val, watch_id, now()))
+    mark_filters_changed(watch_id)
+    return fid
 
 
-def update_filter(fid: int, active: bool) -> bool:
-    return _exec("UPDATE filters SET active=? WHERE id=?", (int(active), fid)) > 0
+def update_filter(fid: int, active: Any = _UNSET, kind: Any = _UNSET, value: Any = _UNSET) -> bool:
+    cur = filter_by_id(fid)
+    if not cur:
+        return False
+    allowed: Dict[str, Any] = {}
+    eff_kind = cur["kind"]
+    if kind is not _UNSET:
+        clean_kind = str(kind or "").strip()
+        if clean_kind not in FILTER_KINDS:
+            raise ValueError("invalid filter kind")
+        allowed["kind"] = clean_kind
+        eff_kind = clean_kind
+    eff_val = cur["value"]
+    if value is not _UNSET:
+        clean_val = str(value or "").strip()[:500]
+        if not clean_val:
+            raise ValueError("filter value cannot be empty")
+        allowed["value"] = clean_val
+        eff_val = clean_val
+    if eff_kind == "deadline_within" and (not str(eff_val).isdigit() or int(eff_val) <= 0):
+        raise ValueError("deadline_within must be a positive number of days")
+    if active is not _UNSET:
+        allowed["active"] = int(bool(active))
+    if not allowed:
+        return False
+    changed = _exec(f"UPDATE filters SET {', '.join(k + '=?' for k in allowed)} WHERE id=?", (*allowed.values(), fid)) > 0
+    if changed:
+        mark_filters_changed(cur.get("watch_id"))
+    return changed
 
 
 def delete_filter(fid: int) -> bool:
-    return _exec("DELETE FROM filters WHERE id=?", (fid,)) > 0
+    cur = filter_by_id(fid)
+    if not cur:
+        return False
+    deleted = _exec("DELETE FROM filters WHERE id=?", (fid,)) > 0
+    if deleted:
+        mark_filters_changed(cur.get("watch_id"))
+    return deleted
 
 
 # ---------- scans ----------
@@ -887,7 +1078,7 @@ def delete_discovery(discovery_id: int) -> None:
 
 
 # ---------- items & history ----------
-_TRACKED_ITEM_FIELDS = ("title", "deadline", "start_date", "location", "org", "category", "summary", "extra")
+_TRACKED_ITEM_FIELDS = ("title", "deadline", "start_date", "location", "org", "category")
 
 
 def _norm_field(v: Any) -> Optional[str]:
@@ -917,7 +1108,8 @@ def _build_change_summary(reopened: bool, changes: List[Tuple[str, Optional[str]
     return "; ".join(parts)[:240], kind
 
 
-def save_item(scan_id: int, source: Dict[str, Any], it: Dict[str, Any]) -> bool:
+def save_item(scan_id: int, source: Dict[str, Any], it: Dict[str, Any], *,
+              match: Any = _UNSET, match_key: Any = _UNSET, notified: Any = _UNSET) -> bool:
     """Insert or refresh an item, recording field history. Never resurrects closed items as new."""
     t = now()
     wid = source.get("watch_id")
@@ -939,13 +1131,14 @@ def save_item(scan_id: int, source: Dict[str, Any], it: Dict[str, Any]) -> bool:
         if exists:
             ex = dict(exists)
             item_id = ex["id"]
-            reopened = ex.get("status") == "gone"
+            reopened = ex.get("status") == "gone" and match != 0
             changes: List[Tuple[str, Optional[str], Optional[str]]] = []
-            for field in _TRACKED_ITEM_FIELDS:
-                old_v = _norm_field(ex.get(field))
-                new_v = _norm_field(it.get(field))
-                if old_v != new_v:
-                    changes.append((field, old_v, new_v))
+            if match != 0:
+                for field in _TRACKED_ITEM_FIELDS:
+                    old_v = _norm_field(ex.get(field))
+                    new_v = _norm_field(it.get(field))
+                    if old_v != new_v:
+                        changes.append((field, old_v, new_v))
             hist_rows: List[Tuple[str, int, str, str, str, Optional[str], Optional[str]]] = []
             if reopened:
                 hist_rows.append((item_id, scan_id, t, "reopened", "status", "gone", "open"))
@@ -964,13 +1157,23 @@ def save_item(scan_id: int, source: Dict[str, Any], it: Dict[str, Any]) -> bool:
                 summary = ex.get("change_summary")
                 change_kind = ex.get("last_change_kind")
                 updated_at = ex.get("updated_at")
+            if match is not _UNSET:
+                new_match = match
+                new_match_key = None if match_key is _UNSET else match_key
+            elif ex.get("match_key") == "det_excluded":
+                new_match = None
+                new_match_key = None
+            else:
+                new_match = ex.get("match")
+                new_match_key = ex.get("match_key") if match_key is _UNSET else match_key
+            new_notified = ex.get("notified", 0) if notified is _UNSET else int(bool(notified))
             c.execute(
                 """UPDATE items SET title=?, org=?, category=?, url=?, deadline=?, start_date=?, location=?,
                    summary=?, extra=?, watch_id=?, status='open', last_scan=?, last_seen=?,
-                   updated_at=?, change_summary=?, last_change_kind=? WHERE id=?""",
+                   updated_at=?, change_summary=?, last_change_kind=?, match=?, match_key=?, notified=? WHERE id=?""",
                 (it["title"], it.get("org"), it.get("category"), it["url"], it.get("deadline"),
                  it.get("start_date"), it.get("location"), it.get("summary"), it.get("extra"), wid, scan_id, t,
-                 updated_at, summary, change_kind, item_id),
+                 updated_at, summary, change_kind, new_match, new_match_key, new_notified, item_id),
             )
             c.execute(
                 "INSERT OR REPLACE INTO scan_items(scan_id, item_id, is_new, is_updated) VALUES(?, ?, 0, ?)",
@@ -980,16 +1183,20 @@ def save_item(scan_id: int, source: Dict[str, Any], it: Dict[str, Any]) -> bool:
             return False
 
         item_id = it["id"]
+        ins_match = None if match is _UNSET else match
+        ins_match_key = None if match_key is _UNSET else match_key
+        ins_notified = 0 if notified is _UNSET else int(bool(notified))
         c.execute(
             """INSERT INTO items(id, source_id, source_name, title, org, category, url, deadline, start_date,
-               location, summary, extra, watch_id, first_scan, last_scan, first_seen, last_seen)
-               VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               location, summary, extra, watch_id, first_scan, last_scan, first_seen, last_seen,
+               match, match_key, notified)
+               VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (item_id, src_id, source["name"], it["title"], it.get("org"), it.get("category"),
              it["url"], it.get("deadline"), it.get("start_date"), it.get("location"), it.get("summary"),
-             it.get("extra"), wid, scan_id, scan_id, t, t),
+             it.get("extra"), wid, scan_id, scan_id, t, t, ins_match, ins_match_key, ins_notified),
         )
-        c.execute("INSERT OR REPLACE INTO scan_items(scan_id, item_id, is_new, is_updated) VALUES(?, ?, 1, 0)",
-                  (scan_id, item_id))
+        c.execute("INSERT OR REPLACE INTO scan_items(scan_id, item_id, is_new, is_updated) VALUES(?, ?, ?, 0)",
+                  (scan_id, item_id, 0 if ins_match == 0 else 1))
         c.commit()
         return True
 
@@ -1026,30 +1233,255 @@ def mark_gone(source: Dict[str, Any], scan_id: int) -> int:
         return len(ids)
 
 
-def items(limit: Optional[int] = None, offset: int = 0, watch_id: Any = _UNSET) -> List[Dict[str, Any]]:
-    clauses, args = [], []
+def _items_where(
+    watch_id: Any = _UNSET,
+    *,
+    status: Optional[str] = None,
+    match_only: bool = False,
+    match: Optional[str] = None,
+    exclude_hidden: bool = False,
+    exclude_applied: bool = False,
+    exclude_expired: bool = False,
+    snoozed: str = "all",
+    only_updated: bool = False,
+    categories: Optional[List[str]] = None,
+    source_name: Optional[str] = None,
+    source_id: Optional[int] = None,
+    search: Optional[str] = None,
+) -> Tuple[str, List[Any]]:
+    clauses: List[str] = []
+    args: List[Any] = []
+    today = now()[:10]
     if watch_id is None:
         clauses.append("COALESCE(s.watch_id, i.watch_id) IS NULL")
     elif watch_id is not _UNSET:
         clauses.append("COALESCE(s.watch_id, i.watch_id)=?")
         args.append(watch_id)
-    where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
-    sql = (f"SELECT i.*, COALESCE(s.watch_id, i.watch_id) AS watch_id "
-           f"FROM items i LEFT JOIN sources s ON s.id = i.source_id{where} ORDER BY i.first_seen DESC")
+    if status and status != "all":
+        clauses.append("i.status=?")
+        args.append(status)
+    if match == "0":
+        clauses.append("i.match=0")
+    elif match == "1" or match_only:
+        clauses.append("COALESCE(i.match, 1)=1")
+    if exclude_hidden:
+        clauses.append("(i.action IS NULL OR i.action != 'hidden')")
+    if exclude_applied:
+        clauses.append("(i.action IS NULL OR i.action != 'applied')")
+    if exclude_expired:
+        clauses.append(
+            "(COALESCE(NULLIF(i.deadline,''), NULLIF(i.start_date,'')) IS NULL "
+            "OR COALESCE(NULLIF(i.deadline,''), NULLIF(i.start_date,'')) >= ?)"
+        )
+        args.append(today)
+    if snoozed == "exclude":
+        clauses.append("(i.snoozed_until IS NULL OR i.snoozed_until <= ?)")
+        args.append(today)
+    elif snoozed == "only":
+        clauses.append("(i.snoozed_until IS NOT NULL AND i.snoozed_until > ?)")
+        args.append(today)
+    if only_updated:
+        recent_cutoff = (datetime.now() - timedelta(hours=72)).strftime(TS)
+        clauses.append(
+            "(i.updated_at IS NOT NULL AND i.last_change_kind IS NOT NULL "
+            "AND i.last_change_kind != 'closed' AND i.updated_at >= ?)"
+        )
+        args.append(recent_cutoff)
+    if categories:
+        cats = [c for c in categories if c]
+        if cats:
+            placeholders = ",".join("?" for _ in cats)
+            clauses.append(f"COALESCE(NULLIF(TRIM(i.category), ''), 'Other') IN ({placeholders})")
+            args.extend(cats)
+    if source_name:
+        clauses.append("i.source_name=?")
+        args.append(source_name)
+    if source_id is not None:
+        clauses.append("i.source_id=?")
+        args.append(source_id)
+    if search:
+        for tok in str(search).strip().split():
+            esc_tok = _tr_lower(tok).replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            pat = f"%{esc_tok}%"
+            clauses.append(
+                "(norm_tr(i.title) LIKE ? ESCAPE '\\' OR norm_tr(i.org) LIKE ? ESCAPE '\\' "
+                "OR norm_tr(i.summary) LIKE ? ESCAPE '\\' OR norm_tr(i.category) LIKE ? ESCAPE '\\' "
+                "OR norm_tr(i.location) LIKE ? ESCAPE '\\' OR norm_tr(i.source_name) LIKE ? ESCAPE '\\' "
+                "OR norm_tr(i.change_summary) LIKE ? ESCAPE '\\')"
+            )
+            args.extend([pat] * 7)
+    return (" WHERE " + " AND ".join(clauses)) if clauses else "", args
+
+
+def items(
+    limit: Optional[int] = None,
+    offset: int = 0,
+    watch_id: Any = _UNSET,
+    *,
+    sort: str = "first_seen",
+    **filters,
+) -> List[Dict[str, Any]]:
+    where, args = _items_where(watch_id=watch_id, **filters)
+    if sort == "deadline":
+        order = (
+            "CASE WHEN COALESCE(NULLIF(i.deadline,''), NULLIF(i.start_date,'')) IS NULL THEN 1 ELSE 0 END, "
+            "COALESCE(NULLIF(i.deadline,''), NULLIF(i.start_date,'')) ASC, i.first_seen DESC"
+        )
+    elif sort == "updated":
+        order = "COALESCE(i.updated_at, i.first_seen) DESC, i.first_seen DESC"
+    else:
+        order = "i.first_seen DESC"
+    sql = (
+        f"SELECT i.*, COALESCE(s.watch_id, i.watch_id) AS watch_id "
+        f"FROM items i LEFT JOIN sources s ON s.id = i.source_id{where} ORDER BY {order}"
+    )
     if limit is not None:
         sql += " LIMIT ? OFFSET ?"
         args.extend([max(1, int(limit)), max(0, int(offset))])
     return _rows(sql, args)
 
 
-def items_count(watch_id: Any = _UNSET) -> int:
-    if watch_id is _UNSET:
-        return int(_one("SELECT COUNT(*) n FROM items")["n"])
-    if watch_id is None:
-        return int(_one("SELECT COUNT(*) n FROM items i LEFT JOIN sources s ON s.id = i.source_id "
-                        "WHERE COALESCE(s.watch_id, i.watch_id) IS NULL")["n"])
-    return int(_one("SELECT COUNT(*) n FROM items i LEFT JOIN sources s ON s.id = i.source_id "
-                    "WHERE COALESCE(s.watch_id, i.watch_id)=?", (watch_id,))["n"])
+def items_count(watch_id: Any = _UNSET, **filters) -> int:
+    where, args = _items_where(watch_id=watch_id, **filters)
+    row = _one(
+        f"SELECT COUNT(*) n FROM items i LEFT JOIN sources s ON s.id = i.source_id{where}",
+        args,
+    )
+    return int(row["n"]) if row else 0
+
+
+def items_facets(
+    watch_id: Any = _UNSET,
+    *,
+    status: Optional[str] = "open",
+    match_only: bool = True,
+    exclude_hidden: bool = True,
+    exclude_applied: bool = True,
+    exclude_expired: bool = True,
+    snoozed: str = "exclude",
+) -> Dict[str, Any]:
+    today = now()[:10]
+    recent_cutoff = (datetime.now() - timedelta(hours=72)).strftime(TS)
+    where_base, args_base = _items_where(
+        watch_id=watch_id,
+        status=status,
+        match_only=match_only,
+        exclude_hidden=exclude_hidden,
+        exclude_applied=exclude_applied,
+        exclude_expired=exclude_expired,
+        snoozed=snoozed,
+    )
+    where_scope, args_scope = _items_where(
+        watch_id=watch_id,
+        status=status,
+        match_only=match_only,
+        exclude_hidden=exclude_hidden,
+        exclude_applied=exclude_applied,
+        exclude_expired=exclude_expired,
+        snoozed="only",
+    )
+    with _lock, _conn() as c:
+        cat_rows = c.execute(
+            f"SELECT COALESCE(NULLIF(TRIM(i.category), ''), 'Other') AS cat, COUNT(*) AS n "
+            f"FROM items i LEFT JOIN sources s ON s.id = i.source_id{where_base} GROUP BY cat ORDER BY n DESC, cat ASC",
+            args_base,
+        ).fetchall()
+        src_rows = c.execute(
+            f"SELECT DISTINCT i.source_name FROM items i LEFT JOIN sources s ON s.id = i.source_id{where_base} "
+            f"ORDER BY i.source_name COLLATE NOCASE",
+            args_base,
+        ).fetchall()
+        upd_clause = (where_base + " AND " if where_base else " WHERE ") + (
+            "(i.updated_at IS NOT NULL AND i.last_change_kind IS NOT NULL "
+            "AND i.last_change_kind != 'closed' AND i.updated_at >= ?)"
+        )
+        upd_count = int(c.execute(
+            f"SELECT COUNT(*) n FROM items i LEFT JOIN sources s ON s.id = i.source_id{upd_clause}",
+            [*args_base, recent_cutoff],
+        ).fetchone()["n"])
+        sn_count = int(c.execute(
+            f"SELECT COUNT(*) n FROM items i LEFT JOIN sources s ON s.id = i.source_id{where_scope}",
+            args_scope,
+        ).fetchone()["n"])
+    return {
+        "categories": {r["cat"]: r["n"] for r in cat_rows},
+        "sources": [r["source_name"] for r in src_rows if r["source_name"]],
+        "updated_count": upd_count,
+        "snoozed_count": sn_count,
+    }
+
+
+def counts() -> Dict[str, Any]:
+    today = now()[:10]
+    week_end = (date.today() + timedelta(days=7)).isoformat()
+    recent_cutoff = (datetime.now() - timedelta(hours=72)).strftime(TS)
+    with _lock, _conn() as c:
+        base_where = (
+            "i.status='open' AND COALESCE(i.match,1)=1 "
+            "AND (i.action IS NULL OR i.action NOT IN ('hidden','applied')) "
+            "AND (COALESCE(NULLIF(i.deadline,''), NULLIF(i.start_date,'')) IS NULL "
+            "OR COALESCE(NULLIF(i.deadline,''), NULLIF(i.start_date,'')) >= ?)"
+        )
+        rows = c.execute(
+            f"""SELECT COALESCE(s.watch_id, i.watch_id) AS wid,
+                       i.first_seen, i.updated_at, i.last_change_kind,
+                       i.snoozed_until, i.deadline
+                FROM items i LEFT JOIN sources s ON s.id = i.source_id
+                WHERE {base_where}""",
+            (today,),
+        ).fetchall()
+        feed_open = 0
+        feed_new = 0
+        feed_updated = 0
+        feed_snoozed = 0
+        closing_week = 0
+        watch_map: Dict[str, Dict[str, int]] = {}
+        for w in c.execute("SELECT id FROM watches").fetchall():
+            watch_map[str(w["id"])] = {"open": 0, "new": 0, "snoozed": 0, "closing_this_week": 0}
+        for r in rows:
+            wid = r["wid"]
+            wentry = (
+                watch_map.setdefault(str(wid), {"open": 0, "new": 0, "snoozed": 0, "closing_this_week": 0})
+                if wid is not None else None
+            )
+            sn = bool(r["snoozed_until"] and r["snoozed_until"] > today)
+            if sn:
+                feed_snoozed += 1
+                if wentry is not None:
+                    wentry["snoozed"] += 1
+                continue
+            feed_open += 1
+            if wentry is not None:
+                wentry["open"] += 1
+            if r["first_seen"] and r["first_seen"] >= recent_cutoff:
+                feed_new += 1
+                if wentry is not None:
+                    wentry["new"] += 1
+            if r["updated_at"] and r["last_change_kind"] and r["last_change_kind"] != "closed" and r["updated_at"] >= recent_cutoff:
+                feed_updated += 1
+            dl = r["deadline"]
+            if dl and today <= dl <= week_end:
+                closing_week += 1
+                if wentry is not None:
+                    wentry["closing_this_week"] += 1
+        agenda_saved = int(c.execute("SELECT COUNT(*) n FROM items WHERE action='saved'").fetchone()["n"])
+        agenda_applied = int(c.execute("SELECT COUNT(*) n FROM items WHERE action='applied'").fetchone()["n"])
+        sources_active = int(c.execute("SELECT COUNT(*) n FROM sources WHERE active=1").fetchone()["n"])
+        filters_global_active = int(c.execute("SELECT COUNT(*) n FROM filters WHERE watch_id IS NULL AND active=1").fetchone()["n"])
+        items_total = int(c.execute("SELECT COUNT(*) n FROM items").fetchone()["n"])
+    return {
+        "feed_open": feed_open,
+        "feed_new": feed_new,
+        "feed_updated": feed_updated,
+        "feed_snoozed": feed_snoozed,
+        "closing_this_week": closing_week,
+        "agenda_saved": agenda_saved,
+        "agenda_applied": agenda_applied,
+        "sources_active": sources_active,
+        "filters_global_active": filters_global_active,
+        "items_total": items_total,
+        "watches": watch_map,
+    }
 
 
 def agenda_items() -> List[Dict[str, Any]]:
@@ -1112,14 +1544,69 @@ def mark_notified(ids: Iterable[str]) -> None:
         c.commit()
 
 
+def mark_source_scan_notified(source: Dict[str, Any], scan_id: int) -> None:
+    with _lock, _conn() as c:
+        if source.get("id") is not None:
+            c.execute("UPDATE items SET notified=1 WHERE source_id=? AND last_scan=?", (source["id"], scan_id))
+        else:
+            c.execute("UPDATE items SET notified=1 WHERE source_name=? AND last_scan=?", (source["name"], scan_id))
+        c.commit()
+
+
+def log_notification(scan_id: Optional[int], channel: str, ok: bool, message: str = "") -> int:
+    return _exec(
+        "INSERT INTO notification_log(scan_id, channel, ok, message, created) VALUES(?, ?, ?, ?, ?)",
+        (scan_id, str(channel)[:40], int(bool(ok)), str(message or "")[:500], now()),
+    )
+
+
+def recent_notify_errors() -> List[Dict[str, Any]]:
+    try:
+        dismissed_id = int(get_settings().get("notify_errors_dismissed_id") or 0)
+    except (TypeError, ValueError):
+        dismissed_id = 0
+    rows = _rows(
+        """SELECT nl.* FROM notification_log nl
+           JOIN (
+               SELECT channel, MAX(id) AS max_id FROM notification_log GROUP BY channel
+           ) latest ON latest.channel = nl.channel AND latest.max_id = nl.id
+           WHERE nl.ok=0 AND nl.id > ? ORDER BY nl.id DESC""",
+        (dismissed_id,),
+    )
+    return rows
+
+
+def dismiss_notify_errors() -> None:
+    row = _one("SELECT COALESCE(MAX(id), 0) AS max_id FROM notification_log")
+    max_id = int(row["max_id"]) if row else 0
+    set_settings({"notify_errors_dismissed_id": str(max_id)})
+
+
 # ---------- agent usage ----------
 def log_agent_call(agent: str, model: str, ok: bool, error: str = "", resets_at: Optional[str] = None) -> None:
     t = now()
-    _exec("""INSERT INTO agent_usage(agent, model, day, calls, ok, last_call, last_error, resets_at)
-             VALUES(?, ?, ?, 1, ?, ?, ?, ?)
-             ON CONFLICT(agent, model, day) DO UPDATE SET calls=calls+1, ok=ok+excluded.ok, last_call=excluded.last_call,
-             last_error=excluded.last_error, resets_at=excluded.resets_at""",
-          (agent, model or "", t[:10], int(ok), t, error[-400:], resets_at))
+    with _lock, _conn() as c:
+        c.execute(
+            """INSERT INTO agent_usage(agent, model, day, calls, ok, last_call, last_error, resets_at)
+               VALUES(?, ?, ?, 1, ?, ?, ?, ?)
+               ON CONFLICT(agent, model, day) DO UPDATE SET
+                   calls=calls+1,
+                   ok=ok+excluded.ok,
+                   last_call=excluded.last_call,
+                   last_error=excluded.last_error,
+                   resets_at=CASE
+                       WHEN excluded.ok=1 THEN NULL
+                       WHEN excluded.resets_at IS NOT NULL THEN excluded.resets_at
+                       ELSE agent_usage.resets_at
+                   END""",
+            (agent, model or "", t[:10], int(ok), t, error[-400:], resets_at),
+        )
+        if ok:
+            c.execute(
+                "UPDATE agent_usage SET resets_at=NULL WHERE agent=? AND model=? AND resets_at IS NOT NULL",
+                (agent, model or ""),
+            )
+        c.commit()
 
 
 def agent_blocked_until(agent: str, model: str) -> Optional[str]:
@@ -1141,12 +1628,49 @@ def agent_usage(agent: str) -> List[Dict[str, Any]]:
 def items_needing_match(scan_id: int, key: str, watch_id: Any = _UNSET) -> List[Dict[str, Any]]:
     if watch_id is _UNSET:
         return _rows("""SELECT i.* FROM scan_items si JOIN items i ON i.id = si.item_id
-                        WHERE si.scan_id=? AND (i.match_key IS NULL OR i.match_key != ?)""", (scan_id, key))
+                        WHERE si.scan_id=? AND (i.match_key IS NULL OR i.match_key != ?)
+                        AND COALESCE(i.match_key, '') != 'det_excluded'""", (scan_id, key))
     return _rows("""SELECT i.* FROM scan_items si
                     JOIN items i ON i.id = si.item_id
                     LEFT JOIN sources s ON s.id = i.source_id
                     WHERE si.scan_id=? AND COALESCE(s.watch_id, i.watch_id) IS ?
-                    AND (i.match_key IS NULL OR i.match_key != ?)""", (scan_id, watch_id, key))
+                    AND (i.match_key IS NULL OR i.match_key != ?)
+                    AND COALESCE(i.match_key, '') != 'det_excluded'""", (scan_id, watch_id, key))
+
+
+def open_items_for_scope(watch_id: Optional[int]) -> List[Dict[str, Any]]:
+    if watch_id is None:
+        return _rows(
+            "SELECT i.*, COALESCE(s.watch_id, i.watch_id) AS watch_id "
+            "FROM items i LEFT JOIN sources s ON s.id = i.source_id "
+            "WHERE i.status='open' AND COALESCE(s.watch_id, i.watch_id) IS NULL"
+        )
+    return _rows(
+        "SELECT i.*, COALESCE(s.watch_id, i.watch_id) AS watch_id "
+        "FROM items i LEFT JOIN sources s ON s.id = i.source_id "
+        "WHERE i.status='open' AND COALESCE(s.watch_id, i.watch_id)=?",
+        (watch_id,),
+    )
+
+
+def open_items_needing_match(key: str, watch_id: Optional[int]) -> List[Dict[str, Any]]:
+    return _rows(
+        """SELECT i.* FROM items i
+           LEFT JOIN sources s ON s.id = i.source_id
+           WHERE i.status='open' AND COALESCE(s.watch_id, i.watch_id) IS ?
+           AND (i.match_key IS NULL OR i.match_key != ?)
+           AND COALESCE(i.match_key, '') != 'det_excluded'""",
+        (watch_id, key),
+    )
+
+
+def update_item_matches(rows: Iterable[Tuple[Optional[int], Optional[str], str]]) -> None:
+    batch = list(rows)
+    if not batch:
+        return
+    with _lock, _conn() as c:
+        c.executemany("UPDATE items SET match=?, match_key=? WHERE id=?", batch)
+        c.commit()
 
 
 def set_matches(decisions: Dict[str, bool], key: str) -> None:

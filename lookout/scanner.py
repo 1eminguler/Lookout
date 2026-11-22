@@ -243,6 +243,20 @@ def _scan_one(scan_id: int, source: Dict[str, Any], fs: List[Dict[str, Any]], pl
                 progress["current"].remove(source["name"])
 
 
+def _scan_label(trigger: str, only: Optional[List[int]], srcs: List[Dict[str, Any]]) -> str:
+    if trigger == "scheduled":
+        return "Daily scan"
+    if only:
+        names = [s["name"] for s in srcs] or [s["name"] for s in db.sources() if s["id"] in only]
+        if len(names) == 1:
+            return names[0]
+        if len(names) == 2:
+            return f"{names[0]} and {names[1]}"
+        if len(names) > 2:
+            return f"{names[0]}, {names[1]} and {len(names) - 2} more"
+    return "All sources"
+
+
 def run_scan(trigger: str = "manual", only: Optional[List[int]] = None) -> Optional[int]:
     """Blocking scan. Returns the scan id (None if one is already running)."""
     with _lock:
@@ -257,7 +271,8 @@ def run_scan(trigger: str = "manual", only: Optional[List[int]] = None) -> Optio
         srcs = [s for s in db.sources(active_only=True) if not only or s["id"] in only]
         if not settings["agent"]:
             srcs = [s for s in srcs if s["method"] == "plugin"]
-        scan_id = db.start_scan(trigger, settings["agent"], settings["model"], fs)
+        label = _scan_label(trigger, only, srcs)
+        scan_id = db.start_scan(trigger, settings["agent"], settings["model"], fs, label)
         progress.update(scan_id=scan_id, total=len(srcs))
         workers = max(1, int(settings.get("parallel") or 2))
         plugin_srcs = [s for s in srcs if s["method"] == "plugin"]

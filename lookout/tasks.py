@@ -93,16 +93,26 @@ Their standing filters, for context:
 Sources they already have (do not suggest these again):
 {existing}
 
+## Time
+You have about {minutes} minutes in total. Spend at most 2 minutes on any one candidate. Write `title.txt` and an
+initial `sources.json` (even `[]`) in the first minute, then REWRITE `sources.json` every time you confirm a new
+source, so nothing is lost if you run out of time.
+
 ## Steps
-1. Use a search engine in the browser (for example https://duckduckgo.com/html/?q=...) with several different
-   queries, and open the most promising results.
+1. Find candidates. If your own tools include a web search, use it first (several different queries, in the user's
+   language and in English). Otherwise use a search engine in the browser, e.g. https://duckduckgo.com/html/?q=...
+   or https://www.bing.com/search?q=... . If a search engine shows a CAPTCHA, switch to another one.
 2. Prefer pages that LIST many items and are updated regularly (job boards, an organisation's own careers/events
    page, official announcement pages). Avoid news articles, blog posts, aggregators full of ads, and sites that need
    a login or show CAPTCHAs.
-3. For each candidate, check that the listing page actually loads and currently shows relevant items.
-4. Write `sources.json`: a JSON array of 3 to 12 objects:
+3. For each candidate, open the listing page once and check that it loads and currently shows relevant items.
+   Then add it to `sources.json` right away.
+4. `sources.json` is a JSON array of 3 to 12 objects:
    {{"name": short name, "url": the listing page itself (not the home page), "why": one sentence,
      "notes": tips for scanning it later (which filter/tab to use, where dates are), "sample": one item title you saw}}
+5. `title.txt` holds a 2-5 word title for the request, in the same language the user wrote in, no quotes, no trailing
+   period (for example: Bilgisayar mühendisliği staj).
+6. Stop when you have about 8 good sources or when time is nearly up.
 
 {safety}"""
 
@@ -189,15 +199,51 @@ def classify(items: List[Dict[str, Any]], fs: List[Dict[str, Any]]) -> Dict[str,
     return {str(k): bool(v) for k, v in data.items()}
 
 
-def discover_sources(request: str) -> List[Dict[str, Any]]:
+_FILLER = {
+    "a", "an", "the", "for", "of", "in", "on", "to", "with", "about", "and", "or", "by", "from", "at", "that",
+    "find", "looking", "search", "searching", "want", "need", "show", "me", "my", "i", "am", "im", "please",
+    "any", "all", "new", "good", "best", "sites", "websites", "pages", "sources", "listings", "list", "watch",
+    "monitor", "track", "follow",
+    "için", "ilanları", "ilanlar", "ilanı", "ilan", "ve", "veya", "ile", "bir", "bu", "da", "de", "bul", "ara",
+    "arıyorum", "istiyorum", "siteleri", "siteler", "sayfaları", "kaynakları", "kaynaklar", "hakkında", "ilgili",
+    "olan", "tüm", "bütün",
+}
+
+
+def quick_title(request: str) -> str:
+    """Short local fallback title derived from the user's request."""
+    clean = re.sub(r"[^\w\s-]|_", " ", request or "")
+    words = [w.strip("-") for w in clean.split() if w.strip("-")]
+    kept = [w for w in words if w.replace("İ", "i").lower() not in _FILLER] or words
+    picked: List[str] = []
+    for w in kept[:5]:
+        cand = " ".join(picked + [w])
+        if picked and len(cand) > 48:
+            break
+        picked.append(w)
+    title = " ".join(picked)[:48].strip()
+    if not title:
+        return "Web search"
+    return title[0].upper() + title[1:]
+
+
+def discover_sources(request: str) -> Dict[str, Any]:
     s = db.get_settings()
+    # Searching and checking several sites takes longer than reading one.
+    minutes = max(8, int(s.get("agent_timeout_min") or 12) + 4)
     existing = "\n".join(f"- {x['name']}: {x['url']}" for x in db.sources()) or "- none"
     text = DISCOVER.format(browser=BROWSER.format(session="lookout-discover", headed=" --headed" if s.get("headed") == "1"
                                                   else ""),
                            request=request.strip()[:2000], filters=describe_filters(db.filters(True)),
-                           existing=existing, safety=SAFETY)
-    out = _run_agent(text, ["sources.json"], max(5, int(s.get("agent_timeout_min") or 12)) * 60, s)
+                           existing=existing, safety=SAFETY, minutes=minutes - 1)
+    out = _run_agent(text, ["sources.json"], minutes * 60, s, raw=["title.txt"])
     found = out["files"].get("sources.json")
     if found is None:
         raise RuntimeError("The agent did not return any sources. " + out["log"][-200:].strip())
-    return [x for x in found if isinstance(x, dict) and str(x.get("url", "")).startswith("http")]
+    lines = (out["raw"].get("title.txt") or "").strip().splitlines()
+    raw_title = lines[0].strip().strip("\"'`«»“”‘’").rstrip(".!?;:") if lines else ""
+    title = re.sub(r"\s+", " ", raw_title).strip()[:60] or None
+    return {
+        "sources": [x for x in found if isinstance(x, dict) and str(x.get("url", "")).startswith("http")],
+        "title": title,
+    }

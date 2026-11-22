@@ -103,6 +103,19 @@ CREATE TABLE IF NOT EXISTS agent_usage (
     resets_at TEXT,
     PRIMARY KEY (agent, model, day)
 );
+
+CREATE TABLE IF NOT EXISTS discoveries (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    started TEXT NOT NULL,
+    finished TEXT,
+    request TEXT,
+    title TEXT,
+    status TEXT DEFAULT 'running',        -- running | done | failed
+    agent TEXT,
+    model TEXT,
+    results TEXT,                         -- JSON array
+    error TEXT
+);
 """
 
 
@@ -121,6 +134,7 @@ MIGRATIONS = {
     "sources": {"extractor": "TEXT", "extractor_ok": "INTEGER DEFAULT 0", "extractor_error": "TEXT",
                 "extractor_updated": "TEXT", "extractor_runs": "INTEGER DEFAULT 0"},
     "items": {"match": "INTEGER", "match_key": "TEXT"},
+    "scans": {"label": "TEXT"},
 }
 
 
@@ -230,9 +244,10 @@ def delete_filter(fid: int) -> None:
 
 
 # ---------- scans ----------
-def start_scan(trigger: str, agent: str, model: str, filter_snapshot: List[Dict[str, Any]]) -> int:
-    return _exec("INSERT INTO scans(started, trigger, agent, model, filters) VALUES(?, ?, ?, ?, ?)",
-                 (now(), trigger, agent, model, json.dumps(filter_snapshot, ensure_ascii=False)))
+def start_scan(trigger: str, agent: str, model: str, filter_snapshot: List[Dict[str, Any]],
+               label: Optional[str] = None) -> int:
+    return _exec("INSERT INTO scans(started, trigger, agent, model, filters, label) VALUES(?, ?, ?, ?, ?, ?)",
+                 (now(), trigger, agent, model, json.dumps(filter_snapshot, ensure_ascii=False), label))
 
 
 def finish_scan(scan_id: int, status: str, note: str = "") -> None:
@@ -249,7 +264,7 @@ def record_source_result(scan_id: int, source: Dict[str, Any], ok: bool, count: 
 
 
 def scans(limit: int = 60) -> List[Dict[str, Any]]:
-    return _rows("SELECT id, started, finished, trigger, agent, model, status, found, new, note FROM scans "
+    return _rows("SELECT id, started, finished, trigger, agent, model, status, found, new, note, label FROM scans "
                  "ORDER BY id DESC LIMIT ?", (limit,))
 
 
@@ -273,6 +288,50 @@ def delete_scan(scan_id: int) -> None:
 
 def running_scan() -> Optional[Dict[str, Any]]:
     return _one("SELECT * FROM scans WHERE status='running' ORDER BY id DESC LIMIT 1")
+
+
+# ---------- discoveries ----------
+def start_discovery(request: str, title: str, agent: str, model: str) -> int:
+    return _exec("INSERT INTO discoveries(started, request, title, agent, model) VALUES(?, ?, ?, ?, ?)",
+                 (now(), request, title, agent, model))
+
+
+def finish_discovery(discovery_id: int, status: str, results: List[Dict[str, Any]], error: str = "",
+                     title: Optional[str] = None) -> None:
+    raw = json.dumps(results or [], ensure_ascii=False)
+    if title:
+        _exec("UPDATE discoveries SET finished=?, status=?, results=?, error=?, title=? WHERE id=?",
+              (now(), status, raw, error, title, discovery_id))
+    else:
+        _exec("UPDATE discoveries SET finished=?, status=?, results=?, error=? WHERE id=?",
+              (now(), status, raw, error, discovery_id))
+
+
+def discoveries(limit: int = 60) -> List[Dict[str, Any]]:
+    rows = _rows("SELECT id, started, finished, request, title, status, agent, model, results, error "
+                 "FROM discoveries ORDER BY id DESC LIMIT ?", (limit,))
+    for r in rows:
+        raw = r.pop("results")
+        try:
+            r["found"] = len(json.loads(raw)) if raw else 0
+        except (TypeError, ValueError):
+            r["found"] = 0
+    return rows
+
+
+def discovery_detail(discovery_id: int) -> Optional[Dict[str, Any]]:
+    d = _one("SELECT * FROM discoveries WHERE id=?", (discovery_id,))
+    if not d:
+        return None
+    try:
+        d["results"] = json.loads(d["results"] or "[]")
+    except (TypeError, ValueError):
+        d["results"] = []
+    return d
+
+
+def delete_discovery(discovery_id: int) -> None:
+    _exec("DELETE FROM discoveries WHERE id=?", (discovery_id,))
 
 
 # ---------- items ----------

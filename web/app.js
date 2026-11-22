@@ -151,15 +151,28 @@ function renderSide() {
   btn.disabled = p.running; btn.classList.toggle("spin", p.running);
   $("#scanLabel").textContent = p.running ? "Scanning" : "New scan";
   $("#scanSub").textContent = p.running ? `${p.done} of ${p.total}` : "";
+  const hh = $(".hist-head");
+  if (hh && hh.textContent !== "History") hh.textContent = "History";
+  const hist = [
+    ...S.scans.map((s) => ({ kind: "scan", ...s })),
+    ...(S.discoveries || []).map((d) => ({ kind: "search", ...d })),
+  ].sort((a, b) => (b.started || "").localeCompare(a.started || "") || b.id - a.id);
   let html = "", last = "";
-  for (const s of S.scans) {
-    const day = s.started.slice(0, 10), t0 = today0();
-    const label = day === iso(t0) ? "Today" : day === iso(new Date(t0 - 864e5)) ? "Yesterday" : short(day);
-    if (label !== last) { html += `<div class="day">${label}</div>`; last = label; }
-    const right = s.status === "running" ? '<i class="live"></i>' : s.status === "failed" ? '<span class="bad">failed</span>' : s.new ? `<span class="new">+${s.new}</span>` : `<span>${s.found}</span>`;
-    html += `<a href="#/scan/${s.id}" class="${route.view === "scan" && route.id === s.id ? "on" : ""}" title="${s.found} matching, ${s.new} new"><b>${s.trigger === "scheduled" ? "Daily scan" : "Scan"} at ${s.started.slice(11, 16)}</b>${right}</a>`;
+  for (const e of hist) {
+    const day = e.started.slice(0, 10), t0 = today0();
+    const dayLabel = day === iso(t0) ? "Today" : day === iso(new Date(t0 - 864e5)) ? "Yesterday" : short(day);
+    if (dayLabel !== last) { html += `<div class="day">${dayLabel}</div>`; last = dayLabel; }
+    if (e.kind === "search") {
+      const title = e.title || e.request || "Web search";
+      const right = e.status === "running" ? '<i class="live"></i>' : e.status === "failed" ? '<span class="bad">failed</span>' : `<span>${e.found || 0}</span>`;
+      html += `<a href="#/search/${e.id}" class="h-search ${route.view === "search" && route.id === e.id ? "on" : ""}" title="${esc(title)}">${I.search}<b>${esc(title)}</b>${right}</a>`;
+    } else {
+      const label = e.label || (e.trigger === "scheduled" ? "Daily scan" : "Scan"), hm = e.started.slice(11, 16);
+      const right = e.status === "running" ? '<i class="live"></i>' : e.status === "failed" ? '<span class="bad">failed</span>' : e.new ? `<span class="new">+${e.new}</span>` : `<span>${e.found}</span>`;
+      html += `<a href="#/scan/${e.id}" class="${route.view === "scan" && route.id === e.id ? "on" : ""}" title="${esc(`${label} · ${hm} (${e.found} matching, ${e.new} new)`)}"><span class="hl"><b>${esc(label)}</b><time>${hm}</time></span>${right}</a>`;
+    }
   }
-  $("#history").innerHTML = html || `<div class="day">Your scans will show up here.</div>`;
+  $("#history").innerHTML = html || `<div class="day">Your history will show up here.</div>`;
 }
 
 // ---------- item card ----------
@@ -188,12 +201,17 @@ function progressBox() {
 }
 
 // ---------- home ----------
+function candCard(c, k, discId = null) {
+  const have = S.sources.some((s) => s.url === c.url);
+  const attrs = discId !== null ? `data-disc-cand="${k}" data-disc-id="${discId}"` : `data-cand="${k}"`;
+  return `<div class="cand"><div><h4>${esc(c.name)}</h4><div class="u"><a href="${esc(safeUrl(c.url))}" data-ext target="_blank" rel="noopener noreferrer">${esc(c.url)}</a></div><p>${esc(c.why || "")}</p>${c.sample ? `<p class="muted" style="font-size:12px">Example: ${esc(c.sample)}</p>` : ""}</div>
+      <button class="btn sm" ${attrs} ${have ? "disabled" : ""}>${have ? "Added" : "Add source"}</button></div>`;
+}
 function renderHome() {
   const st = S.settings, d = S.discovery, open = openItems();
   const fresh = open.filter(isNew).length, week = open.filter((i) => { const x = daysTo(i.deadline); return x !== null && x <= 7; }).length;
   const hour = new Date().getHours(), greet = hour < 5 ? "Working late" : hour < 12 ? "Good morning" : hour < 18 ? "Good afternoon" : "Good evening";
-  const cands = d.results.map((c, k) => { const have = S.sources.some((s) => s.url === c.url); return `<div class="cand"><div><h4>${esc(c.name)}</h4><div class="u">${esc(c.url)}</div><p>${esc(c.why || "")}</p></div>
-      <button class="btn sm" data-cand="${k}" ${have ? "disabled" : ""}>${have ? "Added" : "Add source"}</button></div>`; }).join("");
+  const cands = !d.running ? (d.results || []).map((c, k) => candCard(c, k)).join("") : "";
   return `<div class="home">${S.progress.running ? `<div style="width:min(760px,100%)">${progressBox()}</div>` : ""}
     <div class="scope">${SCOPE}</div>
     <h1>${greet}. What should Lookout watch?</h1>
@@ -202,14 +220,14 @@ function renderHome() {
       <div class="ctx"><button type="button" class="chip outlined" data-pick="agent">${I.bot} ${st.agent ? esc(agentName(st.agent)) : "Choose an agent"} ${I.down}</button>
         <a class="chip" href="#/sources">${I.globe} ${S.sources.filter((s) => s.active).length} sources</a>
         <a class="chip" href="#/filters">${I.funnel} ${S.filters.filter((f) => f.active).length} filters</a></div>
-      <div class="field"><textarea name="request" id="ask" rows="2" placeholder="Machine-learning internships in Berlin, or new hackathons with cash prizes" ${d.running ? "disabled" : ""}>${esc(d.request)}</textarea>
+      <div class="field"><textarea name="request" id="ask" rows="2" placeholder="Machine-learning internships in Berlin, or new hackathons with cash prizes" ${d.running ? "disabled" : ""}>${d.running ? esc(d.request) : ""}</textarea>
         <div class="bar"><a class="chip" href="#/sources" title="Add a website yourself" aria-label="Add a website yourself">${I.plus}</a>
           ${st.agent ? `<button type="button" class="chip model" data-pick="model">${modelChipText(st.model, st.agent)} ${I.down}</button>` : ""}<span class="grow"></span>
-          ${d.running ? '<span class="muted" style="font-size:13px">Searching the web</span>' : ""}
           <button type="button" class="chip" data-act="scan" ${S.progress.running ? "disabled" : ""}>${I.play} Scan now</button>
           <button class="send" aria-label="Find sources" ${d.running || !st.agent ? "disabled" : ""}>${d.running ? '<svg class="spin" viewBox="0 0 24 24"><path d="M21 12a9 9 0 1 1-2.6-6.4"/></svg>' : I.up}</button></div></div>
     </form>
-    ${d.error ? `<p style="color:var(--red);font-size:13px;margin:12px 0 0">${esc(d.error)}</p>` : ""}
+    ${d.running && d.id ? `<a class="disc-bar" href="#/search/${d.id}"><i class="live"></i><span>Searching for <b>${esc(d.title || d.request)}</b></span><span class="grow"></span><span class="muted">View search →</span></a>` : ""}
+    ${!d.running && d.error ? `<p style="color:var(--red);font-size:13px;margin:12px 0 0">${esc(d.error)}</p>` : ""}
     ${cands ? `<div class="found"><div class="h2">Suggested sources <span>${d.results.length}</span><span class="grow"></span><button class="btn sm ghost" data-act="clear-disc">Clear</button></div><div class="list">${cands}</div></div>` : ""}
     <div class="glance">${S.scans.length ? `<a href="#/feed"><b class="${fresh ? "hot" : ""}">${fresh}</b> new in the last 3 days</a><a href="#/feed"><b class="${week ? "warn" : ""}">${week}</b> closing this week</a><a href="#/agenda"><b>${S.items.filter((i) => i.action === "saved").length}</b> in your agenda</a>` : !st.agent ? `<a href="#/settings">Start by choosing your agent</a>` : `<a href="#/sources">Add a website to watch</a>`}</div></div>`;
 }
@@ -435,7 +453,7 @@ function renderScan() {
   const ok = d.sources.filter((s) => s.ok).length, shown = d.items.filter((i) => i.match !== 0), hidden = d.items.length - shown.length;
   const srows = d.sources.map((s) => `<tr><td><span class="dot ${s.ok ? "" : "bad"}"></span>${esc(s.source_name)}</td><td>${s.ok ? `${s.count} items${s.new ? `, <b>${s.new} new</b>` : ""}` : `<span class="err">${esc(s.error)}</span>`}</td><td class="muted" style="text-align:right;white-space:nowrap">${(s.ms / 1000).toFixed(1)} s</td></tr>`).join("");
   return `<div class="page">${S.progress.running && S.progress.scan_id === d.id ? progressBox() : ""}
-    <div class="head"><div><h1>${d.trigger === "scheduled" ? "Daily scan" : "Scan"}, ${short(d.started.slice(0, 10))} at ${d.started.slice(11, 16)}</h1>
+    <div class="head"><div><h1>${esc(d.label || (d.trigger === "scheduled" ? "Daily scan" : "Scan"))}, ${short(d.started.slice(0, 10))} at ${d.started.slice(11, 16)}</h1>
       <p>${d.agent ? `${esc(agentName(d.agent))}${d.model ? ", " + esc(d.model) : ""}` : "Plugins only"}${d.finished ? `, took ${duration(d.started, d.finished)}` : ", running"}${d.note ? ". " + esc(d.note) : ""}</p></div>
       <button class="btn sm ghost danger" data-scan-del="${d.id}">${I.trash} Delete</button></div>
     <div class="stats"><div class="stat"><b>${d.found}</b><span>matching items</span></div><div class="stat"><b>${d.new}</b><span>new</span></div><div class="stat"><b>${ok} of ${d.sources.length}</b><span>sources read</span></div><div class="stat"><b>${hidden}</b><span>filtered out</span></div></div>
@@ -445,14 +463,48 @@ function renderScan() {
     ${shown.length ? `<div class="list">${shown.map((i) => itemCard(i, { isNew: !!i.is_new })).join("")}</div>` : '<div class="empty"><b>No matching items in this scan</b></div>'}</div>`;
 }
 
+// ---------- search (discovery) detail ----------
+const discCache = {}, discInFlight = {};
+async function loadDiscovery(id) {
+  if (discInFlight[id]) return;
+  discInFlight[id] = true;
+  try {
+    const data = await api(`/api/discoveries/${id}`).catch(() => (discCache[id] ? null : { missing: true }));
+    if (!data) return;
+    const changed = !discCache[id] || JSON.stringify(discCache[id]) !== JSON.stringify(data);
+    discCache[id] = data;
+    if (changed && route.view === "search" && route.id === id) render();
+  } finally {
+    delete discInFlight[id];
+  }
+}
+function renderSearch() {
+  const d = discCache[route.id];
+  if (!d) { loadDiscovery(route.id); return `<div class="page"><div class="head"><div><h1>Search</h1><p>Loading…</p></div></div></div>`; }
+  if (d.missing) return `<div class="page"><div class="empty"><b>This search no longer exists</b></div></div>`;
+  const running = d.status === "running", results = d.results || [];
+  const meta = [d.agent ? `${agentName(d.agent)}${d.model ? ", " + d.model : ""}` : "", running ? "searching…" : d.finished ? `took ${duration(d.started, d.finished)}` : ""].filter(Boolean).join(" · ");
+  const prog = running ? `<div class="progress"><div class="row"><b>Searching the web…</b><span class="grow"></span></div>
+    <div class="muted" style="font-size:13px;margin-top:2px">Your agent is looking for pages that list relevant items and checking that they load.</div>
+    <div class="pbar"><i class="indet"></i></div></div>` : "";
+  const body = d.error ? `<div class="banner">${I.warn}<div><b>Search failed</b><div class="muted" style="font-size:13px;margin-top:2px">${esc(d.error)}</div></div></div>`
+    : results.length ? `<div class="h2">Suggested sources <span>${results.length}</span></div><div class="list">${results.map((c, k) => candCard(c, k, d.id)).join("")}</div>`
+    : running ? "" : `<div class="empty"><b>No sources suggested</b>Try describing what you want in a different way on <a href="#/home">Home</a>.</div>`;
+  return `<div class="page">${prog}
+    <div class="head"><div><h1>${esc(d.title || "Search")}</h1>
+      <p>“${esc(d.request)}”${meta ? ` · ${esc(meta)}` : ""}</p></div>
+      <button class="btn sm ghost danger" data-disc-del="${d.id}">${I.trash} Delete</button></div>
+    ${body}</div>`;
+}
+
 // ---------- render ----------
 let lastHtml = null, lastTag = null;
 function render() {
   if (!S) return;
   renderSide();
   const v = route.view;
-  const html = v === "feed" ? renderFeed() : v === "agenda" ? renderAgenda() : v === "sources" ? renderSources() : v === "filters" ? renderFilters() : v === "settings" ? renderSettings() : v === "scan" ? renderScan() : renderHome();
-  const tag = v === "settings" && AG ? "settings:ag" : v === "scan" ? `scan:${route.id}` : v, main = $("#main");
+  const html = v === "feed" ? renderFeed() : v === "agenda" ? renderAgenda() : v === "sources" ? renderSources() : v === "filters" ? renderFilters() : v === "settings" ? renderSettings() : v === "scan" ? renderScan() : v === "search" ? renderSearch() : renderHome();
+  const tag = v === "settings" && AG ? "settings:ag" : v === "scan" ? `scan:${route.id}` : v === "search" ? `search:${route.id}` : v, main = $("#main");
   const force = render.force; render.force = false;
   const same = main.dataset.view === tag;
   // Settings is a form: background refreshes must not wipe what is being typed.
@@ -474,7 +526,8 @@ async function refresh() {
     if (S.settings.agent && !modelCache[S.settings.agent]) modelsFor(S.settings.agent).then(() => { render.force = true; render(); });
     if (!AG) ensureAgents().then(() => render());
     const busy = S.progress.running || S.discovery.running;
-    if ((wasBusy || busy) && route.view === "scan") loadScan(route.id);
+    if (route.view === "scan" && (wasBusy || busy || scanCache[route.id]?.status === "running")) loadScan(route.id);
+    if (route.view === "search" && (wasBusy || busy || discCache[route.id]?.status === "running")) loadDiscovery(route.id);
     const typing = document.activeElement && /INPUT|TEXTAREA|SELECT/.test(document.activeElement.tagName) && document.activeElement.id !== "q";
     if (!popEl && !typing) render(); else renderSide();
     wasBusy = busy;
@@ -513,9 +566,11 @@ document.addEventListener("click", async (e) => {
     if (d.srcDel) { if (!confirm("Delete this source? Items already found stay in your feed.")) return; await api(`/api/sources/${d.srcDel}/delete`, {}); return refresh(); }
     if (d.srcEdit) { const s = S.sources.find((x) => x.id === Number(d.srcEdit)); const notes = prompt(`Notes for your agent about ${s.name}:`, s.notes || ""); if (notes === null) return; await api(`/api/sources/${s.id}`, { notes }); toast("Notes saved"); return refresh(); }
     if (d.cand !== undefined) { const c = S.discovery.results[Number(d.cand)]; await api("/api/sources", { name: c.name, url: c.url, notes: c.notes || "" }); toast(`Added ${c.name}`); return refresh(); }
+    if (d.discCand !== undefined) { const c = discCache[Number(d.discId)]?.results?.[Number(d.discCand)]; if (!c) return; await api("/api/sources", { name: c.name, url: c.url, notes: c.notes || "" }); toast(`Added ${c.name}`); return refresh(); }
     if (d.act === "clear-disc") { await api("/api/discover/clear", {}); return refresh(); }
     if (d.fDel) { await api(`/api/filters/${d.fDel}/delete`, {}); return refresh(); }
     if (d.scanDel) { if (!confirm("Delete this scan from history? Items it found stay in your feed.")) return; await api(`/api/scans/${d.scanDel}/delete`, {}); location.hash = "#/home"; return refresh(); }
+    if (d.discDel) { if (!confirm("Delete this search from history?")) return; await api(`/api/discoveries/${d.discDel}/delete`, {}); delete discCache[Number(d.discDel)]; location.hash = "#/home"; return refresh(); }
     if (d.act === "save-agent") {
       await api("/api/settings", { agent: $("input[name=agent]:checked")?.value || "", headed: $("#headedIn").checked ? "1" : "0", agent_timeout_min: $("#timeoutIn").value, parallel: $("#parallelIn").value, verify_weekly: $("#verifyIn").checked ? "1" : "0", custom_command: $("#customCmd")?.value || "" });
       toast("Saved"); AG = null; render.force = true; return refresh();
@@ -551,7 +606,12 @@ document.addEventListener("submit", async (e) => {
   try {
     if (f.id === "addSrc") { await api("/api/sources", data); toast(`Added ${data.name}`); f.reset(); return refresh(); }
     if (f.id === "addF") { await api("/api/filters", data); f.reset(); $("#fHint").textContent = FKIND.include[1]; return refresh(); }
-    if (f.id === "discover") { if (!data.request || data.request.trim().length < 5) return toast("Describe what you want to follow"); const r = await api("/api/discover", data); toast(r.started ? "Your agent is searching the web" : "Already searching"); return refresh(); }
+    if (f.id === "discover") {
+      if (!data.request || data.request.trim().length < 5) return toast("Describe what you want to follow");
+      const r = await api("/api/discover", data);
+      if (r.started && r.id) { toast("Your agent is searching the web"); location.hash = `#/search/${r.id}`; return; }
+      toast("Already searching"); return refresh();
+    }
   } catch (err) { toast(err.message); }
 });
 document.addEventListener("keydown", (e) => {

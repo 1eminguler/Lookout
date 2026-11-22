@@ -13,7 +13,9 @@ WEB = db.ROOT / "web"
 PORT = int(__import__("os").environ.get("LOOKOUT_PORT") or 8780)
 HOSTS = {f"127.0.0.1:{PORT}", f"localhost:{PORT}"}
 SECRET_KEYS = {"smtp_password"}
-discovery: Dict[str, Any] = {"running": False, "request": "", "results": [], "error": "", "finished": None}
+discovery: Dict[str, Any] = {"id": None, "running": False, "request": "", "title": "", "results": [], "error": "",
+                             "finished": None}
+_disc_lock = threading.Lock()
 last_hit = {"t": time.time()}
 
 
@@ -25,19 +27,23 @@ def public_settings() -> Dict[str, Any]:
 
 
 def state() -> Dict[str, Any]:
-    return {"items": db.items(), "scans": db.scans(), "sources": db.sources(), "filters": db.filters(),
+    return {"items": db.items(), "scans": db.scans(), "discoveries": db.discoveries(), "sources": db.sources(),
+            "filters": db.filters(),
             "progress": {k: scanner.progress.get(k) for k in ("running", "scan_id", "done", "total", "current", "learning")},
             "settings": public_settings(), "discovery": discovery, "schedule": notify.schedule_status()}
 
 
-def run_discovery(request: str) -> None:
-    discovery.update(running=True, request=request, results=[], error="", finished=None)
+def run_discovery(did: int, request: str) -> None:
+    results, error, status, title = [], "", "done", None
     try:
-        discovery["results"] = tasks.discover_sources(request)
+        out = tasks.discover_sources(request)
+        results, title = out["sources"], out.get("title")
     except Exception as e:
-        discovery["error"] = str(e)[:400]
+        status, error = "failed", str(e)[:400]
     finally:
-        discovery.update(running=False, finished=db.now())
+        db.finish_discovery(did, status, results, error, title=title)
+        discovery.update(id=did, running=False, results=results, error=error, finished=db.now(),
+                         title=title or discovery.get("title", ""))
 
 
 def agenda_ics() -> str:
@@ -124,6 +130,9 @@ class Handler(BaseHTTPRequestHandler):
         if m := re.fullmatch(r"/api/scans/(\d+)", path):
             d = db.scan_detail(int(m[1]))
             return self.send(200 if d else 404, d or {"error": "not found"})
+        if m := re.fullmatch(r"/api/discoveries/(\d+)", path):
+            d = db.discovery_detail(int(m[1]))
+            return self.send(200 if d else 404, d or {"error": "not found"})
         if path == "/api/agents":
             return self.send(200, {"agents": agents.detect(), "browser": agents.browser_tool(),
                                    "settings": public_settings()})
@@ -208,12 +217,23 @@ class Handler(BaseHTTPRequestHandler):
             req = str(b.get("request", "")).strip()
             if len(req) < 5:
                 raise ValueError("Describe what you want to monitor")
-            if discovery["running"]:
-                return self.send(200, {"started": False})
-            threading.Thread(target=run_discovery, args=(req,), daemon=True).start()
-            return self.send(200, {"started": True})
+            with _disc_lock:
+                if discovery["running"]:
+                    return self.send(200, {"started": False, "id": discovery.get("id")})
+                st = db.get_settings()
+                title = tasks.quick_title(req)
+                did = db.start_discovery(req, title, st["agent"], st["model"])
+                discovery.update(id=did, running=True, request=req, title=title, results=[], error="", finished=None)
+            threading.Thread(target=run_discovery, args=(did, req), daemon=True).start()
+            return self.send(200, {"started": True, "id": did})
+        if m := re.fullmatch(r"/api/discoveries/(\d+)/delete", p):
+            did = int(m[1])
+            db.delete_discovery(did)
+            if discovery.get("id") == did and not discovery["running"]:
+                discovery.update(id=None, results=[], error="", request="", title="", finished=None)
+            return self.send(200, {"ok": True})
         if p == "/api/discover/clear":
-            discovery.update(results=[], error="", request="")
+            discovery.update(id=None, results=[], error="", request="", title="", finished=None)
             return self.send(200, {"ok": True})
         self.send(404, {"error": "not found"})
 

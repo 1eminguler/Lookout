@@ -35,8 +35,7 @@ def _wait_js(page, expression, timeout=10000):
 
 
 class FeedUnitTests(unittest.TestCase):
-    @unittest.skipUnless(shutil.which("node"), "Node.js is not installed")
-    def test_shared_url_programmes_render_as_separate_cards(self):
+    def run_render_assertions(self, assertions):
         script = """
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
@@ -51,6 +50,16 @@ const context = {
   fetch: () => new Promise(() => {}),
 };
 vm.runInNewContext(fs.readFileSync("web/app.js", "utf8"), context);
+""" + assertions
+        result = subprocess.run(
+            ["node", "-e", script], cwd=Path(__file__).resolve().parents[1],
+            capture_output=True, text=True, encoding="utf-8", timeout=15,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    @unittest.skipUnless(shutil.which("node"), "Node.js is not installed")
+    def test_shared_url_programmes_render_as_separate_cards(self):
+        self.run_render_assertions("""
 const url = "https://example.com/careers";
 const summer = {id: "one", title: "Summer Internship", url, source_name: "Careers"};
 const talent = {id: "two", title: "Young Talent", url, source_name: "Careers"};
@@ -59,12 +68,35 @@ const cards = context.dedupeItems([summer, talent, {...summer}])
 assert.equal(cards.length, 2);
 assert.match(cards[0], /Summer Internship/);
 assert.match(cards[1], /Young Talent/);
-"""
-        result = subprocess.run(
-            ["node", "-e", script], cwd=Path(__file__).resolve().parents[1],
-            capture_output=True, text=True, encoding="utf-8", timeout=15,
-        )
-        self.assertEqual(result.returncode, 0, result.stderr)
+""")
+
+    @unittest.skipUnless(shutil.which("node"), "Node.js is not installed")
+    def test_deadline_text_and_guessed_year_render_in_cards_and_agenda(self):
+        self.run_render_assertions(r"""
+const item = {
+  id: "one", title: "Internship", url: "https://example.com/one", source_name: "Careers",
+  deadline: "2027-03-15", deadline_raw: '15 Mart 17.00 "local" <time>',
+  extra: '{"deadline_inferred":true}', action: "saved",
+};
+for (const markup of [context.itemCard(item, {isNew: false}), context.agRow(item)]) {
+  assert.match(markup, /title="15 Mart 17.00 &quot;local&quot; &lt;time&gt;"/);
+  assert.match(markup, /<\/time> <small class="year-guessed">year guessed<\/small>/);
+}
+vm.runInContext('agOpen = "one"', context);
+assert.match(context.agRow(item), /Deadline text: 15 Mart 17.00 &quot;local&quot; &lt;time&gt;/);
+context.item = item;
+vm.runInContext('S = {agenda_items: [item]}; ui.calMonth = "2027-03"; agDay = item.deadline', context);
+assert.match(context.renderMonth(), /title="15 Mart 17.00 &quot;local&quot; &lt;time&gt;"/);
+assert.match(context.renderMonth(), /year guessed/);
+
+const explicit = {...item, extra: '{"deadline_inferred":false}'};
+assert.doesNotMatch(context.itemCard(explicit, {isNew: false}), /year guessed/);
+const legacy = {...item, deadline_raw: null, extra: '{"incomplete":'};
+assert.doesNotMatch(context.agRow(legacy), /year guessed|Deadline text/);
+const unparsed = {...item, deadline: null, deadline_raw: "To be announced", extra: null};
+assert.match(context.itemCard(unparsed, {isNew: false}), /title="To be announced"/);
+assert.match(context.agRow(unparsed), /Deadline text: To be announced/);
+""")
 
 
 class UiSmokeTests(TempLookoutTestCase):

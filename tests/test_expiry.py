@@ -89,6 +89,21 @@ class YearlessDateTests(TempLookoutTestCase):
             {"title": "Staj", "url": "https://ex.com/5", "start_date": "13 Kasım"}, src, today=TODAY)
         self.assertIsNone(it5["extra"])
 
+    def test_normalise_preserves_deadline_text_before_truncating(self):
+        src = {"name": "Src"}
+        raw = {"title": "Staj", "url": "https://ex.com/1"}
+        cases = [
+            ("  15 Mart  17.00\n", "  15 Mart  17.00\n", "2026-03-15"),
+            ("Başvurular kapandı", "Başvurular kapandı", None),
+            ("Ş" * 80 + " 15 Mart", "Ş" * 80, "2026-03-15"),
+            (None, None, None),
+        ]
+        for value, expected_text, expected_date in cases:
+            with self.subTest(value=value):
+                item = scanner.normalise(dict(raw, deadline=value), src, today=TODAY)
+                self.assertEqual(item["deadline_raw"], expected_text)
+                self.assertEqual(item["deadline"], expected_date)
+
 
 class ClosedMarkerTests(TempLookoutTestCase):
     def test_turkish_and_english_markers_mark_expired(self):

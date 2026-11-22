@@ -340,6 +340,9 @@ def agenda_ics() -> str:
     lines = ["BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//Lookout//Agenda//EN", "CALSCALE:GREGORIAN",
              "X-WR-CALNAME:Lookout"]
     for i in db.agenda_items():
+        description = " - ".join(x for x in (i["org"], i["source_name"], i["note"]) if x)
+        if i["deadline_raw"]:
+            description += "\nDeadline text: " + i["deadline_raw"]
         for kind, day in (("Deadline", i["deadline"]), ("Reminder", i["remind_on"])):
             if not day:
                 continue
@@ -352,7 +355,7 @@ def agenda_ics() -> str:
                 f"DTSTART;VALUE=DATE:{d}",
                 f"SUMMARY:{text(kind + ': ' + i['title'])}",
                 f"URL:{clean_url}",
-                f"DESCRIPTION:{text(' - '.join(x for x in (i['org'], i['source_name'], i['note']) if x))}",
+                f"DESCRIPTION:{text(description)}",
                 "END:VEVENT",
             ]
     lines.append("END:VCALENDAR")
@@ -881,13 +884,13 @@ class Handler(BaseHTTPRequestHandler):
             buf = _io.StringIO()
             w = csv.writer(buf)
             w.writerow(["title", "organisation", "category", "source", "deadline", "start", "location", "url",
-                        "first seen", "status", "your mark", "note"])
+                        "first seen", "status", "your mark", "note", "deadline_text"])
             for i in db.items():
                 if i.get("match") == 0:
                     continue
                 w.writerow([_csv_cell(x) for x in (
                     i["title"], i["org"], i["category"], i["source_name"], i["deadline"], i["start_date"],
-                    i["location"], i["url"], i["first_seen"], i["status"], i["action"], i["note"]
+                    i["location"], i["url"], i["first_seen"], i["status"], i["action"], i["note"], i["deadline_raw"]
                 )])
             return self.send(200, ("\ufeff" + buf.getvalue()).encode("utf-8"), "text/csv; charset=utf-8")
         if path == "/api/backup.json":

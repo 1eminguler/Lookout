@@ -1,5 +1,7 @@
 """Integration tests for lookout.server HTTP API & security boundaries."""
+import csv
 import http.client
+import io
 import json
 import os
 import re
@@ -12,7 +14,7 @@ import urllib.request
 import unittest
 import xml.etree.ElementTree as ET
 from datetime import date, datetime, timedelta
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from lookout import agents, db, notify, scanner, server, tasks
 import run
@@ -21,6 +23,36 @@ from tests.helpers import TempLookoutTestCase
 _REAL_AGENTS_DETECT = agents.detect
 _REAL_AGENTS_WHICH = agents.which
 _REAL_AGENTS_WHICH = agents.which
+
+
+class ExportTests(TempLookoutTestCase):
+    def test_deadline_text_in_csv_and_ics(self):
+        sid = db.add_source("Board", "https://board.example")
+        src = db.source_by_id(sid)
+        scan_id = db.start_scan("manual", "claude", "", [])
+        deadline = (date.today() + timedelta(days=5)).isoformat()
+        reminder = (date.today() + timedelta(days=2)).isoformat()
+        deadline_text = "15 Mart 17.00, Türkiye\r\nYerel saat"
+        db.save_item(scan_id, src, {"id": "one", "title": "Intern", "url": src["url"] + "/1",
+                                    "deadline": deadline, "deadline_raw": deadline_text})
+        db.save_item(scan_id, src, {"id": "two", "title": "Engineer", "url": src["url"] + "/2",
+                                    "deadline": deadline})
+        db.set_item("one", action="saved", remind_on=reminder)
+
+        handler = Mock()
+        server.Handler._get(handler, "/api/export.csv")
+        status, body, _ = handler.send.call_args.args
+        self.assertEqual(status, 200)
+        rows = {row["title"]: row for row in csv.DictReader(io.StringIO(body.decode("utf-8-sig"), newline=""))}
+        self.assertEqual(rows["Intern"]["deadline"], deadline)
+        self.assertEqual(rows["Intern"]["deadline_text"], deadline_text)
+        self.assertEqual(rows["Engineer"]["deadline_text"], "")
+
+        server.Handler._get(handler, "/api/agenda.ics")
+        status, body, _ = handler.send.call_args.args
+        self.assertEqual(status, 200)
+        unfolded = body.decode("utf-8").replace("\r\n ", "")
+        self.assertEqual(unfolded.count(r"\nDeadline text: 15 Mart 17.00\, Türkiye\nYerel saat"), 2)
 
 
 class ServerTests(TempLookoutTestCase):

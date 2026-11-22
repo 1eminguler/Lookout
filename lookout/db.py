@@ -15,7 +15,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 ROOT = Path(__file__).resolve().parent.parent
 DB_PATH = Path(os.environ.get("LOOKOUT_DATA_DIR") or ROOT / "data") / "lookout.db"
 TS = "%Y-%m-%d %H:%M:%S"
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 _lock = threading.RLock()
 _UNSET = object()
 _TRACKING_EXACT = {"fbclid", "gclid", "mc_cid", "mc_eid"}
@@ -270,6 +270,10 @@ MIGRATIONS_V5 = {
     "sources": {"empty_read_count": "INTEGER NOT NULL DEFAULT 0"},
 }
 
+MIGRATIONS_V6 = {
+    "items": {"deadline_raw": "TEXT"},
+}
+
 
 def _add_columns(c: sqlite3.Connection, spec: Dict[str, Dict[str, str]]) -> None:
     for table, cols in spec.items():
@@ -312,6 +316,8 @@ def init() -> None:
             ver = 4
         if ver < 5:
             _add_columns(c, MIGRATIONS_V5)
+        if ver < 6:
+            _add_columns(c, MIGRATIONS_V6)
         c.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         c.commit()
 
@@ -1135,6 +1141,7 @@ def save_item(scan_id: int, source: Dict[str, Any], it: Dict[str, Any], *,
     t = now()
     wid = source.get("watch_id")
     src_id = source.get("id")
+    deadline_raw = it.get("deadline_raw")
     with _lock, _conn() as c:
         exists = c.execute("SELECT * FROM items WHERE id=?", (it["id"],)).fetchone()
         if exists is None and it.get("legacy_id"):
@@ -1196,11 +1203,11 @@ def save_item(scan_id: int, source: Dict[str, Any], it: Dict[str, Any], *,
             new_notified = ex.get("notified", 0) if notified is _UNSET else int(bool(notified))
             new_expired = int(bool(expired)) if expired is not _UNSET else int(ex.get("expired") or 0)
             c.execute(
-                """UPDATE items SET title=?, org=?, category=?, url=?, deadline=?, start_date=?, location=?,
+                """UPDATE items SET title=?, org=?, category=?, url=?, deadline=?, deadline_raw=?, start_date=?, location=?,
                    summary=?, extra=?, watch_id=?, status='open', last_scan=?, last_seen=?,
                    updated_at=?, change_summary=?, last_change_kind=?, match=?, match_key=?, notified=?,
                    expired=? WHERE id=?""",
-                (it["title"], it.get("org"), it.get("category"), it["url"], it.get("deadline"),
+                (it["title"], it.get("org"), it.get("category"), it["url"], it.get("deadline"), deadline_raw,
                  it.get("start_date"), it.get("location"), it.get("summary"), it.get("extra"), wid, scan_id, t,
                  updated_at, summary, change_kind, new_match, new_match_key, new_notified, new_expired, item_id),
             )
@@ -1217,12 +1224,12 @@ def save_item(scan_id: int, source: Dict[str, Any], it: Dict[str, Any], *,
         ins_notified = 0 if notified is _UNSET else int(bool(notified))
         ins_expired = 0 if expired is _UNSET else int(bool(expired))
         c.execute(
-            """INSERT INTO items(id, source_id, source_name, title, org, category, url, deadline, start_date,
+            """INSERT INTO items(id, source_id, source_name, title, org, category, url, deadline, deadline_raw, start_date,
                location, summary, extra, watch_id, first_scan, last_scan, first_seen, last_seen,
                match, match_key, notified, expired)
-               VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (item_id, src_id, source["name"], it["title"], it.get("org"), it.get("category"),
-             it["url"], it.get("deadline"), it.get("start_date"), it.get("location"), it.get("summary"),
+             it["url"], it.get("deadline"), deadline_raw, it.get("start_date"), it.get("location"), it.get("summary"),
              it.get("extra"), wid, scan_id, scan_id, t, t, ins_match, ins_match_key, ins_notified, ins_expired),
         )
         c.execute("INSERT OR REPLACE INTO scan_items(scan_id, item_id, is_new, is_updated) VALUES(?, ?, ?, 0)",

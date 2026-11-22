@@ -267,7 +267,8 @@ def normalise(raw: Dict[str, Any], source: Dict[str, Any], today: Optional[date]
         return None
     url = _clean_url(url)
     extra = raw.get("extra")
-    deadline, deadline_inferred = _parse_date_value(raw.get("deadline"), today)
+    deadline_value = raw.get("deadline")
+    deadline, deadline_inferred = _parse_date_value(deadline_value, today)
     start_date, _ = _parse_date_value(raw.get("start_date"), today)
     if deadline_inferred:
         # Remember that the deadline year was guessed from a yearless date.
@@ -292,6 +293,7 @@ def normalise(raw: Dict[str, Any], source: Dict[str, Any], today: Optional[date]
         "category": blank_to_none(clean(raw.get("category") or raw.get("type"), 40)),
         "url": url,
         "deadline": deadline,
+        "deadline_raw": str(deadline_value if deadline_value is not None else "")[:80] or None,
         "start_date": start_date,
         "location": blank_to_none(clean(raw.get("location"), 80)),
         "summary": blank_to_none(clean(raw.get("summary") or raw.get("description"), 400)),

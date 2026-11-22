@@ -111,6 +111,19 @@ const parseIso = (s) => { const [y, m, d] = s.split("-").map(Number); return new
 const daysTo = (s) => (s ? Math.round((parseIso(s) - today0()) / 864e5) : null);
 const short = (s) => { const d = parseIso(s); return `${d.getDate()} ${MON[d.getMonth()]}` + (d.getFullYear() !== new Date().getFullYear() ? ` ${d.getFullYear()}` : ""); };
 const target = (i) => i.deadline || i.start_date || null;
+function deadlineTooltip(i) {
+  return i.deadline_raw ? ` title="${esc(i.deadline_raw)}"` : "";
+}
+function deadlineLabel(i, label) {
+  const tip = deadlineTooltip(i);
+  if (!i.deadline) return tip ? `<span${tip}>${label}</span>` : "";
+  let extra = i.extra;
+  if (typeof extra === "string") {
+    try { extra = JSON.parse(extra); } catch { extra = null; }
+  }
+  const guessed = extra?.deadline_inferred === true ? ' <small class="year-guessed">year guessed</small>' : "";
+  return `<time datetime="${esc(i.deadline)}"${tip}>${label}</time>${guessed}`;
+}
 const isNew = (i) => Date.now() - new Date(i.first_seen.replace(" ", "T")).getTime() < 72 * 36e5;
 const isUpdated = (i) => Boolean(i.updated_at && i.last_change_kind && i.last_change_kind !== "closed" && (Date.now() - new Date(i.updated_at.replace(" ", "T")).getTime() < 72 * 36e5));
 const isSnoozed = (i) => Boolean(i.snoozed_until && daysTo(i.snoozed_until) > 0);
@@ -403,11 +416,13 @@ function renderNotifyErrorsBanner() {
 // ---------- item card ----------
 function whenBox(i) {
   const t = target(i);
-  if (!t) return `<div class="when"><b class="s">—</b><span>no date</span></div>`;
+  const tip = i.deadline ? "" : deadlineTooltip(i);
+  if (!t) return `<div class="when"${tip}><b class="s">—</b><span>no date</span></div>`;
+  const dateLabel = i.deadline ? deadlineLabel(i, short(t)) : `<time>${short(t)}</time>`;
   const d = daysTo(t), cls = !i.deadline ? "" : d <= 3 ? "red" : d <= 7 ? "orange" : d <= 14 ? "amber" : "";
-  if (d < 0) return `<div class="when"><b class="s">past</b><time>${short(t)}</time></div>`;
+  if (d < 0) return `<div class="when"${tip}><b class="s">past</b>${dateLabel}</div>`;
   const big = d === 0 ? `<b class="s">today</b><span>${i.deadline ? "last day" : "starts"}</span>` : d === 1 ? `<b class="s">tomorrow</b><span>${i.deadline ? "last day" : "starts"}</span>` : `<b>${d}</b><span>${i.deadline ? "days left" : "days to go"}</span>`;
-  return `<div class="when ${cls}">${big}<time>${short(t)}</time></div>`;
+  return `<div class="when ${cls}"${tip}>${big}${dateLabel}</div>`;
 }
 function itemCard(i, opts = {}) {
   const a = i.action, sn = isSnoozed(i), w = opts.showWatch && i.watch_id ? watchById(i.watch_id) : null;
@@ -662,15 +677,16 @@ function leftText(i) {
 function agRow(i) {
   const when = i.remind_on && (!i.deadline || i.remind_on < i.deadline) && daysTo(i.remind_on) >= 0 ? i.remind_on : i.deadline;
   const dt = when ? parseIso(when) : null, left = leftText(i), done = i.action === "applied", open = agOpen === i.id;
+  const deadline = deadlineLabel(i, i.deadline ? `deadline ${short(i.deadline)}` : "deadline text");
   return `<div class="ag-row ${open ? "open" : ""}">
     <div class="ag-date ${dt ? "" : "none"}">${dt ? `<b>${dt.getDate()}</b><span>${WD[dt.getDay()]} ${MON[dt.getMonth()]}</span>` : "<b>—</b><span>no date</span>"}</div>
     <button class="ag-main" data-ag-open="${esc(i.id)}" aria-expanded="${open}"><span class="t">${esc(i.title)}</span>
-      <span class="s">${i.org ? `<span>${esc(i.org)}</span>` : ""}<span>${esc(i.source_name)}</span>${i.deadline ? `<span>deadline ${short(i.deadline)}</span>` : ""}${i.remind_on ? `<span class="rem">reminder ${short(i.remind_on)}</span>` : ""}${i.note && !open ? `<span>has notes</span>` : ""}</span></button>
+      <span class="s">${i.org ? `<span>${esc(i.org)}</span>` : ""}<span>${esc(i.source_name)}</span>${deadline ? `<span>${deadline}</span>` : ""}${i.remind_on ? `<span class="rem">reminder ${short(i.remind_on)}</span>` : ""}${i.note && !open ? `<span>has notes</span>` : ""}</span></button>
     <div class="ag-left ${left.c}">${done ? "done" : left.t}</div>
     <div class="ag-acts"><button class="ib" data-pick="remind" data-rid="${esc(i.id)}" data-tip="Set a reminder" aria-label="Set a reminder"><svg viewBox="0 0 24 24"><path d="M6 8a6 6 0 1 1 12 0c0 7 3 8 3 8H3s3-1 3-8"/><path d="M10.5 20a1.5 1.5 0 0 0 3 0"/></svg></button>
       <button class="ib ${done ? "on green" : ""}" data-item="${esc(i.id)}" data-set="applied" data-tip="${done ? "Mark as not done" : "Mark as done"}" aria-label="${done ? "Mark as not done" : "Mark as done"}">${I.done}</button>
       <button class="ib" data-item="${esc(i.id)}" data-set="${done ? "applied" : "saved"}" data-unsave="1" data-tip="Remove from agenda" aria-label="Remove from agenda">${I.trash}</button></div>
-    ${open ? `<div class="ag-detail"><textarea data-note="${esc(i.id)}" placeholder="Notes: what to prepare, who to contact, links…">${esc(i.note || "")}</textarea>
+    ${open ? `<div class="ag-detail">${i.deadline_raw ? `<div class="deadline-text">Deadline text: ${esc(i.deadline_raw)}</div>` : ""}<textarea data-note="${esc(i.id)}" placeholder="Notes: what to prepare, who to contact, links…">${esc(i.note || "")}</textarea>
       <div class="links"><a class="btn sm" href="${esc(safeUrl(i.url))}" data-ext target="_blank" rel="noopener noreferrer">Open page</a>${i.summary ? `<span class="muted ag-sum">${esc(i.summary)}</span>` : ""}</div></div>` : ""}
   </div>`;
 }
@@ -700,7 +716,11 @@ function renderMonth() {
   }
   const dayEvs = byDay[sel] || [], sd = parseIso(sel);
   const upcoming = agendaEntries().filter((e) => e.date > sel && e.i.action === "saved").sort((a, b) => a.date.localeCompare(b.date)).slice(0, 4);
-  const entry = (e, showDate) => `<div class="entry"><a href="${esc(safeUrl(e.i.url))}" data-ext target="_blank" rel="noopener noreferrer">${esc(e.i.title)}</a><div class="k ${e.kind}">${showDate ? short(e.date) + ", " : ""}${e.kind === "dl" ? "deadline" : "your reminder"}${e.i.org ? " · " + esc(e.i.org) : ""}</div></div>`;
+  const entry = (e, showDate) => {
+    const dateLabel = showDate ? short(e.date) + ", " : "";
+    const label = e.kind === "dl" ? deadlineLabel(e.i, dateLabel + "deadline") : dateLabel + "your reminder";
+    return `<div class="entry"><a href="${esc(safeUrl(e.i.url))}" data-ext target="_blank" rel="noopener noreferrer">${esc(e.i.title)}</a><div class="k ${e.kind}">${label}${e.i.org ? " · " + esc(e.i.org) : ""}</div></div>`;
+  };
   return `<div class="month"><div><div class="box"><div class="cal-head"><h2>${MON[m.getMonth()]} ${m.getFullYear()}</h2>
       <button class="btn sm ghost" data-cal="-1" aria-label="Previous month">‹</button><button class="btn sm" data-cal="0">Today</button><button class="btn sm ghost" data-cal="1" aria-label="Next month">›</button></div>
       <div class="cal">${cells}</div></div><div class="legend"><span><i class="dl"></i>Deadline</span><span><i></i>Your reminder</span></div></div>

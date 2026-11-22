@@ -231,6 +231,8 @@ label.f small { font-weight: 400; color: var(--muted); }
 .when b.s { font-size: 15px; line-height: 24px; }
 .when span { display: block; font-size: 11.5px; color: var(--muted); margin-top: 4px; }
 .when time { display: block; font-size: 11.5px; color: var(--muted); }
+.year-guessed { font-size: 10px; color: var(--muted); white-space: nowrap; }
+.when .year-guessed { display: block; }
 .when.red b { color: var(--red); } .when.orange b { color: var(--orange); } .when.amber b { color: var(--amber); }
 .when.red { box-shadow: inset 2px 0 0 var(--red); } .when.orange { box-shadow: inset 2px 0 0 var(--orange); }
 .ibody { padding: 12px 16px; min-width: 0; }
@@ -293,6 +295,7 @@ label.f small { font-weight: 400; color: var(--muted); }
 .ag-left.red { color: var(--red); } .ag-left.orange { color: var(--orange); }
 .ag-acts { display: flex; gap: 2px; }
 .ag-detail { grid-column: 2 / -1; display: grid; grid-template-columns: 1fr auto; gap: 12px; align-items: start; padding-top: 4px; }
+.ag-detail .deadline-text { grid-column: 1 / -1; color: var(--muted); font-size: 12.5px; white-space: pre-wrap; overflow-wrap: anywhere; }
 .ag-detail textarea { min-height: 64px; font-size: 13px; background: var(--panel); }
 .ag-detail .links { display: flex; flex-direction: column; gap: 6px; align-items: flex-end; }
 .ag-done { margin-top: 26px; }

@@ -1008,6 +1008,46 @@ class TestDatabase(LookoutTestCase):
             (new_err_id, "email", "SMTP timeout"),
         ])
 
+    def test_v5_migration_and_deadline_text_refresh(self):
+        db.DB_PATH.unlink()
+        with contextlib.closing(sqlite3.connect(str(db.DB_PATH))) as c:
+            c.executescript(db.SCHEMA)
+            for migration in (db.MIGRATIONS, db.MIGRATIONS_V2, db.MIGRATIONS_V3, db.MIGRATIONS_V4, db.MIGRATIONS_V5):
+                db._add_columns(c, migration)
+            c.execute(
+                """INSERT INTO items(id, source_name, title, url, deadline, first_seen, last_seen, note)
+                   VALUES('old', 'Board', 'Role', 'https://example.com/old',
+                          '2030-03-15', '2026-01-01', '2026-01-01', 'My note')"""
+            )
+            c.execute("PRAGMA user_version = 5")
+            c.commit()
+
+        db.init()
+        with contextlib.closing(db.connect()) as c:
+            self.assertEqual(c.execute("PRAGMA user_version").fetchone()[0], db.SCHEMA_VERSION)
+        old = db.item_by_id("old")
+        self.assertIsNone(old["deadline_raw"])
+        self.assertEqual(old["deadline"], "2030-03-15")
+        self.assertEqual(old["note"], "My note")
+
+        source = {"name": "Board"}
+        scan_id = db.start_scan("manual", "claude", "", [])
+        item = {"id": "new", "title": "Role", "url": "https://example.com/new",
+                "deadline": "2030-03-15", "deadline_raw": "15 Mart 2030 17.00"}
+        self.assertTrue(db.save_item(scan_id, source, item, match=1, match_key="cached"))
+        self.assertEqual(db.item_by_id("new")["deadline_raw"], item["deadline_raw"])
+        db.finish_scan(scan_id, "done")
+
+        next_scan = db.start_scan("manual", "claude", "", [])
+        item["deadline_raw"] = "15 Mart 2030 18.00"
+        self.assertFalse(db.save_item(next_scan, source, item))
+        refreshed = db.item_by_id("new")
+        self.assertEqual(refreshed["deadline_raw"], item["deadline_raw"])
+        self.assertEqual(refreshed["match_key"], "cached")
+        self.assertIsNone(refreshed["updated_at"])
+        self.assertEqual(db.item_history("new"), [])
+        self.assertEqual(db.scan_changes(next_scan), [])
+
     def test_schema_v3_and_v1_v2_to_v3_baseline_done_migration(self):
         # v2 -> v3 migration sets baseline_done=1 for sources with prior ok=1 scans or items
         db.DB_PATH.unlink()

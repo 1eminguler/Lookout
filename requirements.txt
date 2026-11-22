@@ -1,0 +1,2 @@
+pywebview>=5  # desktop window; optional, Lookout falls back to your browser
+# Your own plugins may need e.g. requests and beautifulsoup4.

@@ -12,6 +12,7 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+from lookout import categories as categories_mod
 from lookout import eligibility
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -208,6 +209,7 @@ def connect() -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.create_function("norm_tr", 1, _tr_lower)
     conn.create_function("eligibility_verdict", 1, _eligibility_verdict, deterministic=True)
+    conn.create_function("cat_group", 1, categories_mod.group, deterministic=True)
     conn.execute("PRAGMA foreign_keys=ON")
     conn.execute("PRAGMA busy_timeout=30000")
     conn.execute("PRAGMA synchronous=NORMAL")
@@ -1509,7 +1511,7 @@ def _items_where(
         cats = [c for c in categories if c]
         if cats:
             placeholders = ",".join("?" for _ in cats)
-            clauses.append(f"COALESCE(NULLIF(TRIM(i.category), ''), 'Other') IN ({placeholders})")
+            clauses.append(f"cat_group(i.category) IN ({placeholders})")
             args.extend(cats)
     if source_name:
         clauses.append("i.source_name=?")
@@ -1603,7 +1605,7 @@ def items_facets(
     )
     with _lock, _conn() as c:
         cat_rows = c.execute(
-            f"SELECT COALESCE(NULLIF(TRIM(i.category), ''), 'Other') AS cat, COUNT(*) AS n "
+            f"SELECT cat_group(i.category) AS cat, COUNT(*) AS n "
             f"FROM items i LEFT JOIN sources s ON s.id = i.source_id{where_base} GROUP BY cat ORDER BY n DESC, cat ASC",
             args_base,
         ).fetchall()

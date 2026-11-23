@@ -231,7 +231,14 @@ async function loadItems(append = false) {
         }
       } else {
         feedState.items = res.items || [];
-        if (res.facets) feedState.facets = res.facets;
+        if (res.facets) {
+          feedState.facets = res.facets;
+          // Category filters saved before categories were grouped no longer exist; drop them.
+          const known = Object.keys(res.facets.categories || {});
+          if (ui.cats.length && known.length && ui.cats.some((c) => !known.includes(c))) {
+            ui.cats = ui.cats.filter((c) => known.includes(c)); keep();
+          }
+        }
       }
       feedState.total = Number(res.total || 0);
       feedState.hasMore = Boolean(res.has_more);

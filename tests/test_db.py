@@ -786,9 +786,9 @@ class TestDatabase(LookoutTestCase):
         self.assertEqual(ids(status="open", snoozed="only"), ["it-snoozed"])
         self.assertEqual(ids(only_updated=True), ["it-upd"])  # excludes 'it-gone' whose last_change_kind=='closed'
 
-        # Category ('Other' covers '' and NULL) and source filters
-        self.assertEqual(set(ids(categories=["Other"])), {"it-upd", "it-glob"})
-        self.assertEqual(set(ids(categories=["grant"])), {"it-saved"})
+        # Category filters use the folded groups ('Other jobs' covers '' and NULL) and source filters
+        self.assertEqual(set(ids(categories=["Other jobs"])), {"it-upd", "it-glob"})
+        self.assertEqual(set(ids(categories=["Young talent & scholarships"])), {"it-saved"})
         self.assertEqual(set(ids(source_name="Gamma W2")), {"it-w2-open", "it-applied"})
         self.assertEqual(set(ids(source_id=s_w1_b)), {"it-saved", "it-gone"})
 
@@ -813,13 +813,13 @@ class TestDatabase(LookoutTestCase):
 
         # Facets (global and per-watch)
         facets = db.items_facets()
-        self.assertEqual(facets["categories"], {"Other": 2, "grant": 1, "hackathon": 1, "internship": 1})
+        self.assertEqual(facets["categories"], {"Other jobs": 2, "Young talent & scholarships": 1, "Hackathons & events": 1, "Internship": 1})
         self.assertEqual(facets["sources"], ["Alpha W1", "Beta W1", "Gamma W2", "Global Src"])
         self.assertEqual(facets["updated_count"], 1)
         self.assertEqual(facets["snoozed_count"], 1)
 
         facets_w1 = db.items_facets(watch_id=w1)
-        self.assertEqual(facets_w1["categories"], {"Other": 1, "grant": 1, "internship": 1})
+        self.assertEqual(facets_w1["categories"], {"Other jobs": 1, "Young talent & scholarships": 1, "Internship": 1})
         self.assertEqual(facets_w1["sources"], ["Alpha W1", "Beta W1"])
         self.assertEqual(facets_w1["updated_count"], 1)
         self.assertEqual(facets_w1["snoozed_count"], 1)

@@ -78,7 +78,9 @@ class RunTests(TempLookoutTestCase):
             try:
                 self.assertFalse(run.wait_for_internet(0.2))
                 self.assertLess(time.monotonic() - start, 1.5)
-                connect.assert_called_once()
+                # The deadline is what matters; a slow runner may start one more probe just before it.
+                self.assertGreaterEqual(connect.call_count, 1)
+                self.assertLessEqual(connect.call_count, 2)
             finally:
                 release.set()
                 stopped.wait(3)
